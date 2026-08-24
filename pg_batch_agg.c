@@ -144,7 +144,6 @@ pg_batch_advance_aggregates(PgBatchAggState *state, PgBatchSlot *slot)
 	for (int i = 0; i < state->naggs; i++)
 	{
 		PgBatchAggSpec *agg = &state->aggs[i];
-		PgBatchColumn *column;
 		uint64		rows;
 
 		if (agg->kind == PG_BATCH_AGG_COUNT_STAR)
@@ -154,25 +153,53 @@ pg_batch_advance_aggregates(PgBatchAggState *state, PgBatchSlot *slot)
 			continue;
 		}
 
-		column = &slot->columns[agg->column];
 		rows = selected_rows;
-
-		while (rows != 0)
+		if (likely(slot->format_ops == NULL))
 		{
-			int			row = pg_rightmost_one_pos64(rows);
-			uint64		bit = UINT64CONST(1) << row;
+			PgBatchColumn *column = &slot->columns[agg->column];
 
-			Assert((column->valid_rows & bit) != 0);
-			if (!column->isnull[row])
+			while (rows != 0)
 			{
-				if (agg->kind == PG_BATCH_AGG_COUNT_COLUMN)
-					pg_batch_add_int64(&agg->value, 1);
-				else
-					pg_batch_add_int64(&agg->value,
-									   DatumGetInt32(column->values[row]));
-				agg->has_value = true;
+				int			row = pg_rightmost_one_pos64(rows);
+				uint64		bit = UINT64CONST(1) << row;
+
+				Assert((column->valid_rows & bit) != 0);
+				if (!column->isnull[row])
+				{
+					if (agg->kind == PG_BATCH_AGG_COUNT_COLUMN)
+						pg_batch_add_int64(&agg->value, 1);
+					else
+						pg_batch_add_int64(&agg->value,
+										   DatumGetInt32(column->values[row]));
+					agg->has_value = true;
+				}
+				rows &= ~bit;
 			}
-			rows &= ~bit;
+		}
+		else
+		{
+			PgBatchArrowView column =
+				pg_batch_get_arrow_column(slot, agg->column);
+			const struct ArrowArray *array = column.array;
+			const int32 *values = array->buffers[1];
+
+			Assert(strcmp(column.schema->format, "i") == 0);
+			while (rows != 0)
+			{
+				int			row = pg_rightmost_one_pos64(rows);
+				uint64		bit = UINT64CONST(1) << row;
+
+				if (pg_batch_arrow_row_is_valid(array, row))
+				{
+					if (agg->kind == PG_BATCH_AGG_COUNT_COLUMN)
+						pg_batch_add_int64(&agg->value, 1);
+					else
+						pg_batch_add_int64(&agg->value,
+										   values[array->offset + row]);
+					agg->has_value = true;
+				}
+				rows &= ~bit;
+			}
 		}
 	}
 }

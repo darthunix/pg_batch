@@ -4,6 +4,7 @@ OBJS = \
 	pg_batch_plan.o \
 	pg_batch_slot.o \
 	pg_batch_exec.o \
+	pg_batch_compress.o \
 	pg_batch_scan.o \
 	pg_batch_filter.o \
 	pg_batch_agg.o

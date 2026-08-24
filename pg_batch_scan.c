@@ -28,11 +28,13 @@ typedef struct PgBatchScanState
 {
 	CustomScanState css;
 	TableScanDesc scan;
+	PgBatchCompressedRelation *compressed;
 	TupleTableSlot *heap_slot;
 	MemoryContext operator_context;
 	PgBatchQualState *quals;
 	int			nquals;
 	int			next_page_row;
+	int			next_compressed_batch;
 	bool		page_active;
 	bool		first_batch_on_page;
 	bool		done;
@@ -111,11 +113,16 @@ pg_batch_scan_begin(CustomScanState *node, EState *estate, int eflags)
 	pg_batch_configure_slot(bslot,
 							RelationGetDescr(node->ss.ss_currentRelation),
 							attnums, nfilter);
-	state->scan = table_beginscan(node->ss.ss_currentRelation,
-								  estate->es_snapshot, 0, NULL, 0);
-	state->heap_slot = ExecInitExtraTupleSlot(estate,
-											  RelationGetDescr(node->ss.ss_currentRelation),
-											  &TTSOpsBufferHeapTuple);
+	state->compressed =
+		pg_batch_compressed_lookup(node->ss.ss_currentRelation);
+	if (state->compressed == NULL)
+	{
+		state->scan = table_beginscan(node->ss.ss_currentRelation,
+									  estate->es_snapshot, 0, NULL, 0);
+		state->heap_slot = ExecInitExtraTupleSlot(estate,
+												  RelationGetDescr(node->ss.ss_currentRelation),
+												  &TTSOpsBufferHeapTuple);
+	}
 	state->nquals = list_length(cscan->custom_exprs);
 	state->quals = palloc0_array(PgBatchQualState, state->nquals);
 	foreach_ptr(OpExpr, op, cscan->custom_exprs)
@@ -133,7 +140,22 @@ pg_batch_scan_begin(CustomScanState *node, EState *estate, int eflags)
 static bool
 pg_batch_scan_next_batch(PgBatchScanState *state, PgBatchSlot *bslot)
 {
-	HeapScanDesc hscan = (HeapScanDesc) state->scan;
+	HeapScanDesc hscan;
+
+	if (state->compressed != NULL)
+	{
+		if (!pg_batch_compressed_next_batch(bslot, state->compressed,
+											&state->next_compressed_batch))
+		{
+			state->done = true;
+			return false;
+		}
+		state->batches++;
+		state->source_rows += bslot->nrows;
+		return true;
+	}
+
+	hscan = (HeapScanDesc) state->scan;
 
 	for (;;)
 	{
@@ -206,8 +228,8 @@ pg_batch_scan_filter(PgBatchScanState *state, PgBatchSlot *bslot)
 	MemoryContext oldcontext;
 	uint64		initial = bslot->selected_rows;
 
-	pg_batch_materialize_columns(bslot, bslot->request.filter_columns,
-								 bslot->selected_rows, PG_BATCH_FILTER_PHASE);
+	pg_batch_prepare_columns(bslot, bslot->request.filter_columns,
+							 bslot->selected_rows, PG_BATCH_FILTER_PHASE);
 	ResetExprContext(econtext);
 	oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 	for (int q = 0; q < state->nquals && bslot->selected_rows != 0; q++)
@@ -227,8 +249,6 @@ pg_batch_scan_filter(PgBatchScanState *state, PgBatchSlot *bslot)
 			bslot->selected_rows = 0;
 		else
 		{
-			PgBatchColumn *column = &bslot->columns[qual->column];
-
 			track_function =
 				pgstat_track_functions > qual->fcinfo->flinfo->fn_stats;
 			oldoperator = MemoryContextSwitchTo(state->operator_context);
@@ -238,16 +258,44 @@ pg_batch_scan_filter(PgBatchScanState *state, PgBatchSlot *bslot)
 			 * batch.
 			 */
 			rows = bslot->selected_rows;
-			while (rows != 0)
+			if (likely(bslot->format_ops == NULL))
 			{
-				int			row = pg_rightmost_one_pos64(rows);
-				uint64		bit = UINT64CONST(1) << row;
+				PgBatchColumn *column = &bslot->columns[qual->column];
 
-				if (column->isnull[row] ||
-					!pg_batch_eval_qual(qual, column->values[row],
-										track_function))
-					bslot->selected_rows &= ~bit;
-				rows &= ~bit;
+				while (rows != 0)
+				{
+					int			row = pg_rightmost_one_pos64(rows);
+					uint64		bit = UINT64CONST(1) << row;
+
+					Assert((column->valid_rows & bit) != 0);
+					if (column->isnull[row] ||
+						!pg_batch_eval_qual(qual,
+											column->values[row],
+											track_function))
+						bslot->selected_rows &= ~bit;
+					rows &= ~bit;
+				}
+			}
+			else
+			{
+				PgBatchArrowView column =
+					pg_batch_get_arrow_column(bslot, qual->column);
+				const struct ArrowArray *array = column.array;
+				const int32 *values = array->buffers[1];
+
+				Assert(strcmp(column.schema->format, "i") == 0);
+				while (rows != 0)
+				{
+					int			row = pg_rightmost_one_pos64(rows);
+					uint64		bit = UINT64CONST(1) << row;
+
+					if (!pg_batch_arrow_row_is_valid(array, row) ||
+						!pg_batch_eval_qual(qual,
+											Int32GetDatum(values[array->offset + row]),
+											track_function))
+						bslot->selected_rows &= ~bit;
+					rows &= ~bit;
+				}
 			}
 			MemoryContextSwitchTo(oldoperator);
 		}
@@ -311,6 +359,11 @@ pg_batch_scan_end(CustomScanState *node)
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 	if (state->scan != NULL)
 		table_endscan(state->scan);
+	if (state->compressed != NULL)
+	{
+		pg_batch_compressed_release(state->compressed);
+		state->compressed = NULL;
+	}
 }
 
 static void
@@ -319,7 +372,9 @@ pg_batch_scan_rescan(CustomScanState *node)
 	PgBatchScanState *state = (PgBatchScanState *) node;
 
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
-	table_rescan(state->scan, NULL);
+	if (state->scan != NULL)
+		table_rescan(state->scan, NULL);
+	state->next_compressed_batch = 0;
 	state->page_active = false;
 	state->first_batch_on_page = false;
 	state->next_page_row = 0;
@@ -334,6 +389,8 @@ pg_batch_scan_explain(CustomScanState *node, List *ancestors,
 	PgBatchSlot *bslot = pg_batch_slot_cast(node->ss.ss_ScanTupleSlot);
 
 	ExplainPropertyInteger("Batch Size", NULL, PG_BATCH_SIZE, es);
+	ExplainPropertyText("Batch Source",
+						state->compressed == NULL ? "Heap" : "Compressed Arrow", es);
 	if (es->analyze)
 	{
 		ExplainPropertyInteger("Batches", NULL, state->batches, es);
@@ -343,5 +400,14 @@ pg_batch_scan_explain(CustomScanState *node, List *ancestors,
 							   bslot->project_datums, es);
 		ExplainPropertyInteger("Restarted Projection Datums", NULL,
 							   bslot->restarted_project_datums, es);
+		if (state->compressed != NULL)
+		{
+			ExplainPropertyInteger("Arrow Filter Columns", NULL,
+								   bslot->arrow_filter_columns, es);
+			ExplainPropertyInteger("Arrow Projection Columns", NULL,
+								   bslot->arrow_project_columns, es);
+			ExplainPropertyInteger("Arrow Decoded Values", NULL,
+								   bslot->arrow_decoded_values, es);
+		}
 	}
 }

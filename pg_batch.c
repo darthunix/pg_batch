@@ -11,6 +11,7 @@ PGDLLEXPORT void _PG_init(void);
 PGDLLEXPORT void _PG_fini(void);
 
 bool		pg_batch_enable = true;
+bool		pg_batch_use_compressed = false;
 
 void
 _PG_init(void)
@@ -19,6 +20,10 @@ _PG_init(void)
 							 "Enable pg_batch custom paths.", NULL,
 							 &pg_batch_enable, true, PGC_USERSET, 0,
 							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_batch.use_compressed",
+							 "Use a backend-local compressed Arrow snapshot when available.",
+							 NULL, &pg_batch_use_compressed, false,
+							 PGC_USERSET, 0, NULL, NULL, NULL);
 	pg_batch_planner_init();
 }
 
@@ -26,4 +31,5 @@ void
 _PG_fini(void)
 {
 	pg_batch_planner_fini();
+	pg_batch_compress_fini();
 }

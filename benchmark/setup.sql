@@ -45,10 +45,20 @@ SELECT g AS a,
        g AS p
 FROM generate_series(1, 500000) AS g;
 
+DROP TABLE IF EXISTS pg_batch_bench_plain;
+CREATE TABLE pg_batch_bench_plain AS
+SELECT ((g::bigint * 1103515245 + 12345) % 2147483647)::int AS c1,
+       ((g::bigint * 214013 + 2531011) % 2147483647)::int AS c2,
+       ((g::bigint * 48271 + 17) % 2147483647)::int AS c3,
+       ((g::bigint * 16807 + 31) % 2147483647)::int AS c4
+FROM generate_series(1, 1000000) AS g;
+
 VACUUM (ANALYZE) pg_batch_bench_narrow;
 VACUUM (ANALYZE) pg_batch_bench_wide;
 VACUUM (ANALYZE) pg_batch_bench_mixed;
+VACUUM (ANALYZE) pg_batch_bench_plain;
 
 SELECT pg_size_pretty(pg_total_relation_size('pg_batch_bench_narrow')) AS narrow,
        pg_size_pretty(pg_total_relation_size('pg_batch_bench_wide')) AS wide,
-       pg_size_pretty(pg_total_relation_size('pg_batch_bench_mixed')) AS mixed;
+       pg_size_pretty(pg_total_relation_size('pg_batch_bench_mixed')) AS mixed,
+       pg_size_pretty(pg_total_relation_size('pg_batch_bench_plain')) AS plain;

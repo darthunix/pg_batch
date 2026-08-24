@@ -48,6 +48,9 @@ pg_batch_slot_clear(TupleTableSlot *slot)
 	PgBatchSlot *bslot = (PgBatchSlot *) slot;
 
 	pg_batch_slot_release_materialized(bslot);
+	if (unlikely(bslot->format_ops != NULL &&
+				 bslot->format_ops->clear_batch != NULL))
+		bslot->format_ops->clear_batch(bslot);
 	if (BufferIsValid(bslot->buffer))
 		ReleaseBuffer(bslot->buffer);
 	bslot->buffer = InvalidBuffer;
@@ -56,6 +59,8 @@ pg_batch_slot_clear(TupleTableSlot *slot)
 	bslot->current_row = -1;
 	bslot->selected_rows = 0;
 	bslot->batch_consumed = false;
+	bslot->format_ops = NULL;
+	bslot->format_private = NULL;
 	MemoryContextReset(bslot->batch_context);
 	bslot->columns = NULL;
 	slot->tts_nvalid = 0;
@@ -222,9 +227,9 @@ pg_batch_materialize_filters(PgBatchSlot *bslot, const int *columns,
 }
 
 void
-pg_batch_materialize_columns(PgBatchSlot *bslot, const Bitmapset *columns,
-							 uint64 selected_rows,
-							 PgBatchMaterializePhase phase)
+pg_batch_prepare_columns(PgBatchSlot *bslot, const Bitmapset *columns,
+						 uint64 selected_rows,
+						 PgBatchMaterializePhase phase)
 {
 	int			requested_columns[MaxTupleAttributeNumber];
 	int			ncolumns = 0;
@@ -232,6 +237,13 @@ pg_batch_materialize_columns(PgBatchSlot *bslot, const Bitmapset *columns,
 
 	if (columns == NULL || selected_rows == 0)
 		return;
+	if (unlikely(bslot->format_ops != NULL))
+	{
+		if (bslot->format_ops->prepare_columns == NULL)
+			elog(ERROR, "pg_batch slot has no active batch format");
+		bslot->format_ops->prepare_columns(bslot, columns, selected_rows, phase);
+		return;
+	}
 
 	while ((column = bms_next_member(columns, column)) >= 0)
 	{
@@ -265,6 +277,56 @@ pg_batch_materialize_columns(PgBatchSlot *bslot, const Bitmapset *columns,
 	}
 }
 
+PgBatchArrowView
+pg_batch_get_arrow_column(PgBatchSlot *bslot, int column)
+{
+	if (bslot->format_ops == NULL ||
+		bslot->format_ops->get_arrow_column == NULL)
+		elog(ERROR, "pg_batch slot has no active batch format");
+	return bslot->format_ops->get_arrow_column(bslot, column);
+}
+
+void
+pg_batch_materialize_columns(PgBatchSlot *bslot, const Bitmapset *columns,
+							 uint64 selected_rows,
+							 PgBatchMaterializePhase phase)
+{
+	int			column = -1;
+
+	pg_batch_prepare_columns(bslot, columns, selected_rows, phase);
+	if (bslot->format_ops == NULL)
+		return;
+	while (columns != NULL &&
+		   (column = bms_next_member(columns, column)) >= 0)
+	{
+		PgBatchArrowView view = pg_batch_get_arrow_column(bslot, column);
+		PgBatchColumn *datum_column;
+		const struct ArrowArray *array;
+		const int32 *values;
+		uint64		missing;
+
+		array = view.array;
+		Assert(strcmp(view.schema->format, "i") == 0);
+		Assert(array->offset >= 0 && array->length == bslot->nrows);
+		pg_batch_allocate_column(bslot, column);
+		datum_column = &bslot->columns[column];
+		values = array->buffers[1];
+		missing = selected_rows & ~datum_column->valid_rows;
+		while (missing != 0)
+		{
+			int			row = pg_rightmost_one_pos64(missing);
+			uint64		bit = UINT64CONST(1) << row;
+			bool		isnull = !pg_batch_arrow_row_is_valid(array, row);
+			Datum		value = isnull ? (Datum) 0 :
+				Int32GetDatum(values[array->offset + row]);
+
+			pg_batch_store_deformed(bslot, datum_column, row, value, isnull,
+									phase, false);
+			missing &= ~bit;
+		}
+	}
+}
+
 void
 pg_batch_slot_select_row(PgBatchSlot *bslot, int row)
 {
@@ -276,7 +338,10 @@ pg_batch_slot_select_row(PgBatchSlot *bslot, int row)
 	bslot->current_row = row;
 	slot->tts_nvalid = 0;
 	slot->tts_flags &= ~TTS_FLAG_EMPTY;
-	ItemPointerSet(&slot->tts_tid, bslot->block, bslot->item_offsets[row]);
+	if (BufferIsValid(bslot->buffer))
+		ItemPointerSet(&slot->tts_tid, bslot->block, bslot->item_offsets[row]);
+	else
+		ItemPointerSetInvalid(&slot->tts_tid);
 	slot->tts_tableOid = bslot->table_oid;
 }
 
@@ -318,8 +383,10 @@ pg_batch_slot_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 	PgBatchSlot *bslot = (PgBatchSlot *) slot;
 	HeapTupleData tuple;
 
-	if (bslot->current_row < 0)
-		elog(ERROR, "pg_batch slot has no current row");
+	if (bslot->current_row < 0 || !BufferIsValid(bslot->buffer))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("system attributes are unavailable for this pg_batch source")));
 	tuple = pg_batch_heap_tuple(bslot, bslot->current_row);
 	return heap_getsysattr(&tuple, attnum, bslot->source_desc, isnull);
 }
@@ -331,8 +398,10 @@ pg_batch_slot_is_current_xact_tuple(TupleTableSlot *slot)
 	HeapTupleData tuple;
 	TransactionId xmin;
 
-	if (bslot->current_row < 0)
-		elog(ERROR, "pg_batch slot has no current row");
+	if (bslot->current_row < 0 || !BufferIsValid(bslot->buffer))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("transaction visibility metadata is unavailable for this pg_batch source")));
 	tuple = pg_batch_heap_tuple(bslot, bslot->current_row);
 	xmin = HeapTupleHeaderGetXmin(tuple.t_data);
 	return TransactionIdIsCurrentTransactionId(xmin);
@@ -441,6 +510,8 @@ pg_batch_load_batch(PgBatchSlot *bslot, Buffer buffer, BlockNumber block,
 	bslot->buffer = buffer;
 	bslot->block = block;
 	bslot->table_oid = table_oid;
+	bslot->format_ops = NULL;
+	bslot->format_private = NULL;
 	memcpy(bslot->item_offsets, item_offsets, sizeof(OffsetNumber) * nrows);
 	bslot->nrows = nrows;
 	bslot->selected_rows = pg_batch_nrows_mask(nrows);

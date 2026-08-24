@@ -81,6 +81,43 @@ scratch tuple slot. On the same mixed table, the cursor version was 8--9%
 faster for early columns and 25--27% faster for late columns. It also removes
 the machine- and schema-specific seven-attribute crossover rule.
 
+## Compressed Arrow experiment
+
+The same `PgBatchFilterProject` and `PgBatchAgg` nodes were also measured over
+a backend-local compressed source. Each requested column is exposed through
+the Arrow C Data Interface. `PLAIN` data is used in place; `DELTA8` and
+`DELTA16` data is decoded into an `int32` values buffer. The selection mask is
+kept outside Arrow, and no `Datum` array is made unless execution falls back to
+a scalar expression or row-at-a-time parent.
+
+Snapshot build time is excluded from query time. The input size below is the
+logical size of the uncompressed `int4` values, without heap overhead.
+
+| Source | Logical | Compressed | Ratio | Build, ms |
+|---|---:|---:|---:|---:|
+| Narrow, mostly delta | 61 MB | 21 MB | 35.2% | 84.549 |
+| Wide, mostly delta | 57 MB | 20 MB | 34.5% | 58.408 |
+| `PLAIN`-heavy | 15 MB | 15 MB | 98.4% | 27.812 |
+
+| Test | PostgreSQL, ms | Heap batch, ms | Arrow batch, ms |
+|---|---:|---:|---:|
+| Narrow, two dense quals | 47.032 | 21.855 | 7.696 |
+| Narrow, pass none | 31.489 | 12.919 | 4.925 |
+| Wide, early filter and late projection | 7.402 | 4.060 | 0.921 |
+| Wide, late filter and early projection | 11.955 | 4.408 | 0.941 |
+| Wide, `count(*)` | 8.480 | 3.943 | 0.828 |
+| Wide, `sum(c60)` from the native batch | 6.701 | 3.878 | 0.802 |
+| `PLAIN`, `count(*)` | 18.468 | 6.304 | 2.077 |
+| `DELTA16`, `sum(c4)` | 19.168 | 8.861 | 2.935 |
+
+The simplified format dispatch was also compared with the exact pre-refactor
+library, using the same PostgreSQL binary and heap tables. A 20-second,
+single-client `pgbench` run measured 3.956 ms versus 3.935 ms for the wide
+`count(*)` case, a 0.5% increase. The dense narrow case measured 18.617 ms
+versus 18.971 ms, so no regression was observed there. Short alternating
+samples were noisier because other work on the machine changed even ordinary
+executor timings.
+
 ## Limits
 
 The prototype materializes all requested filter columns before it evaluates

@@ -157,10 +157,16 @@ pg_batch_fetch_batch(PgBatchFilterState *state)
 			pg_batch_finish_batch(bslot);
 			continue;
 		}
-		pg_batch_materialize_columns(bslot,
+		if (request_slot->request.return_batch)
+			pg_batch_prepare_columns(bslot,
 									 request_slot->request.survivor_columns,
 									 bslot->selected_rows,
 									 PG_BATCH_PROJECT_PHASE);
+		else
+			pg_batch_materialize_columns(bslot,
+										 request_slot->request.survivor_columns,
+										 bslot->selected_rows,
+										 PG_BATCH_PROJECT_PHASE);
 		rows = pg_batch_row_count(bslot->selected_rows);
 		state->output_rows += rows;
 		state->active_batch = bslot;

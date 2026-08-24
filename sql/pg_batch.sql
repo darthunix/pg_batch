@@ -152,5 +152,60 @@ DEALLOCATE pg_batch_parameter;
 
 SELECT count(*), sum(c2) FROM pg_batch_test WHERE false;
 
+CREATE TABLE pg_batch_arrow AS
+SELECT g AS c1,
+       CASE WHEN g % 7 = 0 THEN NULL ELSE g + 1 END AS c2,
+       CASE WHEN g % 2 = 0
+            THEN 2147483647 - g
+            ELSE -2147483647 + g
+       END AS c3,
+       g * 1000 AS c4
+FROM generate_series(1, 130) AS g;
+ANALYZE pg_batch_arrow;
+
+SET pg_batch.enable = off;
+CREATE TEMP TABLE plain_arrow_rows AS
+SELECT c1, c3
+FROM pg_batch_arrow
+WHERE c2 < 100 AND (c1 + c3) % 5 = 0;
+CREATE TEMP TABLE plain_arrow_agg AS
+SELECT count(*) AS n, count(c2) AS nn, sum(c1) AS total,
+       sum(c4) AS delta16_total
+FROM pg_batch_arrow
+WHERE c2 < 100;
+
+SELECT pg_batch_compress('pg_batch_arrow') > 0 AS compressed;
+SET pg_batch.enable = on;
+SET pg_batch.use_compressed = on;
+
+EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT count(*), count(c2), sum(c1), sum(c4)
+FROM pg_batch_arrow
+WHERE c2 < 100;
+
+CREATE TEMP TABLE compressed_arrow_rows AS
+SELECT c1, c3
+FROM pg_batch_arrow
+WHERE c2 < 100 AND (c1 + c3) % 5 = 0;
+CREATE TEMP TABLE compressed_arrow_agg AS
+SELECT count(*) AS n, count(c2) AS nn, sum(c1) AS total,
+       sum(c4) AS delta16_total
+FROM pg_batch_arrow
+WHERE c2 < 100;
+
+SELECT NOT EXISTS (
+           (TABLE compressed_arrow_rows EXCEPT ALL TABLE plain_arrow_rows)
+           UNION ALL
+           (TABLE plain_arrow_rows EXCEPT ALL TABLE compressed_arrow_rows)
+       ) AS arrow_rows_match,
+       NOT EXISTS (
+           (TABLE compressed_arrow_agg EXCEPT ALL TABLE plain_arrow_agg)
+           UNION ALL
+           (TABLE plain_arrow_agg EXCEPT ALL TABLE compressed_arrow_agg)
+       ) AS arrow_aggregates_match;
+
+SELECT pg_batch_compress('pg_batch_arrow') > 0 AS recompressed;
+
+DROP TABLE pg_batch_arrow;
 DROP TABLE pg_batch_test;
 DROP EXTENSION pg_batch;

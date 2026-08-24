@@ -12,6 +12,8 @@
 #include "storage/block.h"
 #include "storage/buf.h"
 
+#include "pg_batch_arrow.h"
+
 #define PG_BATCH_SIZE 64
 #define PG_BATCH_ALL_ROWS UINT64_MAX
 
@@ -29,6 +31,23 @@ typedef struct PgBatchColumn
 	uint64		valid_rows;
 } PgBatchColumn;
 
+typedef struct PgBatchArrowView
+{
+	const struct ArrowArray *array;
+	const struct ArrowSchema *schema;
+} PgBatchArrowView;
+
+struct PgBatchSlot;
+
+typedef struct PgBatchFormatOps
+{
+	void		(*prepare_columns) (struct PgBatchSlot *bslot,
+									const Bitmapset *columns, uint64 rows,
+									PgBatchMaterializePhase phase);
+	PgBatchArrowView (*get_arrow_column) (struct PgBatchSlot *bslot, int column);
+	void		(*clear_batch) (struct PgBatchSlot *bslot);
+} PgBatchFormatOps;
+
 typedef struct PgBatchRequest
 {
 	/*
@@ -36,9 +55,9 @@ typedef struct PgBatchRequest
 	 * Column numbers are positions in the compact scan descriptor, not table
 	 * attribute numbers.
 	 */
-	/* Materialize these columns for every source row before filtering. */
+	/* Prepare these columns for every source row before filtering. */
 	Bitmapset  *filter_columns;
-	/* Materialize these columns only for rows that survive filtering. */
+	/* Prepare these columns only for rows that survive filtering. */
 	Bitmapset  *survivor_columns;
 	/* Return one batch to a batch-aware parent instead of scalar rows. */
 	bool		return_batch;
@@ -56,7 +75,7 @@ typedef struct PgBatchSlot
 	/* Filter columns form a prefix of the compact slot descriptor. */
 	int			nfilter_columns;
 
-	/* Every batch is a slice of visible tuples from one pinned heap page. */
+	/* Default heap representation: visible tuples from one pinned page. */
 	Buffer		buffer;
 	BlockNumber block;
 	Oid			table_oid;
@@ -64,6 +83,9 @@ typedef struct PgBatchSlot
 	/* A high-water deformation cursor for each tuple on the heap page. */
 	HeapTupleDeformState cursors[PG_BATCH_SIZE];
 	PgBatchColumn *columns;
+	/* NULL means the default heap Datum representation. */
+	const PgBatchFormatOps *format_ops;
+	void	   *format_private;
 	int			nrows;
 	/* selected_rows is a bit mask; current_row provides its scalar view. */
 	int			current_row;
@@ -78,6 +100,9 @@ typedef struct PgBatchSlot
 	uint64		filter_datums;
 	uint64		project_datums;
 	uint64		restarted_project_datums;
+	uint64		arrow_filter_columns;
+	uint64		arrow_project_columns;
+	uint64		arrow_decoded_values;
 } PgBatchSlot;
 
 typedef enum PgBatchAggKind
@@ -88,6 +113,7 @@ typedef enum PgBatchAggKind
 } PgBatchAggKind;
 
 extern bool pg_batch_enable;
+extern bool pg_batch_use_compressed;
 extern const TupleTableSlotOps PgBatchSlotOps;
 
 static inline uint64
@@ -140,7 +166,22 @@ extern void pg_batch_materialize_columns(PgBatchSlot *bslot,
 										 const Bitmapset *columns,
 										 uint64 selected_rows,
 										 PgBatchMaterializePhase phase);
+extern void pg_batch_prepare_columns(PgBatchSlot *bslot,
+									 const Bitmapset *columns,
+									 uint64 selected_rows,
+									 PgBatchMaterializePhase phase);
+extern PgBatchArrowView pg_batch_get_arrow_column(PgBatchSlot *bslot,
+												  int column);
 extern void pg_batch_slot_select_row(PgBatchSlot *bslot, int row);
+
+typedef struct PgBatchCompressedRelation PgBatchCompressedRelation;
+
+extern PgBatchCompressedRelation *pg_batch_compressed_lookup(Relation relation);
+extern void pg_batch_compressed_release(PgBatchCompressedRelation *compressed);
+extern bool pg_batch_compressed_next_batch(PgBatchSlot *bslot,
+										   PgBatchCompressedRelation *compressed,
+										   int *batch_index);
+extern void pg_batch_compress_fini(void);
 
 extern OpExpr *pg_batch_match_qual(Node *clause, uint8 *var_argno);
 extern Node *pg_batch_create_scan_state(CustomScan *cscan);

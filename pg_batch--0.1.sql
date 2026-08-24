@@ -1,1 +1,4 @@
--- pg_batch defines executor hooks but no SQL objects.
+CREATE FUNCTION pg_batch_compress(regclass)
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'pg_batch_compress'
+LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
