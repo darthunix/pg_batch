@@ -1,0 +1,11 @@
+*.bc
+*.dylib
+*.o
+*.so
+/results/
+/regression.diffs
+/regression.out
+/data/
+/pg_batch.log
+/benchmark/artifacts/
+/pg_batch-*.log

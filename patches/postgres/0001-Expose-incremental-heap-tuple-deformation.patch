@@ -1,0 +1,695 @@
+From 98b5dd59fd107d8001fda41e08955c3ac076b9a6 Mon Sep 17 00:00:00 2001
+Message-ID: <98b5dd59fd107d8001fda41e08955c3ac076b9a6.1787552739.git.darthunix@gmail.com>
+From: Denis Smirnov <darthunix@gmail.com>
+Date: Mon, 24 Aug 2026 13:09:31 +0700
+Subject: [PATCH] Expose incremental heap tuple deformation
+
+---
+ src/backend/executor/execTuples.c | 261 +-------------------
+ src/include/access/heap_deform.h  | 392 ++++++++++++++++++++++++++++++
+ 2 files changed, 402 insertions(+), 251 deletions(-)
+ create mode 100644 src/include/access/heap_deform.h
+
+diff --git a/src/backend/executor/execTuples.c b/src/backend/executor/execTuples.c
+index b8e8f52c64c..c335e832523 100644
+--- a/src/backend/executor/execTuples.c
++++ b/src/backend/executor/execTuples.c
+@@ -57,6 +57,7 @@
+  */
+ #include "postgres.h"
+ 
++#include "access/heap_deform.h"
+ #include "access/heaptoast.h"
+ #include "access/htup_details.h"
+ #include "access/tupdesc_details.h"
+@@ -1017,260 +1018,18 @@ static pg_always_inline void
+ slot_deform_heap_tuple(TupleTableSlot *slot, HeapTuple tuple, uint32 *offp,
+ 					   int reqnatts, bool support_cstring)
+ {
+-	CompactAttribute *cattrs;
+-	CompactAttribute *cattr;
+-	TupleDesc	tupleDesc = slot->tts_tupleDescriptor;
+-	HeapTupleHeader tup = tuple->t_data;
+-	size_t		attnum;
+-	int			firstNonCacheOffsetAttr;
+-	int			firstNonGuaranteedAttr;
+-	int			firstNullAttr;
+-	int			natts;
+-	Datum	   *values;
+-	bool	   *isnull;
+-	char	   *tp;				/* ptr to tuple data */
+-	uint32		off;			/* offset in tuple data */
+-
+-	/* Did someone forget to call TupleDescFinalize()? */
+-	Assert(tupleDesc->firstNonCachedOffsetAttr >= 0);
+-
+-	isnull = slot->tts_isnull;
+-
+-	/*
+-	 * Some callers may form and deform tuples prior to NOT NULL constraints
+-	 * being checked.  Here we'd like to optimize the case where we only need
+-	 * to fetch attributes before or up to the point where the attribute is
+-	 * guaranteed to exist in the tuple.  We rely on the slot flag being set
+-	 * correctly to only enable this optimization when it's valid to do so.
+-	 * This optimization allows us to save fetching the number of attributes
+-	 * from the tuple and saves the additional cost of handling non-byval
+-	 * attrs.
+-	 */
+-	firstNonGuaranteedAttr = Min(reqnatts, slot->tts_first_nonguaranteed);
+-
+-	firstNonCacheOffsetAttr = tupleDesc->firstNonCachedOffsetAttr;
+-
+-	if (HeapTupleHasNulls(tuple))
+-	{
+-		natts = HeapTupleHeaderGetNatts(tup);
+-		tp = (char *) tup + MAXALIGN(offsetof(HeapTupleHeaderData, t_bits) +
+-									 BITMAPLEN(natts));
+-
+-		natts = Min(natts, reqnatts);
+-		if (natts > firstNonGuaranteedAttr)
+-		{
+-			uint8	   *bp = tup->t_bits;
+-
+-			/* Find the first NULL attr */
+-			firstNullAttr = first_null_attr(bp, natts);
+-
+-			/*
+-			 * And populate the isnull array for all attributes being fetched
+-			 * from the tuple.
+-			 */
+-			populate_isnull_array(bp, natts, isnull);
+-		}
+-		else
+-		{
+-			/* Otherwise all required columns are guaranteed to exist */
+-			firstNullAttr = natts;
+-
+-			/*
+-			 * Check TupleDescFinalize() didn't get confused when setting
+-			 * firstNonGuaranteedAttr.  There should never be a NULL in a
+-			 * guaranteed column.
+-			 */
+-			Assert(first_null_attr(tup->t_bits, natts) >= firstNullAttr);
+-		}
+-	}
+-	else
++	if (unlikely(!heap_deform_tuple_to(&slot->tts_nvalid, offp, tuple,
++									  slot->tts_tupleDescriptor,
++									  slot->tts_first_nonguaranteed,
++									  reqnatts,
++									  slot->tts_values,
++									  slot->tts_isnull,
++									  support_cstring)))
+ 	{
+-		tp = (char *) tup + MAXALIGN(offsetof(HeapTupleHeaderData, t_bits));
+-
+-		/*
+-		 * We only need to look at the tuple's natts if we need more than the
+-		 * guaranteed number of columns
+-		 */
+-		if (reqnatts > firstNonGuaranteedAttr)
+-			natts = Min(HeapTupleHeaderGetNatts(tup), reqnatts);
+-		else
+-		{
+-			/* No need to access the number of attributes in the tuple */
+-			natts = reqnatts;
+-		}
+-
+-		/* All attrs can be fetched without checking for NULLs */
+-		firstNullAttr = natts;
+-	}
+-
+-	attnum = slot->tts_nvalid;
+-	values = slot->tts_values;
+-	slot->tts_nvalid = reqnatts;
+-
+-	/*
+-	 * We store the tupleDesc's CompactAttribute array in 'cattrs' as gcc
+-	 * seems to be unwilling to optimize accessing the CompactAttribute
+-	 * element efficiently when accessing it via TupleDescCompactAttr().
+-	 */
+-	cattrs = tupleDesc->compact_attrs;
+-
+-	/* Ensure we calculated tp correctly */
+-	Assert(tp == (char *) tup + tup->t_hoff);
+-
+-	if (attnum < firstNonGuaranteedAttr)
+-	{
+-		int			attlen;
+-
+-		do
+-		{
+-			isnull[attnum] = false;
+-			cattr = &cattrs[attnum];
+-			attlen = cattr->attlen;
+-
+-			/* We don't expect any non-byval types */
+-			pg_assume(attlen > 0);
+-			Assert(cattr->attbyval == true);
+-
+-			off = cattr->attcacheoff;
+-			values[attnum] = fetch_att_noerr(tp + off, true, attlen);
+-			attnum++;
+-		} while (attnum < firstNonGuaranteedAttr);
+-
+-		off += attlen;
+-
+-		if (attnum == reqnatts)
+-			goto done;
+-	}
+-	else
+-	{
+-		/*
+-		 * We may be incrementally deforming the tuple, so set 'off' to the
+-		 * previously cached value.  This may be 0, if the slot has just
+-		 * received a new tuple.
+-		 */
+-		off = *offp;
+-
+-		/* We expect *offp to be set to 0 when attnum == 0 */
+-		Assert(off == 0 || attnum > 0);
+-	}
+-
+-	/* We can use attcacheoff up until the first NULL */
+-	firstNonCacheOffsetAttr = Min(firstNonCacheOffsetAttr, firstNullAttr);
+-
+-	/*
+-	 * Handle the portion of the tuple that we have cached the offset for up
+-	 * to the first NULL attribute.  The offset is effectively fixed for
+-	 * these, so we can use the CompactAttribute's attcacheoff.
+-	 */
+-	if (attnum < firstNonCacheOffsetAttr)
+-	{
+-		int			attlen;
+-
+-		do
+-		{
+-			isnull[attnum] = false;
+-			cattr = &cattrs[attnum];
+-			attlen = cattr->attlen;
+-			off = cattr->attcacheoff;
+-			values[attnum] = fetch_att_noerr(tp + off,
+-											 cattr->attbyval,
+-											 attlen);
+-			attnum++;
+-		} while (attnum < firstNonCacheOffsetAttr);
+-
+-		/*
+-		 * Point the offset after the end of the last attribute with a cached
+-		 * offset.  We expect the final cached offset attribute to have a
+-		 * fixed width, so just add the attlen to the attcacheoff
+-		 */
+-		Assert(attlen > 0);
+-		off += attlen;
+-	}
+-
+-	/*
+-	 * Handle any portion of the tuple that doesn't have a fixed offset up
+-	 * until the first NULL attribute.  This loop only differs from the one
+-	 * after it by the NULL checks.
+-	 */
+-	for (; attnum < firstNullAttr; attnum++)
+-	{
+-		int			attlen;
+-
+-		isnull[attnum] = false;
+-		cattr = &cattrs[attnum];
+-		attlen = cattr->attlen;
+-
+-		/*
+-		 * Only emit the cstring-related code in align_fetch_then_add() when
+-		 * cstring support is needed.  We assume support_cstring will be
+-		 * passed as a const to allow the compiler to eliminate this branch.
+-		 */
+-		if (!support_cstring)
+-			pg_assume(attlen > 0 || attlen == -1);
+-
+-		/* align 'off', fetch the datum, and increment off beyond the datum */
+-		values[attnum] = align_fetch_then_add(tp,
+-											  &off,
+-											  cattr->attbyval,
+-											  attlen,
+-											  cattr->attalignby);
+-	}
+-
+-	/*
+-	 * Now handle any remaining attributes in the tuple up to the requested
+-	 * attnum.  This time, include NULL checks as we're now at the first NULL
+-	 * attribute.
+-	 */
+-	for (; attnum < natts; attnum++)
+-	{
+-		int			attlen;
+-
+-		if (isnull[attnum])
+-		{
+-			values[attnum] = (Datum) 0;
+-			continue;
+-		}
+-
+-		cattr = &cattrs[attnum];
+-		attlen = cattr->attlen;
+-
+-		/* As above, only emit cstring code when needed. */
+-		if (!support_cstring)
+-			pg_assume(attlen > 0 || attlen == -1);
+-
+-		/* align 'off', fetch the datum, and increment off beyond the datum */
+-		values[attnum] = align_fetch_then_add(tp,
+-											  &off,
+-											  cattr->attbyval,
+-											  attlen,
+-											  cattr->attalignby);
+-	}
+-
+-	/* Fetch any missing attrs and raise an error if reqnatts is invalid */
+-	if (unlikely(attnum < reqnatts))
+-	{
+-		/*
+-		 * Cache the offset before calling the function to allow the compiler
+-		 * to implement a tail-call optimization
+-		 */
+-		*offp = off;
+-
+-		Assert(HeapTupleHeaderGetNatts(tup) <= attnum);
+-
+-		/*
+-		 * Fetch all missing attributes.  We pass natts rather than attnum as
+-		 * if we're deforming attributes after having already deformed some
+-		 * missing attributes, then the call to populate_isnull_array() may
+-		 * have overwritten the previous tts_isnull values from what was
+-		 * stored in the previous call to slot_getmissingattrs().
+-		 */
+-		slot_getmissingattrs(slot, HeapTupleHeaderGetNatts(tup), reqnatts);
++		slot_getmissingattrs(slot,
++						 HeapTupleHeaderGetNatts(tuple->t_data), reqnatts);
+ 		return;
+ 	}
+-done:
+-
+-	/* Save current offset for next execution */
+-	*offp = off;
+ }
+ 
+ const TupleTableSlotOps TTSOpsVirtual = {
+diff --git a/src/include/access/heap_deform.h b/src/include/access/heap_deform.h
+new file mode 100644
+index 00000000000..2c3eb4dc6f5
+--- /dev/null
++++ b/src/include/access/heap_deform.h
+@@ -0,0 +1,392 @@
++/*-------------------------------------------------------------------------
++ *
++ * heap_deform.h
++ *	  Incremental heap tuple deformation.
++ *
++ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
++ * Portions Copyright (c) 1994, Regents of the University of California
++ *
++ * src/include/access/heap_deform.h
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef HEAP_DEFORM_H
++#define HEAP_DEFORM_H
++
++#include "access/htup_details.h"
++
++/* State needed to continue deforming the same tuple. */
++typedef struct HeapTupleDeformState
++{
++	AttrNumber	nvalid;		/* attribute high-water mark */
++	uint32		off;			/* current offset in tuple data */
++} HeapTupleDeformState;
++
++static inline void
++heap_deform_tuple_init(HeapTupleDeformState *state)
++{
++	state->nvalid = 0;
++	state->off = 0;
++}
++
++/*
++ * heap_deform_tuple_advance
++ *		Advance to one physical attribute without materializing the prefix.
++ *
++ * target_attnum is one-based and must move forward from the cursor's
++ * high-water mark. The returned Datum points into tuple when the attribute is
++ * passed by reference. The function returns false, without setting value or
++ * isnull, if the physical tuple does not have target_attnum. The caller is
++ * responsible for supplying a missing value.
++ *
++ * first_non_guaranteed_attr and support_cstring have the same meaning as for
++ * heap_deform_tuple_to(). The cursor may only be reused with the same tuple,
++ * tuple descriptor, and first_non_guaranteed_attr.
++ */
++static pg_always_inline bool
++heap_deform_tuple_advance(HeapTupleDeformState *state, HeapTuple tuple,
++						  TupleDesc tuple_desc,
++						  int first_non_guaranteed_attr,
++						  AttrNumber target_attnum, Datum *value,
++						  bool *isnull, bool support_cstring)
++{
++	CompactAttribute *cattrs = tuple_desc->compact_attrs;
++	CompactAttribute *cattr;
++	HeapTupleHeader tup = tuple->t_data;
++	size_t		attnum = state->nvalid;
++	int			first_non_cache_offset_attr;
++	int			first_null_attr_num;
++	int			natts;
++	char	   *tp = (char *) tup + tup->t_hoff;
++	uint32		off = state->off;
++
++	Assert(tuple_desc->firstNonCachedOffsetAttr >= 0);
++	Assert(target_attnum > 0 && target_attnum <= tuple_desc->natts);
++	Assert(state->nvalid >= 0 && state->nvalid < target_attnum);
++	Assert(first_non_guaranteed_attr >= 0 &&
++		   first_non_guaranteed_attr <= tuple_desc->natts);
++	Assert(off == 0 || attnum > 0);
++
++	first_non_guaranteed_attr = Min(target_attnum,
++									first_non_guaranteed_attr);
++
++	/* All attributes in this prefix have fixed, cached offsets. */
++	if (target_attnum <= first_non_guaranteed_attr)
++	{
++		cattr = &cattrs[target_attnum - 1];
++		Assert(cattr->attcacheoff >= 0);
++		Assert(cattr->attlen > 0 && cattr->attbyval);
++		off = cattr->attcacheoff;
++		*value = fetch_att_noerr(tp + off, true, cattr->attlen);
++		*isnull = false;
++		state->nvalid = target_attnum;
++		state->off = off + cattr->attlen;
++		return true;
++	}
++
++	natts = Min(HeapTupleHeaderGetNatts(tup), target_attnum);
++	if (attnum >= natts)
++		return false;
++
++	if (HeapTupleHasNulls(tuple))
++		first_null_attr_num = first_null_attr(tup->t_bits, natts);
++	else
++		first_null_attr_num = natts;
++	first_non_cache_offset_attr =
++		Min(tuple_desc->firstNonCachedOffsetAttr, first_null_attr_num);
++
++	/* Skip any remaining guaranteed prefix using its last cached offset. */
++	if (attnum < first_non_guaranteed_attr)
++	{
++		cattr = &cattrs[first_non_guaranteed_attr - 1];
++		Assert(cattr->attcacheoff >= 0);
++		Assert(cattr->attlen > 0 && cattr->attbyval);
++		off = cattr->attcacheoff + cattr->attlen;
++		attnum = first_non_guaranteed_attr;
++	}
++
++	/* Cached offsets let us jump directly to the target attribute. */
++	if (attnum < first_non_cache_offset_attr)
++	{
++		if (target_attnum <= first_non_cache_offset_attr)
++		{
++			cattr = &cattrs[target_attnum - 1];
++			Assert(cattr->attcacheoff >= 0 && cattr->attlen > 0);
++			off = cattr->attcacheoff;
++			*value = fetch_att_noerr(tp + off, cattr->attbyval,
++									  cattr->attlen);
++			*isnull = false;
++			state->nvalid = target_attnum;
++			state->off = off + cattr->attlen;
++			return true;
++		}
++
++		cattr = &cattrs[first_non_cache_offset_attr - 1];
++		Assert(cattr->attcacheoff >= 0 && cattr->attlen > 0);
++		off = cattr->attcacheoff + cattr->attlen;
++		attnum = first_non_cache_offset_attr;
++	}
++
++	/* Walk non-cached attributes before the first NULL. */
++	for (; attnum < first_null_attr_num; attnum++)
++	{
++		Datum		datum;
++
++		cattr = &cattrs[attnum];
++		if (!support_cstring)
++			pg_assume(cattr->attlen > 0 || cattr->attlen == -1);
++		datum = align_fetch_then_add(tp, &off, cattr->attbyval,
++									 cattr->attlen, cattr->attalignby);
++		if (attnum == target_attnum - 1)
++		{
++			*value = datum;
++			*isnull = false;
++			state->nvalid = target_attnum;
++			state->off = off;
++			return true;
++		}
++	}
++
++	/* Continue with NULL checks after the first NULL attribute. */
++	for (; attnum < natts; attnum++)
++	{
++		Datum		datum;
++
++		if (att_isnull(attnum, tup->t_bits))
++		{
++			if (attnum == target_attnum - 1)
++			{
++				*value = (Datum) 0;
++				*isnull = true;
++				state->nvalid = target_attnum;
++				state->off = off;
++				return true;
++			}
++			continue;
++		}
++
++		cattr = &cattrs[attnum];
++		if (!support_cstring)
++			pg_assume(cattr->attlen > 0 || cattr->attlen == -1);
++		datum = align_fetch_then_add(tp, &off, cattr->attbyval,
++									 cattr->attlen, cattr->attalignby);
++		if (attnum == target_attnum - 1)
++		{
++			*value = datum;
++			*isnull = false;
++			state->nvalid = target_attnum;
++			state->off = off;
++			return true;
++		}
++	}
++
++	state->nvalid = natts;
++	state->off = off;
++	return false;
++}
++
++/*
++ * heap_deform_tuple_to
++ *		Incrementally extract physical tuple attributes through reqnatts.
++ *
++ * This keeps separate dense loops because standard tuple slots materialize
++ * every attribute in the requested prefix.
++ *
++ * The caller owns values and isnull. The isnull array must have room for
++ * reqnatts rounded up to the next multiple of 8, as required by
++ * populate_isnull_array(). Datums returned by reference point into tuple,
++ * so the tuple must remain valid while they are used.
++ *
++ * first_non_guaranteed_attr is the number of leading attributes guaranteed to
++ * be present, non-NULL and passed by value. Callers which cannot make those
++ * guarantees must pass 0. support_cstring should be a compile-time constant
++ * so that the compiler can remove cstring handling when it is not needed.
++ *
++ * The function returns false if the physical tuple has fewer than reqnatts
++ * attributes. It does not fill missing attributes; the caller must provide
++ * the appropriate missing values. In either case, *nvalidp advances to
++ * reqnatts. Initialize *nvalidp and *offp to zero before the first call,
++ * request more attributes on each subsequent call, and only reuse them with
++ * the same tuple, tuple descriptor, output arrays and
++ * first_non_guaranteed_attr. HeapTupleDeformState can be used to keep these
++ * two values together.
++ */
++static pg_always_inline bool
++heap_deform_tuple_to(AttrNumber *nvalidp, uint32 *offp, HeapTuple tuple,
++					 TupleDesc tuple_desc, int first_non_guaranteed_attr,
++					 int reqnatts, Datum *values, bool *isnull,
++					 bool support_cstring)
++{
++	CompactAttribute *cattrs;
++	CompactAttribute *cattr;
++	HeapTupleHeader tup = tuple->t_data;
++	size_t		attnum;
++	int			first_non_cache_offset_attr;
++	int			first_null_attr_num;
++	int			natts;
++	char	   *tp;				/* ptr to tuple data */
++	uint32		off;			/* offset in tuple data */
++
++	/* Did someone forget to call TupleDescFinalize()? */
++	Assert(tuple_desc->firstNonCachedOffsetAttr >= 0);
++	Assert(*nvalidp >= 0);
++	Assert(*nvalidp < reqnatts);
++	Assert(first_non_guaranteed_attr >= 0 &&
++		   first_non_guaranteed_attr <= tuple_desc->natts);
++
++	/*
++	 * Some callers may form and deform tuples prior to NOT NULL constraints
++	 * being checked. Only use the guaranteed-attribute optimization when the
++	 * caller says that it is valid for these tuples.
++	 */
++	first_non_guaranteed_attr = Min(reqnatts,
++									first_non_guaranteed_attr);
++	first_non_cache_offset_attr = tuple_desc->firstNonCachedOffsetAttr;
++
++	if (HeapTupleHasNulls(tuple))
++	{
++		natts = HeapTupleHeaderGetNatts(tup);
++		tp = (char *) tup + MAXALIGN(offsetof(HeapTupleHeaderData, t_bits) +
++									 BITMAPLEN(natts));
++
++		natts = Min(natts, reqnatts);
++		if (natts > first_non_guaranteed_attr)
++		{
++			uint8	   *bp = tup->t_bits;
++
++			first_null_attr_num = first_null_attr(bp, natts);
++			populate_isnull_array(bp, natts, isnull);
++		}
++		else
++		{
++			first_null_attr_num = natts;
++			Assert(first_null_attr(tup->t_bits, natts) >=
++				   first_null_attr_num);
++		}
++	}
++	else
++	{
++		tp = (char *) tup + MAXALIGN(offsetof(HeapTupleHeaderData, t_bits));
++
++		if (reqnatts > first_non_guaranteed_attr)
++			natts = Min(HeapTupleHeaderGetNatts(tup), reqnatts);
++		else
++			natts = reqnatts;
++
++		first_null_attr_num = natts;
++	}
++
++	attnum = *nvalidp;
++	*nvalidp = reqnatts;
++	cattrs = tuple_desc->compact_attrs;
++
++	/* Ensure we calculated tp correctly. */
++	Assert(tp == (char *) tup + tup->t_hoff);
++
++	if (attnum < first_non_guaranteed_attr)
++	{
++		int			attlen;
++
++		do
++		{
++			isnull[attnum] = false;
++			cattr = &cattrs[attnum];
++			attlen = cattr->attlen;
++
++			pg_assume(attlen > 0);
++			Assert(cattr->attbyval == true);
++
++			off = cattr->attcacheoff;
++			values[attnum] = fetch_att_noerr(tp + off, true, attlen);
++			attnum++;
++		} while (attnum < first_non_guaranteed_attr);
++
++		off += attlen;
++
++		if (attnum == reqnatts)
++			goto done;
++	}
++	else
++	{
++		off = *offp;
++		Assert(off == 0 || attnum > 0);
++	}
++
++	/* We can use attcacheoff up until the first NULL. */
++	first_non_cache_offset_attr = Min(first_non_cache_offset_attr,
++									 first_null_attr_num);
++
++	if (attnum < first_non_cache_offset_attr)
++	{
++		int			attlen;
++
++		do
++		{
++			isnull[attnum] = false;
++			cattr = &cattrs[attnum];
++			attlen = cattr->attlen;
++			off = cattr->attcacheoff;
++			values[attnum] = fetch_att_noerr(tp + off,
++										 cattr->attbyval,
++										 attlen);
++			attnum++;
++		} while (attnum < first_non_cache_offset_attr);
++
++		Assert(attlen > 0);
++		off += attlen;
++	}
++
++	for (; attnum < first_null_attr_num; attnum++)
++	{
++		int			attlen;
++
++		isnull[attnum] = false;
++		cattr = &cattrs[attnum];
++		attlen = cattr->attlen;
++
++		if (!support_cstring)
++			pg_assume(attlen > 0 || attlen == -1);
++
++		values[attnum] = align_fetch_then_add(tp,
++										  &off,
++										  cattr->attbyval,
++										  attlen,
++										  cattr->attalignby);
++	}
++
++	for (; attnum < natts; attnum++)
++	{
++		int			attlen;
++
++		if (isnull[attnum])
++		{
++			values[attnum] = (Datum) 0;
++			continue;
++		}
++
++		cattr = &cattrs[attnum];
++		attlen = cattr->attlen;
++
++		if (!support_cstring)
++			pg_assume(attlen > 0 || attlen == -1);
++
++		values[attnum] = align_fetch_then_add(tp,
++										  &off,
++										  cattr->attbyval,
++										  attlen,
++										  cattr->attalignby);
++	}
++
++	if (unlikely(attnum < reqnatts))
++	{
++		*offp = off;
++		Assert(HeapTupleHeaderGetNatts(tup) <= attnum);
++		return false;
++	}
++
++done:
++	*offp = off;
++	return true;
++}
++
++#endif							/* HEAP_DEFORM_H */
+-- 
+2.54.0
+

@@ -1,0 +1,1 @@
+-- pg_batch defines executor hooks but no SQL objects.

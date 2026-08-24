@@ -1,0 +1,2 @@
+*.out                                   -whitespace
+patches/postgres/*.patch                -whitespace
