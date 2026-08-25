@@ -22,6 +22,17 @@ Arrow C Data Interface `ArrowArray` objects. Batch filters and aggregates read
 the Arrow value and validity buffers directly. PostgreSQL `Datum` values are
 formed only when a residual expression or a row-at-a-time parent needs them.
 
+The snapshot now groups 64-row executor batches into larger storage groups.
+Each group stores per-column min/max values, NULL presence, and an exact small
+set of values until that set overflows. `pg_batch.compressed_scan_mode` selects
+plain batch reading, group pruning, or pruning plus exact source filtering.
+The default group contains 4096 rows; `pg_batch_compress(regclass, integer)`
+accepts another multiple of 64.
+
+Source filtering currently understands the six built-in `int4` comparisons.
+Other safe conditions remain in `PgBatchScan`. The small set is exact metadata,
+not a Bloom or Fuse filter; it deliberately keeps this API experiment simple.
+
 The slot stores only columns referenced by the query. Filter columns precede
 projection-only columns in its compact descriptor. Each source row keeps a
 PostgreSQL `HeapTupleDeformState`, which records the physical attribute
@@ -71,6 +82,7 @@ To exercise the columnar source, make an in-memory snapshot and enable it:
 ```sql
 SELECT pg_batch_compress('int4_table');
 SET pg_batch.use_compressed = on;
+SET pg_batch.compressed_scan_mode = filter;
 ```
 
 The function returns the compressed size in bytes. The snapshot belongs to the
@@ -78,12 +90,21 @@ current backend and replaces an older snapshot of the same table. It is not
 kept in sync with the source table, so recreate it after any data change.
 
 The first version intentionally supports only serial forward scans of ordinary
-heap tables without dropped or missing columns. The compressed source accepts
-only `int4` columns and uses `PLAIN`, `DELTA8`, or `DELTA16` independently for
-each 64-row column. `PLAIN` becomes an Arrow values buffer without copying;
-delta columns are decoded lazily into an Arrow `int32` buffer, not a `Datum`
-array. The slot keeps its 64-bit row selection separately; Arrow validity bits
-describe NULLs only. Unsupported queries keep their ordinary PostgreSQL plans.
+heap-compatible tables without dropped or missing columns. The compressed
+source accepts only `int4` columns and uses `PLAIN`, `DELTA8`, or `DELTA16`
+independently for each 64-row column. `PLAIN` becomes an Arrow values buffer
+without copying; delta columns are decoded lazily into an Arrow `int32` buffer,
+not a `Datum` array. The slot keeps its 64-bit row selection separately; Arrow
+validity bits describe NULLs only. Unsupported queries keep their ordinary
+PostgreSQL plans.
+
+The extension also registers `pg_batch_compressed`, a test table access method.
+Its physical storage and all ordinary callbacks are heap callbacks. Only a
+scan into `PgBatchSlot` reads the compressed snapshot, including the request
+for restrictions and lazy columns carried by that slot. Set
+`pg_batch.compressed_via_tableam = on` to exercise this path. This isolates the
+API experiment: the direct path and the table access method path share the
+same storage groups, filtering code, and batch format.
 
 ## Source layout
 
@@ -92,7 +113,8 @@ describe NULLs only. Unsupported queries keep their ordinary PostgreSQL plans.
 - `pg_batch_slot.c` owns the batch slot, selection mask, lazy columns, and
   heap deformation cursors.
 - `pg_batch_compress.c` owns the compressed snapshots and their lazy Arrow
-  column views.
+  column views, storage-group metadata, pruning, and source filtering.
+- `pg_batch_tableam.c` contains the heap-compatible test table access method.
 - `pg_batch_scan.c`, `pg_batch_filter.c`, and `pg_batch_agg.c` implement
   the three executor nodes.
 - `pg_batch_exec.c` contains the small amount of shared executor plumbing.
@@ -108,6 +130,7 @@ psql -f benchmark/setup.sql
 psql -f benchmark/run.sql
 psql -f benchmark/run_mixed.sql
 psql -f benchmark/run_compressed.sql
+psql -f benchmark/run_groups.sql
 ```
 
 `benchmark/run_heap_compare.sql` uses longer alternating samples for checking

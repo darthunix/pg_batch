@@ -173,7 +173,8 @@ pg_batch_relation_supported(PlannerInfo *root, RelOptInfo *rel,
 
 	relation = table_open(rte->relid, NoLock);
 	if (relation->rd_rel->relkind != RELKIND_RELATION ||
-		relation->rd_rel->relam != HEAP_TABLE_AM_OID)
+		(relation->rd_rel->relam != HEAP_TABLE_AM_OID &&
+		 !pg_batch_relation_uses_tableam(relation)))
 		result = false;
 	for (int i = 0; result && i < RelationGetNumberOfAttributes(relation); i++)
 	{

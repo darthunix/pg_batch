@@ -292,15 +292,22 @@ WHERE c2 < 100;
          ->  Custom Scan (PgBatchScan) on pg_batch_arrow (actual rows=84.00 loops=1)
                Batch Size: 64
                Batch Source: Compressed Arrow
+               Compressed Path: Direct
+               Compressed Scan Mode: batch
                Batches: 3
                Source Rows: 130
                Filter Datums: 0
                Projection Datums: 0
                Restarted Projection Datums: 0
+               Storage Groups Examined: 0
+               Groups Skipped by Min/Max: 0
+               Groups Skipped by Membership: 0
+               Rows Removed by Source Filter: 0
+               Encoded Bytes Touched: 1392
                Arrow Filter Columns: 3
                Arrow Projection Columns: 4
                Arrow Decoded Values: 386
-(18 rows)
+(25 rows)
 
 CREATE TEMP TABLE compressed_arrow_rows AS
 SELECT c1, c3
@@ -332,6 +339,153 @@ SELECT pg_batch_compress('pg_batch_arrow') > 0 AS recompressed;
  t
 (1 row)
 
+CREATE TABLE pg_batch_groups AS
+SELECT g AS c1, (g % 4) * 2 AS c2, g + 1000 AS c3
+FROM generate_series(1, 384) AS g;
+ANALYZE pg_batch_groups;
+SELECT pg_batch_compress('pg_batch_groups', 128) > 0 AS grouped;
+ grouped 
+---------
+ t
+(1 row)
+
+SET pg_batch.compressed_scan_mode = prune;
+EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT count(*) FROM pg_batch_groups WHERE c1 >= 130 AND c1 <= 140;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Custom Scan (PgBatchAgg) (actual rows=1.00 loops=1)
+   Input Batches: 1
+   Input Rows: 11
+   ->  Custom Scan (PgBatchFilterProject) (actual rows=11.00 loops=1)
+         Input Batches: 1
+         Input Rows: 11
+         Output Rows: 11
+         ->  Custom Scan (PgBatchScan) on pg_batch_groups (actual rows=11.00 loops=1)
+               Batch Size: 64
+               Batch Source: Compressed Arrow
+               Compressed Path: Direct
+               Compressed Scan Mode: prune
+               Batches: 2
+               Source Rows: 128
+               Filter Datums: 0
+               Projection Datums: 0
+               Restarted Projection Datums: 0
+               Storage Groups Examined: 3
+               Groups Skipped by Min/Max: 2
+               Groups Skipped by Membership: 0
+               Rows Removed by Source Filter: 0
+               Encoded Bytes Touched: 560
+               Arrow Filter Columns: 2
+               Arrow Projection Columns: 0
+               Arrow Decoded Values: 128
+(25 rows)
+
+EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT count(*) FROM pg_batch_groups WHERE c2 = 3;
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Custom Scan (PgBatchAgg) (actual rows=1.00 loops=1)
+   Input Batches: 0
+   Input Rows: 0
+   ->  Custom Scan (PgBatchFilterProject) (actual rows=0.00 loops=1)
+         Input Batches: 0
+         Input Rows: 0
+         Output Rows: 0
+         ->  Custom Scan (PgBatchScan) on pg_batch_groups (actual rows=0.00 loops=1)
+               Batch Size: 64
+               Batch Source: Compressed Arrow
+               Compressed Path: Direct
+               Compressed Scan Mode: prune
+               Batches: 0
+               Source Rows: 0
+               Filter Datums: 0
+               Projection Datums: 0
+               Restarted Projection Datums: 0
+               Storage Groups Examined: 3
+               Groups Skipped by Min/Max: 0
+               Groups Skipped by Membership: 3
+               Rows Removed by Source Filter: 0
+               Encoded Bytes Touched: 0
+               Arrow Filter Columns: 0
+               Arrow Projection Columns: 0
+               Arrow Decoded Values: 0
+(25 rows)
+
+SET pg_batch.compressed_scan_mode = filter;
+CREATE TEMP TABLE smart_direct AS
+SELECT c1, c3 FROM pg_batch_groups WHERE c2 = 2 AND c1 > 100;
+SET pg_batch.enable = off;
+CREATE TEMP TABLE smart_plain AS
+SELECT c1, c3 FROM pg_batch_groups WHERE c2 = 2 AND c1 > 100;
+SELECT NOT EXISTS (
+           (TABLE smart_direct EXCEPT ALL TABLE smart_plain)
+           UNION ALL
+           (TABLE smart_plain EXCEPT ALL TABLE smart_direct)
+       ) AS smart_rows_match;
+ smart_rows_match 
+------------------
+ t
+(1 row)
+
+CREATE TABLE pg_batch_tam(c1 int, c2 int, c3 int)
+USING pg_batch_compressed;
+INSERT INTO pg_batch_tam
+SELECT g, (g % 4) * 2, g + 1000 FROM generate_series(1, 384) AS g;
+ANALYZE pg_batch_tam;
+SELECT pg_batch_compress('pg_batch_tam', 128) > 0 AS tam_grouped;
+ tam_grouped 
+-------------
+ t
+(1 row)
+
+SET pg_batch.enable = on;
+SET pg_batch.compressed_via_tableam = on;
+EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT count(*), sum(c3) FROM pg_batch_tam WHERE c2 = 2 AND c1 > 100;
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Custom Scan (PgBatchAgg) (actual rows=1.00 loops=1)
+   Input Batches: 5
+   Input Rows: 71
+   ->  Custom Scan (PgBatchFilterProject) (actual rows=71.00 loops=1)
+         Input Batches: 5
+         Input Rows: 71
+         Output Rows: 71
+         ->  Custom Scan (PgBatchScan) on pg_batch_tam (actual rows=71.00 loops=1)
+               Batch Size: 64
+               Batch Source: Compressed Arrow
+               Compressed Path: Table AM
+               Compressed Scan Mode: filter
+               Batches: 6
+               Source Rows: 384
+               Filter Datums: 0
+               Projection Datums: 0
+               Restarted Projection Datums: 0
+               Storage Groups Examined: 3
+               Groups Skipped by Min/Max: 0
+               Groups Skipped by Membership: 0
+               Rows Removed by Source Filter: 313
+               Encoded Bytes Touched: 1680
+               Arrow Filter Columns: 12
+               Arrow Projection Columns: 5
+               Arrow Decoded Values: 1088
+(25 rows)
+
+CREATE TEMP TABLE smart_tam AS
+SELECT c1, c3 FROM pg_batch_tam WHERE c2 = 2 AND c1 > 100;
+SELECT NOT EXISTS (
+           (TABLE smart_tam EXCEPT ALL TABLE smart_plain)
+           UNION ALL
+           (TABLE smart_plain EXCEPT ALL TABLE smart_tam)
+       ) AS tam_rows_match;
+ tam_rows_match 
+----------------
+ t
+(1 row)
+
+DROP TABLE pg_batch_tam;
+DROP TABLE pg_batch_groups;
 DROP TABLE pg_batch_arrow;
 DROP TABLE pg_batch_test;
 DROP EXTENSION pg_batch;

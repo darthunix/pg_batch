@@ -9,6 +9,7 @@
 #include "fmgr.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "utils/fmgroids.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -22,27 +23,73 @@ typedef struct PgBatchQualState
 	NullableDatum constant;
 	int			column;
 	uint8		var_argno;
+	PgBatchSourceOp source_op;
+	bool		source_exact;
 } PgBatchQualState;
 
 typedef struct PgBatchScanState
 {
 	CustomScanState css;
 	TableScanDesc scan;
-	PgBatchCompressedRelation *compressed;
 	TupleTableSlot *heap_slot;
 	MemoryContext operator_context;
 	PgBatchQualState *quals;
+	PgBatchSourceQual *source_quals;
 	int			nquals;
 	int			next_page_row;
-	int			next_compressed_batch;
 	bool		page_active;
 	bool		first_batch_on_page;
+	bool		compressed_source;
+	bool		through_tableam;
+	bool		source_request_ready;
 	bool		done;
 	uint64		batches;
 	uint64		source_rows;
 } PgBatchScanState;
 
 static const CustomExecMethods pg_batch_scan_exec_methods;
+
+static PgBatchSourceOp
+pg_batch_source_op(Oid funcid, uint8 var_argno)
+{
+	PgBatchSourceOp op;
+
+	switch (funcid)
+	{
+		case F_INT4EQ:
+			op = PG_BATCH_SOURCE_EQ;
+			break;
+		case F_INT4NE:
+			op = PG_BATCH_SOURCE_NE;
+			break;
+		case F_INT4LT:
+			op = PG_BATCH_SOURCE_LT;
+			break;
+		case F_INT4LE:
+			op = PG_BATCH_SOURCE_LE;
+			break;
+		case F_INT4GT:
+			op = PG_BATCH_SOURCE_GT;
+			break;
+		case F_INT4GE:
+			op = PG_BATCH_SOURCE_GE;
+			break;
+		default:
+			return PG_BATCH_SOURCE_UNSUPPORTED;
+	}
+	if (var_argno == 1)
+	{
+		if (op == PG_BATCH_SOURCE_LT)
+			op = PG_BATCH_SOURCE_GT;
+		else if (op == PG_BATCH_SOURCE_LE)
+			op = PG_BATCH_SOURCE_GE;
+		else if (op == PG_BATCH_SOURCE_GT)
+			op = PG_BATCH_SOURCE_LT;
+		else if (op == PG_BATCH_SOURCE_GE)
+			op = PG_BATCH_SOURCE_LE;
+	}
+	return op;
+}
 
 static void
 pg_batch_init_qual(PgBatchQualState *qual, OpExpr *op, uint8 var_argno,
@@ -59,6 +106,7 @@ pg_batch_init_qual(PgBatchQualState *qual, OpExpr *op, uint8 var_argno,
 							 op->inputcollid, NULL, NULL);
 	qual->column = var->varattno - 1;
 	qual->var_argno = var_argno;
+	qual->source_op = pg_batch_source_op(op->opfuncid, var_argno);
 	if (IsA(other, Const))
 	{
 		qual->constant.value = castNode(Const, other)->constvalue;
@@ -113,18 +161,23 @@ pg_batch_scan_begin(CustomScanState *node, EState *estate, int eflags)
 	pg_batch_configure_slot(bslot,
 							RelationGetDescr(node->ss.ss_currentRelation),
 							attnums, nfilter);
-	state->compressed =
-		pg_batch_compressed_lookup(node->ss.ss_currentRelation);
-	if (state->compressed == NULL)
-	{
+	state->compressed_source =
+		pg_batch_compressed_available(node->ss.ss_currentRelation);
+	state->through_tableam = state->compressed_source &&
+		pg_batch_compressed_via_tableam &&
+		pg_batch_relation_uses_tableam(node->ss.ss_currentRelation);
+	if (!state->compressed_source || state->through_tableam)
 		state->scan = table_beginscan(node->ss.ss_currentRelation,
-									  estate->es_snapshot, 0, NULL, 0);
+								  estate->es_snapshot, 0, NULL, 0);
+	if (!state->compressed_source)
+	{
 		state->heap_slot = ExecInitExtraTupleSlot(estate,
 												  RelationGetDescr(node->ss.ss_currentRelation),
 												  &TTSOpsBufferHeapTuple);
 	}
 	state->nquals = list_length(cscan->custom_exprs);
 	state->quals = palloc0_array(PgBatchQualState, state->nquals);
+	state->source_quals = palloc0_array(PgBatchSourceQual, state->nquals);
 	foreach_ptr(OpExpr, op, cscan->custom_exprs)
 	{
 		uint8		var_argno = 0;
@@ -137,15 +190,50 @@ pg_batch_scan_begin(CustomScanState *node, EState *estate, int eflags)
 							  "pg_batch operator", ALLOCSET_START_SMALL_SIZES);
 }
 
+static void
+pg_batch_scan_prepare_source_request(PgBatchScanState *state,
+								 PgBatchSlot *bslot)
+{
+	ExprContext *econtext = state->css.ss.ps.ps_ExprContext;
+
+	ResetExprContext(econtext);
+	for (int q = 0; q < state->nquals; q++)
+	{
+		PgBatchQualState *qual = &state->quals[q];
+		PgBatchSourceQual *source = &state->source_quals[q];
+
+		source->column = qual->column;
+		source->op = qual->source_op;
+		if (qual->other_expr != NULL)
+			source->scalar.value = ExecEvalExpr(qual->other_expr, econtext,
+											 &source->scalar.isnull);
+		else
+			source->scalar = qual->constant;
+		qual->source_exact = state->compressed_source &&
+			pg_batch_compressed_scan_mode == PG_BATCH_COMPRESSED_FILTER &&
+			qual->source_op != PG_BATCH_SOURCE_UNSUPPORTED;
+	}
+	pg_batch_set_source_request(bslot, state->source_quals, state->nquals,
+		(PgBatchCompressedScanMode) pg_batch_compressed_scan_mode);
+	state->source_request_ready = true;
+}
+
 static bool
 pg_batch_scan_next_batch(PgBatchScanState *state, PgBatchSlot *bslot)
 {
 	HeapScanDesc hscan;
 
-	if (state->compressed != NULL)
+	if (state->compressed_source)
 	{
-		if (!pg_batch_compressed_next_batch(bslot, state->compressed,
-											&state->next_compressed_batch))
+		bool		found;
+
+		if (state->through_tableam)
+			found = table_scan_getnextslot(state->scan, ForwardScanDirection,
+									   &bslot->base);
+		else
+			found = pg_batch_compressed_scan_next(bslot,
+											 state->css.ss.ss_currentRelation);
+		if (!found)
 		{
 			state->done = true;
 			return false;
@@ -226,7 +314,7 @@ pg_batch_scan_filter(PgBatchScanState *state, PgBatchSlot *bslot)
 {
 	ExprContext *econtext = state->css.ss.ps.ps_ExprContext;
 	MemoryContext oldcontext;
-	uint64		initial = bslot->selected_rows;
+	uint64		initial = pg_batch_nrows_mask(bslot->nrows);
 
 	pg_batch_prepare_columns(bslot, bslot->request.filter_columns,
 							 bslot->selected_rows, PG_BATCH_FILTER_PHASE);
@@ -239,6 +327,10 @@ pg_batch_scan_filter(PgBatchScanState *state, PgBatchSlot *bslot)
 		MemoryContext oldoperator;
 		bool		track_function;
 		uint64		rows;
+
+		/* The compressed source has already applied this exact condition. */
+		if (qual->source_exact)
+			continue;
 
 		if (qual->other_expr != NULL)
 			other->value = ExecEvalExpr(qual->other_expr, econtext,
@@ -320,7 +412,9 @@ pg_batch_scan_exec(CustomScanState *node)
 	if (!ScanDirectionIsForward(node->ss.ps.state->es_direction))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("pg_batch supports only forward scans")));
+					 errmsg("pg_batch supports only forward scans")));
+	if (!state->source_request_ready)
+		pg_batch_scan_prepare_source_request(state, bslot);
 	if (state->done)
 		return ExecClearTuple(&bslot->base);
 	if (bslot->nrows > 0)
@@ -359,11 +453,8 @@ pg_batch_scan_end(CustomScanState *node)
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 	if (state->scan != NULL)
 		table_endscan(state->scan);
-	if (state->compressed != NULL)
-	{
-		pg_batch_compressed_release(state->compressed);
-		state->compressed = NULL;
-	}
+	pg_batch_compressed_scan_end(
+		pg_batch_slot_cast(node->ss.ss_ScanTupleSlot));
 }
 
 static void
@@ -374,10 +465,12 @@ pg_batch_scan_rescan(CustomScanState *node)
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 	if (state->scan != NULL)
 		table_rescan(state->scan, NULL);
-	state->next_compressed_batch = 0;
+	pg_batch_compressed_scan_rescan(
+		pg_batch_slot_cast(node->ss.ss_ScanTupleSlot));
 	state->page_active = false;
 	state->first_batch_on_page = false;
 	state->next_page_row = 0;
+	state->source_request_ready = false;
 	state->done = false;
 }
 
@@ -387,10 +480,26 @@ pg_batch_scan_explain(CustomScanState *node, List *ancestors,
 {
 	PgBatchScanState *state = (PgBatchScanState *) node;
 	PgBatchSlot *bslot = pg_batch_slot_cast(node->ss.ss_ScanTupleSlot);
+	const PgBatchCompressedStats *compressed_stats =
+		pg_batch_compressed_scan_stats(bslot);
 
 	ExplainPropertyInteger("Batch Size", NULL, PG_BATCH_SIZE, es);
 	ExplainPropertyText("Batch Source",
-						state->compressed == NULL ? "Heap" : "Compressed Arrow", es);
+						state->compressed_source ? "Compressed Arrow" : "Heap", es);
+	if (state->compressed_source)
+	{
+		const char *mode;
+
+		if (pg_batch_compressed_scan_mode == PG_BATCH_COMPRESSED_FILTER)
+			mode = "filter";
+		else if (pg_batch_compressed_scan_mode == PG_BATCH_COMPRESSED_PRUNE)
+			mode = "prune";
+		else
+			mode = "batch";
+		ExplainPropertyText("Compressed Path",
+							state->through_tableam ? "Table AM" : "Direct", es);
+		ExplainPropertyText("Compressed Scan Mode", mode, es);
+	}
 	if (es->analyze)
 	{
 		ExplainPropertyInteger("Batches", NULL, state->batches, es);
@@ -400,8 +509,21 @@ pg_batch_scan_explain(CustomScanState *node, List *ancestors,
 							   bslot->project_datums, es);
 		ExplainPropertyInteger("Restarted Projection Datums", NULL,
 							   bslot->restarted_project_datums, es);
-		if (state->compressed != NULL)
+		if (state->compressed_source)
 		{
+			if (compressed_stats != NULL)
+			{
+				ExplainPropertyInteger("Storage Groups Examined", NULL,
+								   compressed_stats->groups_examined, es);
+				ExplainPropertyInteger("Groups Skipped by Min/Max", NULL,
+								   compressed_stats->groups_skipped_minmax, es);
+				ExplainPropertyInteger("Groups Skipped by Membership", NULL,
+								   compressed_stats->groups_skipped_membership, es);
+				ExplainPropertyInteger("Rows Removed by Source Filter", NULL,
+								   compressed_stats->rows_removed_by_source_filter, es);
+				ExplainPropertyInteger("Encoded Bytes Touched", NULL,
+								   compressed_stats->encoded_bytes_touched, es);
+			}
 			ExplainPropertyInteger("Arrow Filter Columns", NULL,
 								   bslot->arrow_filter_columns, es);
 			ExplainPropertyInteger("Arrow Projection Columns", NULL,

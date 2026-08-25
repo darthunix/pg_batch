@@ -14,6 +14,9 @@
 
 PG_FUNCTION_INFO_V1(pg_batch_compress);
 
+#define PG_BATCH_DEFAULT_GROUP_ROWS 4096
+#define PG_BATCH_DISTINCT_VALUES 16
+
 typedef enum PgBatchCompression
 {
 	PG_BATCH_COMPRESS_PLAIN,
@@ -37,6 +40,28 @@ typedef struct PgBatchCompressedBatch
 	PgBatchCompressedColumn columns[FLEXIBLE_ARRAY_MEMBER];
 } PgBatchCompressedBatch;
 
+typedef struct PgBatchGroupColumn
+{
+	/* Coarse metadata belongs to a storage group, not a 64-row batch. */
+	bool		has_nonnull;
+	bool		has_null;
+	/* distinct[] is exact until more than this small fixed set is seen. */
+	bool		distinct_overflow;
+	uint8		ndistinct;
+	int32		minimum;
+	int32		maximum;
+	int32		distinct[PG_BATCH_DISTINCT_VALUES];
+} PgBatchGroupColumn;
+
+typedef struct PgBatchCompressedGroup
+{
+	int			first_batch;
+	int			nbatches;
+	PgBatchGroupColumn columns[FLEXIBLE_ARRAY_MEMBER];
+} PgBatchCompressedGroup;
+
+typedef struct PgBatchCompressedRelation PgBatchCompressedRelation;
+
 struct PgBatchCompressedRelation
 {
 	MemoryContext context;
@@ -44,9 +69,13 @@ struct PgBatchCompressedRelation
 	int			ncolumns;
 	int			nbatches;
 	int			batch_capacity;
+	int			ngroups;
+	int			group_capacity;
+	int			group_batches;
 	uint64		bytes;
 	int			refcount;
 	PgBatchCompressedBatch **batches;
+	PgBatchCompressedGroup **groups;
 	PgBatchCompressedRelation *next;
 };
 
@@ -62,6 +91,15 @@ typedef struct PgBatchCompressedActive
 	PgBatchCompressedBatch *batch;
 	PgBatchArrowColumn columns[FLEXIBLE_ARRAY_MEMBER];
 } PgBatchCompressedActive;
+
+typedef struct PgBatchCompressedScan
+{
+	PgBatchCompressedRelation *relation;
+	int			group_index;
+	int			batch_index;
+	bool			group_ready;
+	PgBatchCompressedStats stats;
+} PgBatchCompressedScan;
 
 static PgBatchCompressedRelation *compressed_relations;
 
@@ -89,12 +127,13 @@ pg_batch_compressed_relation_supported(Relation relation, bool report_error)
 	TupleDesc	desc = RelationGetDescr(relation);
 
 	if (relation->rd_rel->relkind != RELKIND_RELATION ||
-		relation->rd_rel->relam != HEAP_TABLE_AM_OID)
+		(relation->rd_rel->relam != HEAP_TABLE_AM_OID &&
+		 !pg_batch_relation_uses_tableam(relation)))
 	{
 		if (report_error)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("pg_batch_compress supports only ordinary heap tables")));
+					 errmsg("pg_batch_compress supports only heap-compatible tables")));
 		return false;
 	}
 	if (desc->natts == 0)
@@ -241,12 +280,84 @@ pg_batch_build_compressed_batch(const int32 *values,
 	return batch;
 }
 
+static PgBatchCompressedGroup *
+pg_batch_append_group(PgBatchCompressedRelation *compressed)
+{
+	Size		bytes = offsetof(PgBatchCompressedGroup, columns) +
+		sizeof(PgBatchGroupColumn) * compressed->ncolumns;
+	PgBatchCompressedGroup *group;
+
+	if (compressed->ngroups == compressed->group_capacity)
+	{
+		compressed->group_capacity *= 2;
+		compressed->groups = repalloc_array(compressed->groups,
+											 PgBatchCompressedGroup *,
+											 compressed->group_capacity);
+	}
+	group = palloc0(bytes);
+	group->first_batch = compressed->nbatches;
+	compressed->groups[compressed->ngroups++] = group;
+	compressed->bytes += bytes;
+	return group;
+}
+
+static void
+pg_batch_update_group(PgBatchCompressedGroup *group, const int32 *values,
+					  const uint64 *nonnull_rows, int ncolumns, int nrows)
+{
+	for (int column = 0; column < ncolumns; column++)
+	{
+		PgBatchGroupColumn *meta = &group->columns[column];
+
+		for (int row = 0; row < nrows; row++)
+		{
+			uint64		bit = UINT64CONST(1) << row;
+			int32		value;
+			bool		known = false;
+
+			if ((nonnull_rows[column] & bit) == 0)
+			{
+				meta->has_null = true;
+				continue;
+			}
+			value = values[column * PG_BATCH_SIZE + row];
+			if (!meta->has_nonnull)
+			{
+				meta->has_nonnull = true;
+				meta->minimum = meta->maximum = value;
+			}
+			else
+			{
+				meta->minimum = Min(meta->minimum, value);
+				meta->maximum = Max(meta->maximum, value);
+			}
+
+			if (meta->distinct_overflow)
+				continue;
+			for (int i = 0; i < meta->ndistinct; i++)
+			{
+				if (meta->distinct[i] == value)
+				{
+					known = true;
+					break;
+				}
+			}
+			if (!known && meta->ndistinct < PG_BATCH_DISTINCT_VALUES)
+				meta->distinct[meta->ndistinct++] = value;
+			else if (!known)
+				meta->distinct_overflow = true;
+		}
+	}
+	group->nbatches++;
+}
+
 static void
 pg_batch_append_compressed_batch(PgBatchCompressedRelation *compressed,
 								 const int32 *values,
 								 const uint64 *nonnull_rows, int nrows)
 {
 	PgBatchCompressedBatch *batch;
+	PgBatchCompressedGroup *group;
 
 	if (compressed->nbatches == compressed->batch_capacity)
 	{
@@ -257,8 +368,16 @@ pg_batch_append_compressed_batch(PgBatchCompressedRelation *compressed,
 	}
 	batch = pg_batch_build_compressed_batch(values, nonnull_rows,
 											compressed->ncolumns, nrows);
+	if (compressed->ngroups == 0 ||
+		compressed->groups[compressed->ngroups - 1]->nbatches ==
+		compressed->group_batches)
+		group = pg_batch_append_group(compressed);
+	else
+		group = compressed->groups[compressed->ngroups - 1];
 	compressed->batches[compressed->nbatches++] = batch;
 	compressed->bytes += batch->bytes;
+	pg_batch_update_group(group, values, nonnull_rows,
+						  compressed->ncolumns, nrows);
 }
 
 static void
@@ -294,6 +413,8 @@ Datum
 pg_batch_compress(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
+	int32		group_rows = PG_NARGS() > 1 ? PG_GETARG_INT32(1) :
+		PG_BATCH_DEFAULT_GROUP_ROWS;
 	Relation	relation = table_open(relid, AccessShareLock);
 	TupleDesc	desc = RelationGetDescr(relation);
 	MemoryContext context;
@@ -306,6 +427,11 @@ pg_batch_compress(PG_FUNCTION_ARGS)
 	int			batch_row = 0;
 
 	pg_batch_compressed_relation_supported(relation, true);
+	if (group_rows < PG_BATCH_SIZE || group_rows % PG_BATCH_SIZE != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("storage group size must be a positive multiple of %d",
+						PG_BATCH_SIZE)));
 	context = AllocSetContextCreate(CurrentMemoryContext,
 									"pg_batch compressed snapshot",
 									ALLOCSET_DEFAULT_SIZES);
@@ -314,8 +440,11 @@ pg_batch_compress(PG_FUNCTION_ARGS)
 	compressed->context = context;
 	compressed->relid = relid;
 	compressed->ncolumns = desc->natts;
+	compressed->group_batches = group_rows / PG_BATCH_SIZE;
 	compressed->batches = palloc_array(PgBatchCompressedBatch *, 32);
 	compressed->batch_capacity = 32;
+	compressed->groups = palloc_array(PgBatchCompressedGroup *, 8);
+	compressed->group_capacity = 8;
 	values = palloc0_array(int32, desc->natts * PG_BATCH_SIZE);
 	nonnull_rows = palloc0_array(uint64, desc->natts);
 	MemoryContextSwitchTo(oldcontext);
@@ -365,7 +494,7 @@ pg_batch_compress(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64((int64) compressed->bytes);
 }
 
-PgBatchCompressedRelation *
+static PgBatchCompressedRelation *
 pg_batch_compressed_lookup(Relation relation)
 {
 	PgBatchCompressedRelation *compressed;
@@ -386,11 +515,103 @@ pg_batch_compressed_lookup(Relation relation)
 	return NULL;
 }
 
-void
+bool
+pg_batch_compressed_available(Relation relation)
+{
+	PgBatchCompressedRelation *compressed;
+
+	if (!pg_batch_use_compressed ||
+		!pg_batch_compressed_relation_supported(relation, false))
+		return false;
+	for (compressed = compressed_relations;
+		 compressed != NULL; compressed = compressed->next)
+	{
+		if (compressed->relid == RelationGetRelid(relation) &&
+			compressed->ncolumns == RelationGetNumberOfAttributes(relation))
+			return true;
+	}
+	return false;
+}
+
+static void
 pg_batch_compressed_release(PgBatchCompressedRelation *compressed)
 {
 	Assert(compressed->refcount > 0);
 	compressed->refcount--;
+}
+
+typedef enum PgBatchGroupMatch
+{
+	PG_BATCH_GROUP_MATCH,
+	PG_BATCH_GROUP_SKIP_MINMAX,
+	PG_BATCH_GROUP_SKIP_MEMBERSHIP
+} PgBatchGroupMatch;
+
+static bool
+pg_batch_group_contains(const PgBatchGroupColumn *column, int32 value)
+{
+	for (int i = 0; i < column->ndistinct; i++)
+	{
+		if (column->distinct[i] == value)
+			return true;
+	}
+	return false;
+}
+
+static PgBatchGroupMatch
+pg_batch_group_may_match(PgBatchSlot *bslot,
+						 PgBatchCompressedGroup *group)
+{
+	for (int q = 0; q < bslot->request.nsource_quals; q++)
+	{
+		const PgBatchSourceQual *qual = &bslot->request.source_quals[q];
+		AttrNumber	attnum;
+		PgBatchGroupColumn *column;
+		int32		scalar;
+		bool		matches;
+
+		if (qual->op == PG_BATCH_SOURCE_UNSUPPORTED)
+			continue;
+		if (qual->scalar.isnull)
+			return PG_BATCH_GROUP_SKIP_MINMAX;
+		if (qual->column < 0 || qual->column >= bslot->ncolumns)
+			elog(ERROR, "pg_batch source restriction column is out of range");
+		attnum = bslot->source_attnums[qual->column];
+		column = &group->columns[attnum - 1];
+		if (!column->has_nonnull)
+			return PG_BATCH_GROUP_SKIP_MINMAX;
+		scalar = DatumGetInt32(qual->scalar.value);
+		switch (qual->op)
+		{
+			case PG_BATCH_SOURCE_EQ:
+				matches = scalar >= column->minimum && scalar <= column->maximum;
+				break;
+			case PG_BATCH_SOURCE_NE:
+				matches = column->minimum != scalar || column->maximum != scalar;
+				break;
+			case PG_BATCH_SOURCE_LT:
+				matches = column->minimum < scalar;
+				break;
+			case PG_BATCH_SOURCE_LE:
+				matches = column->minimum <= scalar;
+				break;
+			case PG_BATCH_SOURCE_GT:
+				matches = column->maximum > scalar;
+				break;
+			case PG_BATCH_SOURCE_GE:
+				matches = column->maximum >= scalar;
+				break;
+			case PG_BATCH_SOURCE_UNSUPPORTED:
+				pg_unreachable();
+		}
+		if (!matches)
+			return PG_BATCH_GROUP_SKIP_MINMAX;
+		if (qual->op == PG_BATCH_SOURCE_EQ &&
+			!column->distinct_overflow &&
+			!pg_batch_group_contains(column, scalar))
+			return PG_BATCH_GROUP_SKIP_MEMBERSHIP;
+	}
+	return PG_BATCH_GROUP_MATCH;
 }
 
 static void
@@ -498,21 +719,15 @@ static const PgBatchFormatOps pg_batch_compressed_format_ops = {
 	.clear_batch = pg_batch_compressed_clear_batch,
 };
 
-bool
-pg_batch_compressed_next_batch(PgBatchSlot *bslot,
+static void
+pg_batch_compressed_load_batch(PgBatchSlot *bslot,
 							   PgBatchCompressedRelation *compressed,
-							   int *batch_index)
+							   PgBatchCompressedBatch *batch)
 {
 	TupleTableSlot *slot = &bslot->base;
-	PgBatchCompressedBatch *batch;
 	PgBatchCompressedActive *active;
 
-	if (*batch_index < 0)
-		elog(ERROR, "pg_batch compressed batch index is out of range");
-	if (*batch_index >= compressed->nbatches)
-		return false;
 	ExecClearTuple(slot);
-	batch = compressed->batches[(*batch_index)++];
 	active = MemoryContextAllocZero(bslot->batch_context,
 									offsetof(PgBatchCompressedActive, columns) +
 									sizeof(PgBatchArrowColumn) * bslot->ncolumns);
@@ -530,7 +745,188 @@ pg_batch_compressed_next_batch(PgBatchSlot *bslot,
 											sizeof(PgBatchColumn) * bslot->ncolumns);
 	slot->tts_flags &= ~TTS_FLAG_EMPTY;
 	pg_batch_slot_select_row(bslot, 0);
-	return true;
+}
+
+static bool
+pg_batch_source_compare(PgBatchSourceOp op, int32 value, int32 scalar)
+{
+	switch (op)
+	{
+		case PG_BATCH_SOURCE_EQ:
+			return value == scalar;
+		case PG_BATCH_SOURCE_NE:
+			return value != scalar;
+		case PG_BATCH_SOURCE_LT:
+			return value < scalar;
+		case PG_BATCH_SOURCE_LE:
+			return value <= scalar;
+		case PG_BATCH_SOURCE_GT:
+			return value > scalar;
+		case PG_BATCH_SOURCE_GE:
+			return value >= scalar;
+		case PG_BATCH_SOURCE_UNSUPPORTED:
+			break;
+	}
+	pg_unreachable();
+}
+
+static void
+pg_batch_compressed_filter(PgBatchSlot *bslot,
+						  PgBatchCompressedScan *scan)
+{
+	Bitmapset  *columns = NULL;
+	uint64		initial = bslot->selected_rows;
+
+	for (int q = 0; q < bslot->request.nsource_quals; q++)
+	{
+		const PgBatchSourceQual *qual = &bslot->request.source_quals[q];
+
+		if (qual->op != PG_BATCH_SOURCE_UNSUPPORTED)
+			columns = bms_add_member(columns, qual->column);
+	}
+	pg_batch_prepare_columns(bslot, columns, bslot->selected_rows,
+							 PG_BATCH_FILTER_PHASE);
+	for (int q = 0;
+		 q < bslot->request.nsource_quals && bslot->selected_rows != 0; q++)
+	{
+		const PgBatchSourceQual *qual = &bslot->request.source_quals[q];
+		PgBatchArrowView view;
+		const int32 *values;
+		uint64		rows;
+
+		if (qual->op == PG_BATCH_SOURCE_UNSUPPORTED)
+			continue;
+		if (qual->scalar.isnull)
+		{
+			bslot->selected_rows = 0;
+			break;
+		}
+		view = pg_batch_get_arrow_column(bslot, qual->column);
+		values = view.array->buffers[1];
+		rows = bslot->selected_rows;
+		while (rows != 0)
+		{
+			int			row = pg_rightmost_one_pos64(rows);
+			uint64		bit = UINT64CONST(1) << row;
+
+			if (!pg_batch_arrow_row_is_valid(view.array, row) ||
+				!pg_batch_source_compare(qual->op,
+								 values[view.array->offset + row],
+								 DatumGetInt32(qual->scalar.value)))
+				bslot->selected_rows &= ~bit;
+			rows &= ~bit;
+		}
+	}
+	bms_free(columns);
+	scan->stats.rows_removed_by_source_filter +=
+		pg_batch_row_count(initial) - pg_batch_row_count(bslot->selected_rows);
+}
+
+static PgBatchCompressedScan *
+pg_batch_compressed_scan_begin(PgBatchSlot *bslot, Relation relation)
+{
+	MemoryContext oldcontext;
+	PgBatchCompressedScan *scan;
+
+	oldcontext = MemoryContextSwitchTo(bslot->base.tts_mcxt);
+	scan = palloc0_object(PgBatchCompressedScan);
+	scan->relation = pg_batch_compressed_lookup(relation);
+	MemoryContextSwitchTo(oldcontext);
+	if (scan->relation == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pg_batch compressed snapshot is not available for relation \"%s\"",
+						RelationGetRelationName(relation))));
+	bslot->compressed_scan = scan;
+	return scan;
+}
+
+bool
+pg_batch_compressed_scan_next(PgBatchSlot *bslot, Relation relation)
+{
+	PgBatchCompressedScan *scan = bslot->compressed_scan;
+	PgBatchCompressedRelation *compressed;
+
+	if (scan == NULL)
+		scan = pg_batch_compressed_scan_begin(bslot, relation);
+	compressed = scan->relation;
+	/*
+	 * Storage groups decide whether any of their 64-row executor batches need
+	 * to be touched. The active batch format and its lazy Arrow columns remain
+	 * unchanged below this boundary.
+	 */
+	while (scan->group_index < compressed->ngroups)
+	{
+		PgBatchCompressedGroup *group =
+			compressed->groups[scan->group_index];
+		int			end_batch = group->first_batch + group->nbatches;
+
+		if (!scan->group_ready)
+		{
+			PgBatchGroupMatch match = PG_BATCH_GROUP_MATCH;
+
+			if (bslot->request.source_mode != PG_BATCH_COMPRESSED_BATCH)
+			{
+				scan->stats.groups_examined++;
+				match = pg_batch_group_may_match(bslot, group);
+			}
+			scan->group_ready = true;
+			if (match != PG_BATCH_GROUP_MATCH)
+			{
+				if (match == PG_BATCH_GROUP_SKIP_MINMAX)
+					scan->stats.groups_skipped_minmax++;
+				else
+					scan->stats.groups_skipped_membership++;
+				scan->batch_index = end_batch;
+			}
+		}
+		if (scan->batch_index < end_batch)
+		{
+			PgBatchCompressedBatch *batch =
+				compressed->batches[scan->batch_index++];
+
+			pg_batch_compressed_load_batch(bslot, compressed, batch);
+			scan->stats.encoded_bytes_touched += batch->bytes;
+			if (bslot->request.source_mode == PG_BATCH_COMPRESSED_FILTER)
+				pg_batch_compressed_filter(bslot, scan);
+			return true;
+		}
+		scan->group_index++;
+		scan->group_ready = false;
+	}
+	return false;
+}
+
+void
+pg_batch_compressed_scan_rescan(PgBatchSlot *bslot)
+{
+	PgBatchCompressedScan *scan = bslot->compressed_scan;
+
+	if (scan == NULL)
+		return;
+	scan->group_index = 0;
+	scan->batch_index = 0;
+	scan->group_ready = false;
+}
+
+void
+pg_batch_compressed_scan_end(PgBatchSlot *bslot)
+{
+	PgBatchCompressedScan *scan = bslot->compressed_scan;
+
+	if (scan == NULL)
+		return;
+	pg_batch_compressed_release(scan->relation);
+	pfree(scan);
+	bslot->compressed_scan = NULL;
+}
+
+const PgBatchCompressedStats *
+pg_batch_compressed_scan_stats(PgBatchSlot *bslot)
+{
+	PgBatchCompressedScan *scan = bslot->compressed_scan;
+
+	return scan == NULL ? NULL : &scan->stats;
 }
 
 void

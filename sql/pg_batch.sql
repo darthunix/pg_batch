@@ -206,6 +206,56 @@ SELECT NOT EXISTS (
 
 SELECT pg_batch_compress('pg_batch_arrow') > 0 AS recompressed;
 
+CREATE TABLE pg_batch_groups AS
+SELECT g AS c1, (g % 4) * 2 AS c2, g + 1000 AS c3
+FROM generate_series(1, 384) AS g;
+ANALYZE pg_batch_groups;
+SELECT pg_batch_compress('pg_batch_groups', 128) > 0 AS grouped;
+
+SET pg_batch.compressed_scan_mode = prune;
+EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT count(*) FROM pg_batch_groups WHERE c1 >= 130 AND c1 <= 140;
+
+EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT count(*) FROM pg_batch_groups WHERE c2 = 3;
+
+SET pg_batch.compressed_scan_mode = filter;
+CREATE TEMP TABLE smart_direct AS
+SELECT c1, c3 FROM pg_batch_groups WHERE c2 = 2 AND c1 > 100;
+
+SET pg_batch.enable = off;
+CREATE TEMP TABLE smart_plain AS
+SELECT c1, c3 FROM pg_batch_groups WHERE c2 = 2 AND c1 > 100;
+
+SELECT NOT EXISTS (
+           (TABLE smart_direct EXCEPT ALL TABLE smart_plain)
+           UNION ALL
+           (TABLE smart_plain EXCEPT ALL TABLE smart_direct)
+       ) AS smart_rows_match;
+
+CREATE TABLE pg_batch_tam(c1 int, c2 int, c3 int)
+USING pg_batch_compressed;
+INSERT INTO pg_batch_tam
+SELECT g, (g % 4) * 2, g + 1000 FROM generate_series(1, 384) AS g;
+ANALYZE pg_batch_tam;
+
+SELECT pg_batch_compress('pg_batch_tam', 128) > 0 AS tam_grouped;
+SET pg_batch.enable = on;
+SET pg_batch.compressed_via_tableam = on;
+EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT count(*), sum(c3) FROM pg_batch_tam WHERE c2 = 2 AND c1 > 100;
+
+CREATE TEMP TABLE smart_tam AS
+SELECT c1, c3 FROM pg_batch_tam WHERE c2 = 2 AND c1 > 100;
+
+SELECT NOT EXISTS (
+           (TABLE smart_tam EXCEPT ALL TABLE smart_plain)
+           UNION ALL
+           (TABLE smart_plain EXCEPT ALL TABLE smart_tam)
+       ) AS tam_rows_match;
+
+DROP TABLE pg_batch_tam;
+DROP TABLE pg_batch_groups;
 DROP TABLE pg_batch_arrow;
 DROP TABLE pg_batch_test;
 DROP EXTENSION pg_batch;

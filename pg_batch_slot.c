@@ -35,6 +35,7 @@ pg_batch_slot_release(TupleTableSlot *slot)
 {
 	PgBatchSlot *bslot = (PgBatchSlot *) slot;
 
+	pg_batch_compressed_scan_end(bslot);
 	pg_batch_slot_release_materialized(bslot);
 	if (BufferIsValid(bslot->buffer))
 		ReleaseBuffer(bslot->buffer);
@@ -495,6 +496,16 @@ pg_batch_set_request(PgBatchSlot *bslot, const Bitmapset *filter_columns,
 	bslot->request.filter_columns = new_filter_columns;
 	bslot->request.survivor_columns = new_survivor_columns;
 	bslot->request.return_batch = return_batch;
+}
+
+void
+pg_batch_set_source_request(PgBatchSlot *bslot,
+							const PgBatchSourceQual *quals, int nquals,
+							PgBatchCompressedScanMode mode)
+{
+	bslot->request.source_quals = quals;
+	bslot->request.nsource_quals = nquals;
+	bslot->request.source_mode = mode;
 }
 
 void
