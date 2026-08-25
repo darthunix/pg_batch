@@ -53,6 +53,13 @@ SELECT ((g::bigint * 1103515245 + 12345) % 2147483647)::int AS c1,
        ((g::bigint * 16807 + 31) % 2147483647)::int AS c4
 FROM generate_series(1, 1000000) AS g;
 
+CREATE INDEX pg_batch_bench_narrow_c1_brin
+ON pg_batch_bench_narrow USING brin(c1) WITH (pages_per_range = 32);
+CREATE INDEX pg_batch_bench_wide_c1_brin
+ON pg_batch_bench_wide USING brin(c1) WITH (pages_per_range = 32);
+CREATE INDEX pg_batch_bench_plain_c1_brin
+ON pg_batch_bench_plain USING brin(c1) WITH (pages_per_range = 32);
+
 VACUUM (ANALYZE) pg_batch_bench_narrow;
 VACUUM (ANALYZE) pg_batch_bench_wide;
 VACUUM (ANALYZE) pg_batch_bench_mixed;

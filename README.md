@@ -9,7 +9,8 @@ API do not change.
 The prototype provides three custom nodes:
 
 - `PgBatchScan` exposes batches of up to 64 visible tuples from a pinned heap
-  page and evaluates a safe prefix of simple restrictions in dense loops.
+  page and evaluates a safe prefix of simple restrictions in dense loops. It
+  can visit every page sequentially or only pages selected by a BRIN bitmap.
 - `PgBatchFilterProject` evaluates remaining qualifications, keeps a 64-bit
   selection mask, and materializes projection columns only for surviving
   rows.
@@ -46,6 +47,15 @@ intermediate attributes. Cached fixed offsets allow a direct jump, while
 variable-length and nullable prefixes use PostgreSQL's compact attribute
 metadata and deformation primitives. No scratch tuple slot or local crossover
 rule is needed.
+
+For ordinary heap tables, the planner also recognizes core `BitmapHeapPath`
+alternatives whose bitmap is built only from BRIN indexes. The custom path
+keeps PostgreSQL's `Bitmap Index Scan`, uses the normal heap bitmap callback to
+prune pages and check MVCC visibility, and then exposes the callback's
+`rs_vistuples` array as batches. All relation restrictions are still checked
+by the batch nodes because BRIN results are normally lossy. This experiment is
+heap-specific and intentionally changes neither the table access method API
+nor PostgreSQL core.
 
 ## Build
 
@@ -90,13 +100,14 @@ current backend and replaces an older snapshot of the same table. It is not
 kept in sync with the source table, so recreate it after any data change.
 
 The first version intentionally supports only serial forward scans of ordinary
-heap-compatible tables without dropped or missing columns. The compressed
-source accepts only `int4` columns and uses `PLAIN`, `DELTA8`, or `DELTA16`
-independently for each 64-row column. `PLAIN` becomes an Arrow values buffer
-without copying; delta columns are decoded lazily into an Arrow `int32` buffer,
-not a `Datum` array. The slot keeps its 64-bit row selection separately; Arrow
-validity bits describe NULLs only. Unsupported queries keep their ordinary
-PostgreSQL plans.
+heap-compatible tables without dropped or missing columns. The bitmap batch
+path is restricted to the built-in heap table access method and BRIN indexes.
+The compressed source accepts only `int4` columns and uses `PLAIN`, `DELTA8`,
+or `DELTA16` independently for each 64-row column. `PLAIN` becomes an Arrow
+values buffer without copying; delta columns are decoded lazily into an Arrow
+`int32` buffer, not a `Datum` array. The slot keeps its 64-bit row selection
+separately; Arrow validity bits describe NULLs only. Unsupported queries keep
+their ordinary PostgreSQL plans.
 
 The extension also registers `pg_batch_compressed`, a test table access method.
 Its physical storage and all ordinary callbacks are heap callbacks. Only a
@@ -109,7 +120,8 @@ same storage groups, filtering code, and batch format.
 ## Source layout
 
 - `pg_batch.c` contains module initialization and the extension GUC.
-- `pg_batch_plan.c` adds custom paths and builds the three custom plans.
+- `pg_batch_plan.c` adds sequential and BRIN-backed custom paths and builds the
+  three custom plans.
 - `pg_batch_slot.c` owns the batch slot, selection mask, lazy columns, and
   heap deformation cursors.
 - `pg_batch_compress.c` owns the compressed snapshots and their lazy Arrow
@@ -131,12 +143,21 @@ psql -f benchmark/run.sql
 psql -f benchmark/run_mixed.sql
 psql -f benchmark/run_compressed.sql
 psql -f benchmark/run_groups.sql
+psql -f benchmark/run_brin.sql
 ```
+
+`benchmark/run_groups.sql` compares ordinary and batched heap scans, ordinary
+and batched BRIN scans, and all compressed-source modes on two tables with the
+same logical rows. It exercises BRIN min/max and Bloom operator classes. This
+is the direct comparison used to decide whether BRIN is enough or a native
+analytic table AM provides a separate benefit.
 
 `benchmark/run_heap_compare.sql` uses longer alternating samples for checking
 that changes to the format-neutral slot code do not slow down the heap source.
+It disables bitmap scans so the BRIN indexes cannot change that comparison.
 
 It covers dense simple restrictions, a residual scalar fallback, both
-physical orders of filter and projection columns, and an aggregate that needs
-no projection Datum values. The latest local measurements are recorded in
+physical orders of filter and projection columns, an aggregate that needs no
+projection Datum values, and BRIN page rejection over correlated and
+uncorrelated heap data. The latest local measurements are recorded in
 [`benchmark/results.md`](benchmark/results.md).

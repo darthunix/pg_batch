@@ -225,10 +225,96 @@ pg_batch_base_path_is_useful(PlannerInfo *root, RelOptInfo *rel)
 	return result;
 }
 
+static bool
+pg_batch_bitmapqual_uses_only_brin(Path *path)
+{
+	List	   *children;
+
+	if (IsA(path, IndexPath))
+		return castNode(IndexPath, path)->indexinfo->relam == BRIN_AM_OID;
+	if (IsA(path, BitmapAndPath))
+		children = castNode(BitmapAndPath, path)->bitmapquals;
+	else if (IsA(path, BitmapOrPath))
+		children = castNode(BitmapOrPath, path)->bitmapquals;
+	else
+		return false;
+
+	if (children == NIL)
+		return false;
+	foreach_ptr(Path, child, children)
+	{
+		if (!pg_batch_bitmapqual_uses_only_brin(child))
+			return false;
+	}
+	return true;
+}
+
+static CustomPath *
+pg_batch_make_base_path(RelOptInfo *rel, PgBatchHeapScanMode mode)
+{
+	CustomPath *path = makeNode(CustomPath);
+
+	path->path.pathtype = T_CustomScan;
+	path->path.parent = rel;
+	path->path.pathtarget = rel->reltarget;
+	path->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+	path->custom_private = list_make1(makeInteger(mode));
+	path->methods = &pg_batch_base_path_methods;
+	return path;
+}
+
+static void
+pg_batch_add_bitmap_paths(RelOptInfo *rel, List *candidate_paths)
+{
+	List	   *bitmap_paths = NIL;
+	ListCell   *lc;
+
+	/*
+	 * add_path() can free a dominated BitmapHeapPath. Keep shallow private
+	 * copies before adding any alternatives; their bitmapqual trees and parent
+	 * relation live for the whole planner invocation.
+	 */
+	foreach(lc, candidate_paths)
+	{
+		Path	   *candidate = lfirst(lc);
+		BitmapHeapPath *bitmap;
+		BitmapHeapPath *copy;
+
+		if (!IsA(candidate, BitmapHeapPath) ||
+			candidate->param_info != NULL || candidate->parallel_aware)
+			continue;
+		bitmap = castNode(BitmapHeapPath, candidate);
+		if (!pg_batch_bitmapqual_uses_only_brin(bitmap->bitmapqual))
+			continue;
+		copy = palloc_object(BitmapHeapPath);
+		memcpy(copy, bitmap, sizeof(BitmapHeapPath));
+		bitmap_paths = lappend(bitmap_paths, copy);
+	}
+
+	foreach(lc, bitmap_paths)
+	{
+		BitmapHeapPath *bitmap = lfirst_node(BitmapHeapPath, lc);
+		Path	   *candidate = &bitmap->path;
+		CustomPath *path;
+
+		path = pg_batch_make_base_path(rel, PG_BATCH_HEAP_BITMAP);
+		path->path.rows = candidate->rows;
+		path->path.disabled_nodes = candidate->disabled_nodes;
+		path->path.startup_cost = candidate->startup_cost;
+		path->path.total_cost = candidate->total_cost * 0.90;
+		path->path.pathkeys = candidate->pathkeys;
+		path->custom_paths = list_make1(bitmap);
+		add_path(rel, &path->path);
+	}
+	list_free(bitmap_paths);
+}
+
 static void
 pg_batch_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 						  RangeTblEntry *rte)
 {
+	Relation	relation;
+	List	   *candidate_paths;
 	CustomPath *path;
 
 	if (previous_set_rel_pathlist_hook != NULL)
@@ -238,12 +324,20 @@ pg_batch_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	if (!pg_batch_base_path_is_useful(root, rel))
 		return;
 
-	path = makeNode(CustomPath);
-	path->path.pathtype = T_CustomScan;
-	path->path.parent = rel;
-	path->path.pathtarget = rel->reltarget;
-	path->flags = CUSTOMPATH_SUPPORT_PROJECTION;
-	path->methods = &pg_batch_base_path_methods;
+	/* Preserve the core paths before add_path() starts comparing alternatives. */
+	candidate_paths = list_copy(rel->pathlist);
+	/*
+	 * This experiment deliberately remains heap-specific. The normal bitmap
+	 * path provides the BRIN plan; PgBatchScan only changes how matching heap
+	 * pages are exposed to its parent.
+	 */
+	relation = table_open(rte->relid, NoLock);
+	if (relation->rd_rel->relam == HEAP_TABLE_AM_OID)
+		pg_batch_add_bitmap_paths(rel, candidate_paths);
+	table_close(relation, NoLock);
+	list_free(candidate_paths);
+
+	path = pg_batch_make_base_path(rel, PG_BATCH_HEAP_SEQ);
 	cost_seqscan(&path->path, root, rel, NULL);
 	/* Prefer the playground path until it has a real cost model. */
 	path->path.total_cost *= 0.90;
@@ -452,6 +546,8 @@ pg_batch_plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				   List *tlist, List *clauses, List *custom_plans)
 {
 	PgBatchSourceLayout layout;
+	PgBatchHeapScanMode heap_scan_mode =
+		intVal(linitial(best_path->custom_private));
 	CustomScan *scan;
 	CustomScan *filter;
 	List	   *quals = extract_actual_clauses(clauses, false);
@@ -459,7 +555,23 @@ pg_batch_plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *residual;
 	int			nbatch_quals = 0;
 
-	Assert(custom_plans == NIL);
+	if (heap_scan_mode == PG_BATCH_HEAP_BITMAP)
+	{
+		BitmapHeapScan *bitmap_scan;
+		Plan	   *bitmap_plan;
+
+		Assert(list_length(custom_plans) == 1);
+		bitmap_plan = linitial(custom_plans);
+		/* The outer custom path keeps the same pseudoconstant gate. */
+		while (IsA(bitmap_plan, Result) && outerPlan(bitmap_plan) != NULL)
+			bitmap_plan = outerPlan(bitmap_plan);
+		if (!IsA(bitmap_plan, BitmapHeapScan))
+			elog(ERROR, "pg_batch expected a bitmap heap child plan");
+		bitmap_scan = castNode(BitmapHeapScan, bitmap_plan);
+		custom_plans = list_make1(outerPlan(bitmap_scan));
+	}
+	else
+		Assert(custom_plans == NIL);
 	layout = pg_batch_build_source_layout(root, rel, quals, tlist);
 	foreach_ptr(Node, qual, quals)
 	{
@@ -480,10 +592,12 @@ pg_batch_plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	scan->scan.plan.startup_cost = best_path->path.startup_cost;
 	scan->scan.plan.total_cost = best_path->path.total_cost;
 	scan->custom_exprs = copyObject(batch_quals);
-	/* source attribute numbers and the compact filter-prefix length */
+	scan->custom_plans = custom_plans;
+	/* Source attributes, compact filter prefix, and heap access method. */
 	scan->custom_private =
-		list_make2(copyObject(layout.source_attnums),
-				   makeInteger(layout.nfilter_columns));
+		list_make3(copyObject(layout.source_attnums),
+				   makeInteger(layout.nfilter_columns),
+				   makeInteger(heap_scan_mode));
 	scan->custom_scan_tlist = copyObject(layout.targetlist);
 	scan->custom_relids = bms_copy(rel->relids);
 

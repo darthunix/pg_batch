@@ -2,9 +2,10 @@
 
 ## What was measured
 
-The measurements were taken on 2026-08-24 with PostgreSQL master
-`e42f1d0f1be` plus the heap deformation cursor required by this prototype.
-All compared plans used the same PostgreSQL binary and database. The ordinary
+The original measurements were taken on 2026-08-24 with PostgreSQL master
+`e42f1d0f1be` plus the heap deformation cursor required by this prototype. The
+heap and BRIN comparison was added on 2026-08-25 using the same build and
+database. All compared plans used the same PostgreSQL binary. The ordinary
 executor therefore used the unchanged row-at-a-time path from that patched
 binary.
 
@@ -17,6 +18,11 @@ The report uses these executor names:
 - **PostgreSQL**: the ordinary executor and a regular `Seq Scan`.
 - **Heap batch**: `PgBatchScan`, `PgBatchFilterProject`, and, where supported,
   `PgBatchAgg` reading heap tuples in batches of 64.
+- **PostgreSQL BRIN**: a core `Bitmap Index Scan` and row-at-a-time
+  `Bitmap Heap Scan`.
+- **Heap batch BRIN**: the same core bitmap producer followed by
+  `PgBatchScan`, which exposes visible tuples from each selected heap page in
+  batches.
 - **Arrow batch**: the same batch nodes reading a backend-local compressed
   snapshot through Arrow C Data Interface views.
 - **Prune**: the Arrow source skips 4096-row storage groups using metadata, but
@@ -29,9 +35,10 @@ The report uses these executor names:
 These comparisons answer different questions. PostgreSQL versus Heap batch
 measures the executor changes over the same heap table. Heap batch versus
 Arrow batch also changes the data representation and bypasses a normal heap
-visibility scan. Batch versus Prune isolates group skipping. Prune versus
-Filter shows the effect of evaluating simple conditions in the source. Filter
-versus TAM filter isolates the cost of going through the table access method.
+visibility scan. Arrow batch versus Prune isolates group skipping. Prune
+versus Filter shows the effect of evaluating simple conditions in the source.
+Filter versus TAM filter isolates the cost of going through the table access
+method.
 
 ## Test data
 
@@ -279,164 +286,269 @@ versus 18.971 ms, so no slowdown was observed there. Short alternating samples
 were noisier because other work on the machine changed even ordinary executor
 timings.
 
-## Storage-group pruning and filtering through a table AM
+## Heap plus BRIN versus a compressed table AM
 
-This experiment adds one low-cardinality column to the 2,000,000-row narrow
-table and stores the physical heap table under the test table access method:
+This experiment is intended to guide an architectural choice: whether an
+analytic workload needs a new table access method, or whether an ordered heap
+with BRIN and batch-aware executor nodes is sufficient.
 
-```sql
-CREATE TABLE pg_batch_bench_tam
-(
-    c1 int,
-    c2 int,
-    c3 int,
-    c4 int,
-    small_set int
-)
-USING pg_batch_compressed;
+Two tables contain the same 2,000,000 logical rows and the same five `int4`
+columns. `c1` is physically ordered from 1 to 2,000,000. `small_set` contains
+only `0, 2, 4, ..., 14`.
 
-INSERT INTO pg_batch_bench_tam
-SELECT g,
-       g + 1,
-       g + 2,
-       g + 3,
-       (g % 8) * 2
-FROM generate_series(1, 2000000) AS g;
-```
+- `pg_batch_bench_heap_groups` is an ordinary heap table. It has a default
+  min/max BRIN index on `c1` and an `int4_bloom_ops` BRIN index on `small_set`,
+  both with `pages_per_range = 32`.
+- `pg_batch_bench_tam` uses the heap-compatible test table AM. Its compressed
+  snapshot contains 489 storage groups of 4096 rows and occupies 14,439,732
+  bytes including metadata.
 
-`c1` is physically ordered from 1 to 2,000,000. `small_set` contains only
-`0, 2, 4, ..., 14`. The compressed snapshot uses 4096-row storage groups, each
-containing 64 executor batches of 64 rows. There are 489 groups and 31,250
-batches in total. Its size including group metadata is 14,441,688 bytes.
+Each compressed group stores min/max values, NULL presence, and up to 16 exact
+distinct values per column. The exact set is discarded after it overflows.
+This is deliberately simpler than a production Bloom or Fuse filter.
 
-Each group stores per-column min/max values, NULL presence, and up to 16 exact
-distinct values. The exact set is discarded for pruning after it overflows.
-It is intentionally a simple test structure, not a Bloom or Fuse filter.
+Each timing is the median of 15 executions after three warm-ups. All eight
+modes were rotated in one backend. PostgreSQL and Heap batch force sequential
+heap access. PostgreSQL BRIN and Heap batch BRIN force bitmap access. The four
+Arrow modes read the compressed snapshot. In the query text below, `source`
+stands for the ordinary heap table in heap modes and for the test table-AM
+table in Arrow modes.
 
-Each timing below is the median of 15 executions after three warm-ups. The five
-executor variants were rotated in one backend.
+| Query | PostgreSQL | Heap batch | PostgreSQL BRIN | Heap batch BRIN | Arrow batch | Prune | Filter | TAM filter |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1000-row range | 33.414 | 14.520 | 0.169 | 0.073 | 5.360 | 0.023 | 0.016 | 0.018 |
+| Impossible range | 30.402 | 12.206 | 0.036 | 0.020 | 3.990 | 0.008 | 0.004 | 0.007 |
+| Missing low-cardinality value | 31.992 | 11.413 | 0.165 | 0.150 | 3.965 | 0.011 | 0.004 | 0.008 |
+| Dense filter and sum | 36.991 | 18.785 | 41.517 | 20.942 | 7.848 | 6.590 | 5.955 | 5.993 |
 
-### Query 1: a 1000-row range inside the table
+All times are milliseconds.
+
+### Query 1: a selective range on the ordered column
 
 ```sql
 SELECT count(*)
-FROM pg_batch_bench_tam
+FROM source
 WHERE c1 BETWEEN 1000001 AND 1001000;
 ```
 
-The result is 1000. Without group metadata, PostgreSQL and Batch inspect all
-2,000,000 source rows. Min/max metadata rejects 488 of 489 groups. The one
-remaining group contains 4096 rows in 64 batches. Source filtering keeps 1000
-rows, and only 29,184 encoded bytes are touched.
+The result is 1000. BRIN opens 32 heap pages and exposes 5,024 visible rows for
+recheck. Heap batch BRIN processes those rows in 96 batches and takes 0.073 ms.
+The compressed source rejects 488 of 489 groups, opens 4096 rows, and takes
+0.018 ms through the table AM.
 
-| Executor | Time, ms | Source rows visited | Source batches opened |
-|---|---:|---:|---:|
-| PostgreSQL | 28.984 | 2,000,000 heap rows | n/a |
-| Batch | 5.247 | 2,000,000 compressed rows | 31,250 |
-| Prune | 0.021 | 4,096 compressed rows | 64 |
-| Filter | 0.016 | 4,096 compressed rows | 64 |
-| TAM filter | 0.019 | 4,096 compressed rows | 64 |
-
-Most of the improvement comes from rejecting groups. Filter is slightly
-cheaper than Prune because direct `int4` comparisons in the source replace the
-generic operator calls for the remaining rows.
+The table AM is four times faster, but the absolute difference is only 0.055
+ms. Both approaches solve the important problem by avoiding almost the whole
+table. This result alone is not a strong reason to build a new table AM.
 
 ### Query 2: a range that cannot match
 
 ```sql
 SELECT count(*)
-FROM pg_batch_bench_tam
+FROM source
 WHERE c1 < 0;
 ```
 
-The result is zero. Every group has `minimum >= 1`, so min/max metadata rejects
-all 489 groups without opening a data batch.
+BRIN and compressed min/max metadata both prove that the result is empty
+without opening data pages or batches. Heap batch BRIN takes 0.020 ms and the
+table-AM path takes 0.007 ms. These numbers mostly measure fixed executor
+startup cost.
 
-| Executor | Time, ms | Source rows visited | Source batches opened |
-|---|---:|---:|---:|
-| PostgreSQL | 27.282 | 2,000,000 heap rows | n/a |
-| Batch | 3.924 | 2,000,000 compressed rows | 31,250 |
-| Prune | 0.007 | 0 | 0 |
-| Filter | 0.003 | 0 | 0 |
-| TAM filter | 0.007 | 0 | 0 |
-
-The difference between 0.003 and 0.007 ms is not meaningful. At this scale the
-measurement is dominated by fixed executor startup cost. The useful result is
-that no compressed batch was opened.
-
-### Query 3: a missing value inside the min/max range
+### Query 3: a missing value handled by BRIN Bloom
 
 ```sql
 SELECT count(*)
-FROM pg_batch_bench_tam
+FROM source
 WHERE small_set = 7;
 ```
 
-The result is zero. In every group, min/max is `[0, 14]`, so min/max alone
-cannot reject 7. The exact set is `{0, 2, 4, 6, 8, 10, 12, 14}`, which proves
-that 7 is absent and rejects all groups.
+Every range has `minimum = 0` and `maximum = 14`, so the default BRIN min/max
+operator class would not prove that 7 is absent. The `int4_bloom_ops` index
+does: the bitmap is empty and neither BRIN plan opens a heap page. Heap batch
+BRIN takes 0.150 ms.
 
-| Executor | Time, ms | Source rows visited | Source batches opened |
-|---|---:|---:|---:|
-| PostgreSQL | 30.483 | 2,000,000 heap rows | n/a |
-| Batch | 3.941 | 2,000,000 compressed rows | 31,250 |
-| Prune | 0.010 | 0 | 0 |
-| Filter | 0.005 | 0 | 0 |
-| TAM filter | 0.007 | 0 | 0 |
+The compressed group's exact set is `{0, 2, 4, 6, 8, 10, 12, 14}` and likewise
+rejects all 489 groups without opening a batch. The table-AM path takes 0.008
+ms. Its in-memory exact metadata is faster than scanning the BRIN Bloom index,
+but both designs avoid the 2,000,000-row scan. This result shows why a fair
+heap comparison must consider the appropriate BRIN operator class, not only
+the default min/max summary.
 
-This query exists specifically to demonstrate metadata that can reject a group
-when min/max cannot.
-
-### Query 4: dense filtering followed by a native batch sum
+### Query 4: dense filtering followed by a batch sum
 
 ```sql
 SELECT sum(c4)
-FROM pg_batch_bench_tam
+FROM source
 WHERE c1 < 1500000
   AND small_set = 2;
 ```
 
-The first condition keeps 1,499,999 rows. The second keeps one row out of every
-eight, leaving 187,500 values for the aggregate. The result is 140,625,000,000.
+The result uses 187,500 values. BRIN rejects the final quarter of the ordered
+heap but still visits 9,568 pages and exposes 1,502,176 rows. At this
+selectivity its bitmap overhead outweighs the pages it skips: Heap batch takes
+18.785 ms and Heap batch BRIN takes 20.942 ms.
 
-Min/max metadata rejects only the final 122 groups. The source must still open
-367 groups, or 23,488 batches containing 1,503,232 rows. In Filter mode, the
-source applies both comparisons and `PgBatchAgg` reads `c4` from the native
-batch only for surviving batches.
+Arrow batch takes 7.848 ms even without group rejection. Pruning lowers that
+to 6.590 ms, and exact source filtering lowers it to about 6.0 ms. The roughly
+threefold difference from heap batching comes mainly from the compact native
+column representation and direct filtering, not from the table-AM call
+itself. Direct Filter and TAM filter differ by only 0.038 ms.
 
-| Executor | Time, ms | Source rows visited | Source batches opened |
-|---|---:|---:|---:|
-| PostgreSQL | 35.874 | 2,000,000 heap rows | n/a |
-| Batch | 7.717 | 2,000,000 compressed rows | 31,250 |
-| Prune | 6.531 | 1,503,232 compressed rows | 23,488 |
-| Filter | 5.937 | 1,503,232 compressed rows | 23,488 |
-| TAM filter | 5.931 | 1,503,232 compressed rows | 23,488 |
+### Architectural conclusion
 
-This is the most useful table-AM comparison because enough data is processed
-for fixed startup noise to be small. Direct Filter and TAM filter differ by
-0.006 ms, which is inside normal run-to-run noise. Carrying the source request
-in `PgBatchSlot` and entering the same reader through `table_scan_getnextslot()`
-did not add a visible cost.
+These results do not justify a new table AM merely to reject ordered time or
+identifier ranges. For selective predicates correlated with physical heap
+order, BRIN performs the coarse rejection and batch executor nodes efficiently
+process the remaining pages. BRIN Bloom also handles the tested missing-value
+case without reading heap pages. Before adding a new storage engine, it is
+worth evaluating the built-in min/max, minmax-multi, and Bloom operator classes
+or a type-specific BRIN operator class.
 
-The test table access method is physically heap-compatible. Ordinary scans use
-the heap callbacks unchanged. Only a scan into `PgBatchSlot` switches to the
-backend-local compressed snapshot. This experiment therefore validates the
-request and batch-delivery interface; it is not yet a persistent columnar table
-access method.
+A native analytic format becomes useful for different reasons: compression,
+column-oriented access, lazy decoding, and keeping values outside `Datum` form
+across a batch subtree. It has a large advantage when a query still processes
+a large fraction of the table. Those capabilities, rather than page rejection
+alone, are the stronger justification for a separate table AM.
+
+The timings do not show a performance reason to put that format specifically
+behind a table AM: direct Filter and TAM filter are effectively equal. They
+show the value of the native representation and source capabilities. A table
+AM would still be needed if that representation must become persistent table
+storage with normal PostgreSQL DDL, MVCC, maintenance, and indexing semantics;
+a custom scan could be enough for a narrower experiment.
+
+The compressed snapshot is backend-local, already in memory, and bypasses a
+normal heap visibility scan. It is not a production persistent table AM, so
+the absolute Arrow-versus-heap ratios should not be treated as a storage-engine
+claim. The useful result is the boundary between the two designs:
+
+- start with heap, BRIN, and format-neutral batch executor nodes for selective
+  predicates on physically correlated data;
+- consider a native format when compression, column-oriented access, or source
+  operations not served well by BRIN are required; use a table AM only when
+  that format also needs normal PostgreSQL storage integration, and validate
+  it separately with persistent storage, MVCC, cold reads, updates, and
+  concurrent workloads.
+
+## Additional BRIN coverage
+
+A separate run checks BRIN batching on the original eight-column narrow table,
+the sixty-column wide table, and an uncorrelated table. It covers a wider range
+of selectivities and verifies that lazy projection still works after BRIN has
+selected the heap pages.
+
+The three benchmark tables have a BRIN index on `c1` with
+`pages_per_range = 32`. Each timing is the median of 15 executions after three
+warm-ups. The four modes were rotated in one backend:
+
+- **Standard Seq** uses PostgreSQL's regular `Seq Scan`.
+- **Batch Seq** uses the existing sequential `PgBatchScan`.
+- **Standard BRIN** uses PostgreSQL's `Bitmap Heap Scan`.
+- **Batch BRIN** uses the same bitmap index plan and the new heap bitmap source
+  in `PgBatchScan`.
+
+| Query | Standard Seq, ms | Batch Seq, ms | Standard BRIN, ms | Batch BRIN, ms |
+|---|---:|---:|---:|---:|
+| Ordered heap, 1000-row range | 32.536 | 14.647 | 0.265 | 0.116 |
+| Ordered heap, medium range and sum | 39.533 | 22.349 | 18.323 | 10.314 |
+| Wide heap, range, filter, and late sum | 8.040 | 5.188 | 2.544 | 1.083 |
+| Ordered heap, impossible range | 30.522 | 12.415 | 0.040 | 0.024 |
+| Uncorrelated heap, forced BRIN range | 15.794 | 6.588 | 23.023 | 9.807 |
+
+### Query 1: a narrow range in an ordered heap
+
+```sql
+SELECT count(*)
+FROM pg_batch_bench_narrow
+WHERE c1 BETWEEN 1000001 AND 1001000;
+```
+
+The result is 1000. The table contains 2,000,000 rows in 14,720 heap pages.
+BRIN visits 64 pages containing 8,704 visible rows. Its range summary cannot
+identify the exact 1000 rows, so both bitmap plans must check the condition
+again. Standard BRIN performs that work one row at a time. Batch BRIN forms 192
+source batches and evaluates the comparison in dense loops, reducing 0.265 ms
+to 0.116 ms. Most of the improvement over sequential scanning comes from BRIN;
+batching then removes part of the remaining per-row executor cost.
+
+### Query 2: a medium range followed by a batch aggregate
+
+```sql
+SELECT sum(c4)
+FROM pg_batch_bench_narrow
+WHERE c1 BETWEEN 500001 AND 1000000
+  AND c2 < 900000;
+```
+
+The two conditions leave 399,998 rows and the result is 279,999,599,995. BRIN
+visits 3,712 pages containing 504,832 visible rows. This is large enough for
+both kinds of work to matter: page rejection reduces the scan, while dense
+filtering and `PgBatchAgg` reduce executor overhead. Batch BRIN is 1.78 times
+faster than Standard BRIN and 2.17 times faster than Batch Seq.
+
+### Query 3: filtering before a late projection on a wide heap
+
+```sql
+SELECT sum(c60)
+FROM pg_batch_bench_wide
+WHERE c1 BETWEEN 100001 AND 150000
+  AND c2 < 125000;
+```
+
+The table has sixty `int4` columns. BRIN selects 1,696 of 8,384 pages and the
+range contains 50,880 visible rows. The second condition leaves 24,998 rows.
+Only those survivors need `c60`, so the query combines page rejection, dense
+filtering, lazy late-column deformation, and a batch sum. Batch BRIN takes
+1.083 ms versus 2.544 ms for Standard BRIN.
+
+### Query 4: a range that cannot match
+
+```sql
+SELECT count(*)
+FROM pg_batch_bench_narrow
+WHERE c1 < 0;
+```
+
+BRIN proves from its summaries that no heap page can match. Both bitmap plans
+finish without opening a heap page. The difference between 0.040 and 0.024 ms
+is mostly fixed executor overhead and is too small for a useful speedup claim.
+The important result is that adding the batch source does not force a heap
+scan when BRIN rejects every range.
+
+### Query 5: the boundary when physical order is absent
+
+```sql
+SELECT count(*)
+FROM pg_batch_bench_plain
+WHERE c1 BETWEEN 1000000 AND 1001000;
+```
+
+`c1` is pseudo-random and this particular range has no matches. The BRIN
+summaries overlap the requested range almost everywhere, so the forced bitmap
+plan still visits 5,152 of 5,406 pages and exposes 953,120 rows for recheck.
+Standard BRIN is slower than Standard Seq, and Batch BRIN is slower than Batch
+Seq. Batching reduces the cost of the bad bitmap plan, but it cannot repair an
+index that rejects almost no blocks. The normal planner should choose a
+sequential path in this case.
+
+The ordered results support the intended composition: BRIN is responsible for
+coarse page rejection, while `PgBatchScan`, lazy projection, and `PgBatchAgg`
+remain responsible for efficient processing inside selected pages. No new
+table access method or persistent columnar format is needed for this case.
 
 ## Heap-path sanity check after adding source requests
 
-A separate longer run disabled the compressed source and compared only the
-current heap batch path with the ordinary executor. It used five warm-ups,
-31 alternating samples, and ten executions per sample.
+A separate longer run disabled the compressed source and bitmap scans, then
+compared only the current sequential heap batch path with the ordinary
+executor. It used five warm-ups, 31 alternating samples, and ten executions
+per sample.
 
 | Query | Heap batch, ms | PostgreSQL, ms |
 |---|---:|---:|
-| Narrow: two comparisons and `count(*)` | 18.460 | 42.665 |
-| Narrow: `c1 < 0` and `count(*)` | 11.285 | 28.725 |
-| Wide: filter `c2`, return `c60` | 3.808 | 5.951 |
-| Wide: filter `c60`, return `c2` | 4.037 | 11.342 |
-| Wide: filter `c2`, batch `count(*)` | 3.810 | 8.454 |
+| Narrow: two comparisons and `count(*)` | 18.389 | 43.177 |
+| Narrow: `c1 < 0` and `count(*)` | 11.017 | 28.956 |
+| Wide: filter `c2`, return `c60` | 3.883 | 5.759 |
+| Wide: filter `c60`, return `c2` | 4.105 | 11.350 |
+| Wide: filter `c2`, batch `count(*)` | 3.912 | 8.068 |
 
 This is a sanity check, not a direct before-and-after comparison with the old
 library. It did not reveal an obvious loss in the heap path after the source
@@ -457,6 +569,9 @@ request was added.
 - The custom path cost is deliberately reduced by 10% after basic usefulness
   checks. A production cost model must account for layout, types, nullability,
   expected survivors, group pruning, and whether the parent consumes batches.
+- The BRIN batch path is serial and heap-specific. It deliberately reads
+  `HeapScanDesc` page state as a playground shortcut; a production extension
+  would need a supported core interface.
 - These are warm-cache, serial, single-machine measurements. They validate the
   mechanism; they are not a general throughput claim for cold I/O or concurrent
   workloads.

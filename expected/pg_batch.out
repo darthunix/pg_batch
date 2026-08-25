@@ -248,6 +248,117 @@ SELECT count(*), sum(c2) FROM pg_batch_test WHERE false;
      0 |    
 (1 row)
 
+CREATE TABLE pg_batch_brin AS
+SELECT g AS c1,
+       CASE WHEN g % 17 = 0 THEN NULL ELSE g + 1 END AS c2,
+       repeat('b', 80) AS padding,
+       g + 3 AS c4
+FROM generate_series(1, 4096) AS g;
+CREATE INDEX pg_batch_brin_c1_idx ON pg_batch_brin
+USING brin(c1) WITH (pages_per_range = 1);
+VACUUM (ANALYZE) pg_batch_brin;
+SET enable_seqscan = off;
+SET pg_batch.enable = on;
+EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT count(*), sum(c4)
+FROM pg_batch_brin
+WHERE c1 BETWEEN 2001 AND 2200 AND c2 < 2150;
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Custom Scan (PgBatchAgg) (actual rows=1.00 loops=1)
+   Input Batches: 7
+   Input Rows: 139
+   ->  Custom Scan (PgBatchFilterProject) (actual rows=139.00 loops=1)
+         Input Batches: 7
+         Input Rows: 139
+         Output Rows: 139
+         ->  Custom Scan (PgBatchScan) on pg_batch_brin (actual rows=139.00 loops=1)
+               Batch Size: 64
+               Batch Source: Heap Bitmap
+               Batches: 8
+               Source Rows: 260
+               Filter Datums: 520
+               Projection Datums: 139
+               Restarted Projection Datums: 0
+               Exact Heap Blocks: 0
+               Lossy Heap Blocks: 4
+               ->  Bitmap Index Scan on pg_batch_brin_c1_idx (actual rows=40.00 loops=1)
+                     Index Cond: ((c1 >= 2001) AND (c1 <= 2200))
+                     Index Searches: 1
+(20 rows)
+
+CREATE TEMP TABLE batch_brin_rows AS
+SELECT c1, c4
+FROM pg_batch_brin
+WHERE c1 BETWEEN 2001 AND 2200 AND c2 < 2150 AND c4 % 7 = 0;
+SET pg_batch.enable = off;
+CREATE TEMP TABLE plain_brin_rows AS
+SELECT c1, c4
+FROM pg_batch_brin
+WHERE c1 BETWEEN 2001 AND 2200 AND c2 < 2150 AND c4 % 7 = 0;
+SELECT NOT EXISTS (
+           (TABLE batch_brin_rows EXCEPT ALL TABLE plain_brin_rows)
+           UNION ALL
+           (TABLE plain_brin_rows EXCEPT ALL TABLE batch_brin_rows)
+       ) AS brin_rows_match;
+ brin_rows_match 
+-----------------
+ t
+(1 row)
+
+SET pg_batch.enable = on;
+CREATE TEMP TABLE limited_brin_row AS
+SELECT c1 FROM pg_batch_brin
+WHERE c1 BETWEEN 2001 AND 2200
+LIMIT 1;
+SELECT count(*) = 1 AS brin_early_stop FROM limited_brin_row;
+ brin_early_stop 
+-----------------
+ t
+(1 row)
+
+SELECT count(*) AS empty_brin
+FROM pg_batch_brin WHERE c1 BETWEEN -10 AND -1;
+ empty_brin 
+------------
+          0
+(1 row)
+
+PREPARE pg_batch_brin_parameter(integer, integer) AS
+SELECT count(*), sum(c4)
+FROM pg_batch_brin
+WHERE c1 BETWEEN $1 AND $2 AND c2 < $2;
+EXECUTE pg_batch_brin_parameter(2001, 2050);
+ count |  sum  
+-------+-------
+    45 | 91242
+(1 row)
+
+EXECUTE pg_batch_brin_parameter(3001, 3050);
+ count |  sum   
+-------+--------
+    45 | 136233
+(1 row)
+
+DEALLOCATE pg_batch_brin_parameter;
+PREPARE pg_batch_brin_gate(boolean) AS
+SELECT count(*) FROM pg_batch_brin
+WHERE $1 AND c1 BETWEEN 2001 AND 2050;
+EXECUTE pg_batch_brin_gate(false);
+ count 
+-------
+     0
+(1 row)
+
+EXECUTE pg_batch_brin_gate(true);
+ count 
+-------
+    50
+(1 row)
+
+DEALLOCATE pg_batch_brin_gate;
+RESET enable_seqscan;
+DROP TABLE pg_batch_brin;
 CREATE TABLE pg_batch_arrow AS
 SELECT g AS c1,
        CASE WHEN g % 7 = 0 THEN NULL ELSE g + 1 END AS c2,

@@ -44,6 +44,12 @@ typedef enum PgBatchCompressedScanMode
 	PG_BATCH_COMPRESSED_FILTER
 } PgBatchCompressedScanMode;
 
+typedef enum PgBatchHeapScanMode
+{
+	PG_BATCH_HEAP_SEQ,
+	PG_BATCH_HEAP_BITMAP
+} PgBatchHeapScanMode;
+
 typedef enum PgBatchSourceOp
 {
 	PG_BATCH_SOURCE_UNSUPPORTED,

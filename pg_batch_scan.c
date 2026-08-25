@@ -7,6 +7,7 @@
 #include "executor/executor.h"
 #include "executor/nodeCustom.h"
 #include "fmgr.h"
+#include "nodes/tidbitmap.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "utils/fmgroids.h"
@@ -32,19 +33,25 @@ typedef struct PgBatchScanState
 	CustomScanState css;
 	TableScanDesc scan;
 	TupleTableSlot *heap_slot;
+	PlanState  *bitmap_plan;
+	TIDBitmap *tbm;
 	MemoryContext operator_context;
 	PgBatchQualState *quals;
 	PgBatchSourceQual *source_quals;
 	int			nquals;
 	int			next_page_row;
+	PgBatchHeapScanMode heap_scan_mode;
 	bool		page_active;
 	bool		first_batch_on_page;
+	bool		bitmap_initialized;
 	bool		compressed_source;
 	bool		through_tableam;
 	bool		source_request_ready;
 	bool		done;
 	uint64		batches;
 	uint64		source_rows;
+	uint64		lossy_pages;
+	uint64		exact_pages;
 } PgBatchScanState;
 
 static const CustomExecMethods pg_batch_scan_exec_methods;
@@ -152,6 +159,7 @@ pg_batch_scan_begin(CustomScanState *node, EState *estate, int eflags)
 	PgBatchSlot *bslot = pg_batch_slot_cast(node->ss.ss_ScanTupleSlot);
 	List	   *attnums = (List *) linitial(cscan->custom_private);
 	int			nfilter = intVal(lsecond(cscan->custom_private));
+	PgBatchHeapScanMode heap_scan_mode = intVal(lthird(cscan->custom_private));
 	int			i = 0;
 
 	if (eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK))
@@ -161,12 +169,27 @@ pg_batch_scan_begin(CustomScanState *node, EState *estate, int eflags)
 	pg_batch_configure_slot(bslot,
 							RelationGetDescr(node->ss.ss_currentRelation),
 							attnums, nfilter);
-	state->compressed_source =
+	state->heap_scan_mode = heap_scan_mode;
+	/* A bitmap path is costed for and must continue to read the heap. */
+	state->compressed_source = heap_scan_mode == PG_BATCH_HEAP_SEQ &&
 		pg_batch_compressed_available(node->ss.ss_currentRelation);
 	state->through_tableam = state->compressed_source &&
 		pg_batch_compressed_via_tableam &&
 		pg_batch_relation_uses_tableam(node->ss.ss_currentRelation);
-	if (!state->compressed_source || state->through_tableam)
+	if (heap_scan_mode == PG_BATCH_HEAP_BITMAP)
+	{
+		uint32		flags = SO_NONE;
+
+		pg_batch_init_children(node, estate, eflags);
+		state->bitmap_plan = linitial(node->custom_ps);
+		if (ScanRelIsReadOnly(&node->ss))
+			flags |= SO_HINT_REL_READ_ONLY;
+		if (estate->es_instrument & INSTRUMENT_IO)
+			flags |= SO_SCAN_INSTRUMENT;
+		state->scan = table_beginscan_bm(node->ss.ss_currentRelation,
+										 estate->es_snapshot, 0, NULL, flags);
+	}
+	else if (!state->compressed_source || state->through_tableam)
 		state->scan = table_beginscan(node->ss.ss_currentRelation,
 								  estate->es_snapshot, 0, NULL, 0);
 	if (!state->compressed_source)
@@ -188,6 +211,61 @@ pg_batch_scan_begin(CustomScanState *node, EState *estate, int eflags)
 	state->operator_context =
 		AllocSetContextCreate(node->ss.ps.ps_ExprContext->ecxt_per_query_memory,
 							  "pg_batch operator", ALLOCSET_START_SMALL_SIZES);
+}
+
+static void
+pg_batch_bitmap_begin(PgBatchScanState *state)
+{
+	TBMIterator iterator;
+
+	Assert(state->heap_scan_mode == PG_BATCH_HEAP_BITMAP);
+	Assert(!state->bitmap_initialized);
+	state->tbm = (TIDBitmap *) MultiExecProcNode(state->bitmap_plan);
+	if (state->tbm == NULL || !IsA(state->tbm, TIDBitmap))
+		elog(ERROR, "pg_batch bitmap child returned an invalid result");
+	iterator = tbm_begin_iterate(state->tbm,
+								 state->css.ss.ps.state->es_query_dsa,
+								 InvalidDsaPointer);
+	state->scan->st.rs_tbmiterator = iterator;
+	state->bitmap_initialized = true;
+}
+
+static bool
+pg_batch_heap_next_page(PgBatchScanState *state)
+{
+	HeapScanDesc hscan = (HeapScanDesc) state->scan;
+	bool		recheck;
+	bool		found;
+
+	if (state->page_active)
+	{
+		if (state->heap_scan_mode == PG_BATCH_HEAP_BITMAP)
+			hscan->rs_cindex = hscan->rs_ntuples;
+		else
+			hscan->rs_cindex = hscan->rs_ntuples - 1;
+	}
+	ExecClearTuple(state->heap_slot);
+	if (state->heap_scan_mode == PG_BATCH_HEAP_BITMAP)
+	{
+		if (!state->bitmap_initialized)
+			pg_batch_bitmap_begin(state);
+		/* PgBatchScan rechecks every restriction, including exact pages. */
+		found = table_scan_bitmap_next_tuple(state->scan, state->heap_slot,
+										 &recheck,
+										 &state->lossy_pages,
+										 &state->exact_pages);
+	}
+	else
+		found = heap_getnextslot(state->scan, ForwardScanDirection,
+								 state->heap_slot);
+	if (!found)
+		return false;
+
+	state->page_active = true;
+	state->first_batch_on_page = true;
+	state->next_page_row = 0;
+	ExecClearTuple(state->heap_slot);
+	return true;
 }
 
 static void
@@ -253,33 +331,30 @@ pg_batch_scan_next_batch(PgBatchScanState *state, PgBatchSlot *bslot)
 			state->next_page_row >= (int) hscan->rs_ntuples)
 		{
 			/*
-			 * heap_getnextslot() makes core prune the page and perform MVCC
-			 * checks. We then publish batches over its rs_vistuples array
-			 * while the heap scan and PgBatchSlot both keep the buffer
-			 * pinned.
+			 * A core heap callback prunes the page and performs MVCC checks.
+			 * For bitmap scans it also follows the TIDs selected by BRIN. We
+			 * then publish batches over rs_vistuples while the scan and
+			 * PgBatchSlot both keep the buffer pinned.
 			 */
-			if (state->page_active)
-				hscan->rs_cindex = hscan->rs_ntuples - 1;
-			ExecClearTuple(state->heap_slot);
-			if (!heap_getnextslot(state->scan, ForwardScanDirection,
-								  state->heap_slot))
+			if (!pg_batch_heap_next_page(state))
 			{
 				state->done = true;
 				return false;
 			}
-			state->page_active = true;
-			state->first_batch_on_page = true;
-			state->next_page_row = 0;
-			ExecClearTuple(state->heap_slot);
 			if (hscan->rs_ntuples == 0)
 				continue;
 		}
 
 		nrows = Min(PG_BATCH_SIZE,
 					(int) hscan->rs_ntuples - state->next_page_row);
-		/* heap_getnextslot() counted the first row of the first batch. */
+		/* The core callback counted the first row of the first batch. */
 		for (int i = state->first_batch_on_page ? 1 : 0; i < nrows; i++)
-			pgstat_count_heap_getnext(state->css.ss.ss_currentRelation);
+		{
+			if (state->heap_scan_mode == PG_BATCH_HEAP_BITMAP)
+				pgstat_count_heap_fetch(state->css.ss.ss_currentRelation);
+			else
+				pgstat_count_heap_getnext(state->css.ss.ss_currentRelation);
+		}
 		state->first_batch_on_page = false;
 		pg_batch_load_batch(bslot, hscan->rs_cbuf, hscan->rs_cblock,
 							RelationGetRelid(state->css.ss.ss_currentRelation),
@@ -446,13 +521,27 @@ pg_batch_scan_exec(CustomScanState *node)
 }
 
 static void
+pg_batch_bitmap_end(PgBatchScanState *state)
+{
+	if (!state->bitmap_initialized)
+		return;
+	if (!tbm_exhausted(&state->scan->st.rs_tbmiterator))
+		tbm_end_iterate(&state->scan->st.rs_tbmiterator);
+	tbm_free(state->tbm);
+	state->tbm = NULL;
+	state->bitmap_initialized = false;
+}
+
+static void
 pg_batch_scan_end(CustomScanState *node)
 {
 	PgBatchScanState *state = (PgBatchScanState *) node;
 
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
+	pg_batch_bitmap_end(state);
 	if (state->scan != NULL)
 		table_endscan(state->scan);
+	pg_batch_end_children(node);
 	pg_batch_compressed_scan_end(
 		pg_batch_slot_cast(node->ss.ss_ScanTupleSlot));
 }
@@ -463,8 +552,11 @@ pg_batch_scan_rescan(CustomScanState *node)
 	PgBatchScanState *state = (PgBatchScanState *) node;
 
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
+	pg_batch_bitmap_end(state);
 	if (state->scan != NULL)
 		table_rescan(state->scan, NULL);
+	if (state->bitmap_plan != NULL && state->bitmap_plan->chgParam == NULL)
+		ExecReScan(state->bitmap_plan);
 	pg_batch_compressed_scan_rescan(
 		pg_batch_slot_cast(node->ss.ss_ScanTupleSlot));
 	state->page_active = false;
@@ -485,7 +577,9 @@ pg_batch_scan_explain(CustomScanState *node, List *ancestors,
 
 	ExplainPropertyInteger("Batch Size", NULL, PG_BATCH_SIZE, es);
 	ExplainPropertyText("Batch Source",
-						state->compressed_source ? "Compressed Arrow" : "Heap", es);
+						state->compressed_source ? "Compressed Arrow" :
+						state->heap_scan_mode == PG_BATCH_HEAP_BITMAP ?
+						"Heap Bitmap" : "Heap", es);
 	if (state->compressed_source)
 	{
 		const char *mode;
@@ -509,6 +603,13 @@ pg_batch_scan_explain(CustomScanState *node, List *ancestors,
 							   bslot->project_datums, es);
 		ExplainPropertyInteger("Restarted Projection Datums", NULL,
 							   bslot->restarted_project_datums, es);
+		if (state->heap_scan_mode == PG_BATCH_HEAP_BITMAP)
+		{
+			ExplainPropertyInteger("Exact Heap Blocks", NULL,
+								   state->exact_pages, es);
+			ExplainPropertyInteger("Lossy Heap Blocks", NULL,
+								   state->lossy_pages, es);
+		}
 		if (state->compressed_source)
 		{
 			if (compressed_stats != NULL)

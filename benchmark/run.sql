@@ -3,6 +3,7 @@
 LOAD 'pg_batch';
 SET max_parallel_workers_per_gather = 0;
 SET jit = off;
+SET enable_bitmapscan = off;
 
 SET pg_batch.enable = on;
 PREPARE batch_narrow_dense AS
