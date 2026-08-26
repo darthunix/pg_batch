@@ -1,19 +1,28 @@
-MODULE_big = pg_batch
-OBJS = \
-	pg_batch.o \
-	pg_batch_plan.o \
-	pg_batch_slot.o \
-	pg_batch_exec.o \
-	pg_batch_compress.o \
-	pg_batch_tableam.o \
-	pg_batch_scan.o \
-	pg_batch_filter.o \
-	pg_batch_agg.o
-
-EXTENSION = pg_batch
-DATA = pg_batch--0.1.sql
-REGRESS = pg_batch
-
+SUBDIRS = bridge nodes tam
 PG_CONFIG ?= pg_config
-PGXS := $(shell $(PG_CONFIG) --pgxs)
-include $(PGXS)
+
+.PHONY: all clean install uninstall installcheck $(SUBDIRS)
+
+all: $(SUBDIRS)
+
+$(SUBDIRS):
+	$(MAKE) -C $@ PG_CONFIG="$(PG_CONFIG)"
+
+clean:
+	@for dir in $(SUBDIRS) test; do \
+		$(MAKE) -C $$dir PG_CONFIG="$(PG_CONFIG)" clean || exit; \
+	done
+
+install:
+	@for dir in $(SUBDIRS); do \
+		$(MAKE) -C $$dir PG_CONFIG="$(PG_CONFIG)" install || exit; \
+	done
+
+uninstall:
+	@for dir in tam nodes bridge; do \
+		$(MAKE) -C $$dir PG_CONFIG="$(PG_CONFIG)" uninstall || exit; \
+	done
+
+installcheck:
+	$(MAKE) -C test PG_CONFIG="$(PG_CONFIG)" all
+	$(MAKE) -C test PG_CONFIG="$(PG_CONFIG)" installcheck

@@ -1,163 +1,177 @@
 # pg_batch
 
-`pg_batch` is a small executor playground built against PostgreSQL master. It
-tests whether custom tuple slots and custom plan nodes are sufficient to pass
-heap and columnar data between executor nodes in batches. PostgreSQL core gains
-only a low-level heap deformation cursor; the slot ABI and table access method
-API do not change.
+`pg_batch` is an executor playground built against PostgreSQL master. It tests
+whether independent extensions can exchange batches through ordinary tuple
+slots, keep source-native columns between plan nodes, and postpone conversion
+to PostgreSQL `Datum` values.
 
-The prototype provides three custom nodes:
+The repository is split into three components:
 
-- `PgBatchScan` exposes batches of up to 64 visible tuples from a pinned heap
-  page and evaluates a safe prefix of simple restrictions in dense loops. It
-  can visit every page sequentially or only pages selected by a BRIN bitmap.
-- `PgBatchFilterProject` evaluates remaining qualifications, keeps a 64-bit
-  selection mask, and materializes projection columns only for surviving
-  rows.
-- `PgBatchAgg` consumes complete batches for `count(*)`, `count(column)`, and
-  `sum(int4)` without converting the batch to a row stream.
+```text
+nodes/  ----->  bridge/  <-----  tam/
+```
 
-The same nodes can also read a backend-local compressed snapshot made by
-`pg_batch_compress()`. Requested compressed columns are exposed as standard
-Arrow C Data Interface `ArrowArray` objects. Batch filters and aggregates read
-the Arrow value and validity buffers directly. PostgreSQL `Datum` values are
-formed only when a residual expression or a row-at-a-time parent needs them.
+- `bridge/` is the only shared dependency. It provides a versioned rendezvous
+  API, attaches batch requests and active batches to `TupleTableSlot *`, and
+  registers independent batch sources. Plan nodes keep the returned opaque
+  binding, so normal batch operations do not search for the slot attachment.
+- `nodes/` provides `PgBatchScan`, `PgBatchFilterProject`, `PgBatchAgg`, and the
+  custom batch slot. It knows nothing about the test table access method.
+- `tam/` provides a heap-compatible test table access method and a
+  backend-local compressed columnar snapshot. It knows nothing about the
+  custom nodes or their private slot structure.
 
-The snapshot now groups 64-row executor batches into larger storage groups.
-Each group stores per-column min/max values, NULL presence, and an exact small
-set of values until that set overflows. `pg_batch.compressed_scan_mode` selects
-plain batch reading, group pruning, or pruning plus exact source filtering.
-The default group contains 4096 rows; `pg_batch_compress(regclass, integer)`
-accepts another multiple of 64.
+The `.control` and extension SQL files retain their full extension names
+because PostgreSQL looks them up by those names. Public bridge headers are
+installed under `extension/pg_batch_bridge/`; internal source files use short
+names such as `planner.c`, `slot.c`, `provider.c`, and `compressed.c`.
 
-Source filtering currently understands the six built-in `int4` comparisons.
-Other safe conditions remain in `PgBatchScan`. The small set is exact metadata,
-not a Bloom or Fuse filter; it deliberately keeps this API experiment simple.
+## Batch contract
 
-The slot stores only columns referenced by the query. Filter columns precede
-projection-only columns in its compact descriptor. Each source row keeps a
-PostgreSQL `HeapTupleDeformState`, which records the physical attribute
-high-water mark and byte offset. Filter columns are extracted in column-major
-loops. A later lazy projection continues the saved cursor only for surviving
-rows; an earlier projection restarts only those rows.
+At planning time a source classifies each restriction as:
 
-The prototype build of PostgreSQL exposes `heap_deform_tuple_advance()`. It
-extracts one requested physical attribute without forming Datums for the
-intermediate attributes. Cached fixed offsets allow a direct jump, while
-variable-length and nullable prefixes use PostgreSQL's compact attribute
-metadata and deformation primitives. No scratch tuple slot or local crossover
-rule is needed.
+- `EXACT`: the source applies it completely, so the executor removes the local
+  copy;
+- `PRUNE_ONLY`: the source may skip groups, but the executor still checks the
+  condition;
+- `UNSUPPORTED`: the condition stays entirely above the source.
 
-For ordinary heap tables, the planner also recognizes core `BitmapHeapPath`
-alternatives whose bitmap is built only from BRIN indexes. The custom path
-keeps PostgreSQL's `Bitmap Index Scan`, uses the normal heap bitmap callback to
-prune pages and check MVCC visibility, and then exposes the callback's
-`rs_vistuples` array as batches. All relation restrictions are still checked
-by the batch nodes because BRIN results are normally lossy. This experiment is
-heap-specific and intentionally changes neither the table access method API
-nor PostgreSQL core.
+Filter attributes and projection-only attributes are passed separately. This
+lets a source read filter columns first and materialize projection columns only
+for surviving rows.
 
-## Build
+At execution time the bridge attaches a request to the scan slot. A table
+access method or another source reads that request and publishes a batch on the
+same slot. Every batch must provide lazy `Datum` materialization, which is the
+format-neutral fallback for ordinary PostgreSQL consumers. A batch may also
+publish optional named native interfaces. The test columnar source publishes
+Arrow C Data views; filters and aggregates consume those buffers directly.
 
-The required PostgreSQL change is included as
-`patches/postgres/0001-Expose-incremental-heap-tuple-deformation.patch`.
-Apply it to a PostgreSQL master checkout before building the extension:
+The attachment lookup is only for boundaries that receive an ordinary
+`TupleTableSlot *`, such as a table access method callback. It returns an
+opaque `PgBatchBridgeBinding *`. Batch-aware nodes retain that pointer and use
+it directly; the test table access method performs one lookup for each batch it
+returns.
+
+The bridge does not contain table-access-method policy or expression logic. It
+only owns the common ABI, source registry, slot attachments, selection bitmap,
+and batch lifetime transitions.
+
+## Executor nodes
+
+`PgBatchScan` reads up to 64 visible heap tuples from one pinned page, or asks a
+registered source to publish its next batch. Simple restrictions run in dense
+column loops. For heap tables the scan can be sequential or use pages selected
+by a BRIN bitmap.
+
+`PgBatchFilterProject` checks residual expressions, updates the selection
+bitmap, and requests projection columns only for survivors. `PgBatchAgg`
+consumes full batches for `count(*)`, `count(column)`, and `sum(int4)` without
+turning them into a row stream.
+
+For heap batches, the compact slot stores only columns used by the query.
+Filter columns precede projection-only columns. Every source row keeps a
+`HeapTupleDeformState`, so lazy projection can continue from the saved physical
+attribute and byte offset. The included PostgreSQL patch exposes the small
+incremental deformation cursor needed for this path.
+
+## Test columnar source
+
+The `pg_batch_compressed` table access method deliberately reuses heap storage
+for normal inserts and scalar scans. `pg_batch_compress()` builds a
+backend-local experimental snapshot with 64-row column batches, Arrow validity
+bitmaps, and `PLAIN`, `DELTA8`, or `DELTA16` encoding for `int4` columns.
+
+Larger storage groups contain per-column min/max values, NULL presence, and an
+exact small value set until it overflows. `pg_batch_tam.scan_mode` selects:
+
+- `batch`: return native batches without source filtering;
+- `prune`: use group metadata, then keep all restrictions in executor nodes;
+- `filter`: prune groups and apply supported `int4` comparisons exactly in the
+  source.
+
+The snapshot is not durable and is not kept in sync with the heap storage. It
+exists only to test the contract between a source and unrelated batch nodes.
+
+## Build and test
+
+Apply the included PostgreSQL patch to a master checkout:
 
 ```sh
 git -C ../postgres am \
     ../pg_batch/patches/postgres/0001-Expose-incremental-heap-tuple-deformation.patch
 ```
 
-Build `pg_batch` against that PostgreSQL installation by selecting its
-`pg_config`:
+Then build and install all three components:
 
 ```sh
 make PG_CONFIG=/path/to/patched/postgres/bin/pg_config
 make PG_CONFIG=/path/to/patched/postgres/bin/pg_config install
 ```
 
-Load the library in each session that should use the planner hooks:
+Create and load them in dependency order:
 
 ```sql
+CREATE EXTENSION pg_batch_bridge;
+CREATE EXTENSION pg_batch_tam;
 CREATE EXTENSION pg_batch;
+LOAD 'pg_batch_tam';
 LOAD 'pg_batch';
 ```
 
-Alternatively, add `pg_batch` to `shared_preload_libraries`. Custom paths are
-enabled by default after loading the library. Use `SET pg_batch.enable = off`
-to compare a query with the ordinary executor.
-
-To exercise the columnar source, make an in-memory snapshot and enable it:
+For a columnar-source example:
 
 ```sql
-SELECT pg_batch_compress('int4_table');
-SET pg_batch.use_compressed = on;
-SET pg_batch.compressed_scan_mode = filter;
+CREATE TABLE measurements(ts int, device int, value int)
+USING pg_batch_compressed;
+
+INSERT INTO measurements
+SELECT g, g % 16, g * 10 FROM generate_series(1, 100000) AS g;
+
+SELECT pg_batch_compress('measurements');
+SET pg_batch_tam.scan_mode = filter;
+SELECT count(*), sum(value) FROM measurements WHERE device = 3;
 ```
 
-The function returns the compressed size in bytes. The snapshot belongs to the
-current backend and replaces an older snapshot of the same table. It is not
-kept in sync with the source table, so recreate it after any data change.
+Run the regression suite against an existing server with:
 
-The first version intentionally supports only serial forward scans of ordinary
-heap-compatible tables without dropped or missing columns. The bitmap batch
-path is restricted to the built-in heap table access method and BRIN indexes.
-The compressed source accepts only `int4` columns and uses `PLAIN`, `DELTA8`,
-or `DELTA16` independently for each 64-row column. `PLAIN` becomes an Arrow
-values buffer without copying; delta columns are decoded lazily into an Arrow
-`int32` buffer, not a `Datum` array. The slot keeps its 64-bit row selection
-separately; Arrow validity bits describe NULLs only. Unsupported queries keep
-their ordinary PostgreSQL plans.
+```sh
+PGPORT=5432 make \
+    PG_CONFIG=/path/to/patched/postgres/bin/pg_config installcheck
+```
 
-The extension also registers `pg_batch_compressed`, a test table access method.
-Its physical storage and all ordinary callbacks are heap callbacks. Only a
-scan into `PgBatchSlot` reads the compressed snapshot, including the request
-for restrictions and lazy columns carried by that slot. Set
-`pg_batch.compressed_via_tableam = on` to exercise this path. This isolates the
-API experiment: the direct path and the table access method path share the
-same storage groups, filtering code, and batch format.
+The suite checks heap and BRIN batches, native Arrow consumption, lazy `Datum`
+fallback, exact and pruning-only predicates, parameters, rescans, early stop,
+disabled-source fallback, ABI rejection, and duplicate provider rejection.
 
 ## Source layout
 
-- `pg_batch.c` contains module initialization and the extension GUC.
-- `pg_batch_plan.c` adds sequential and BRIN-backed custom paths and builds the
-  three custom plans.
-- `pg_batch_slot.c` owns the batch slot, selection mask, lazy columns, and
-  heap deformation cursors.
-- `pg_batch_compress.c` owns the compressed snapshots and their lazy Arrow
-  column views, storage-group metadata, pruning, and source filtering.
-- `pg_batch_tableam.c` contains the heap-compatible test table access method.
-- `pg_batch_scan.c`, `pg_batch_filter.c`, and `pg_batch_agg.c` implement
-  the three executor nodes.
-- `pg_batch_exec.c` contains the small amount of shared executor plumbing.
-- `pg_batch.h` is the internal contract between these modules.
+- `bridge/include/bridge.h` defines the common versioned ABI.
+- `bridge/include/arrow.h` defines the optional Arrow interface.
+- `bridge/bridge.c` owns the registry and slot attachments.
+- `nodes/planner.c` builds sequential and BRIN-backed custom plans.
+- `nodes/slot.c` implements the custom slot and heap batch source.
+- `nodes/scan.c`, `filter.c`, and `aggregate.c` implement the executor nodes.
+- `tam/provider.c` classifies source predicates and manages scans.
+- `tam/compressed.c` owns snapshots, native columns, group pruning, and source
+  filtering.
+- `tam/tableam.c` is the heap-compatible test table access method boundary.
 
 ## Benchmark
 
-The reproducible benchmark compares the same queries with `pg_batch.enable`
-enabled and disabled:
+Create the heap data once, then run the desired comparison scripts:
 
 ```sh
 psql -f benchmark/setup.sql
-psql -f benchmark/run.sql
-psql -f benchmark/run_mixed.sql
+psql -f benchmark/run_heap_compare.sql
 psql -f benchmark/run_compressed.sql
 psql -f benchmark/run_groups.sql
 psql -f benchmark/run_brin.sql
 ```
 
-`benchmark/run_groups.sql` compares ordinary and batched heap scans, ordinary
-and batched BRIN scans, and all compressed-source modes on two tables with the
-same logical rows. It exercises BRIN min/max and Bloom operator classes. This
-is the direct comparison used to decide whether BRIN is enough or a native
-analytic table AM provides a separate benefit.
-
-`benchmark/run_heap_compare.sql` uses longer alternating samples for checking
-that changes to the format-neutral slot code do not slow down the heap source.
-It disables bitmap scans so the BRIN indexes cannot change that comparison.
-
-It covers dense simple restrictions, a residual scalar fallback, both
-physical orders of filter and projection columns, an aggregate that needs no
-projection Datum values, and BRIN page rejection over correlated and
-uncorrelated heap data. The latest local measurements are recorded in
+`run_heap_compare.sql` checks that the bridge refactoring does not slow the
+existing heap path. `run_compressed.sql` compares the PostgreSQL executor, heap
+batches, and the independent native source. `run_groups.sql` compares full
+heap scans, heap batches, BRIN, batch-over-BRIN, native batches, group pruning,
+and exact source filtering. Current measurements and query explanations are in
 [`benchmark/results.md`](benchmark/results.md).

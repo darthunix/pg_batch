@@ -3,7 +3,7 @@
 #include "executor/executor.h"
 #include "executor/nodeCustom.h"
 
-#include "pg_batch.h"
+#include "internal.h"
 
 void
 pg_batch_init_children(CustomScanState *css, EState *estate, int eflags)

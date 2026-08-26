@@ -3,6 +3,7 @@
 *.o
 *.so
 /results/
+/test/results/
 /regression.diffs
 /regression.out
 /data/

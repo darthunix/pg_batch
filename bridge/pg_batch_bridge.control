@@ -1,0 +1,4 @@
+comment = 'Experimental ABI between batch scan nodes and data sources'
+default_version = '0.1'
+module_pathname = '$libdir/pg_batch_bridge'
+relocatable = true

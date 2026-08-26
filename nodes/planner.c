@@ -20,35 +20,35 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
-#include "pg_batch.h"
+#include "internal.h"
 
 static set_rel_pathlist_hook_type previous_set_rel_pathlist_hook = NULL;
 static create_upper_paths_hook_type previous_create_upper_paths_hook = NULL;
 
-typedef struct PgBatchSourceLayout
+typedef struct SourceLayout
 {
 	List	   *targetlist;
 	List	   *source_attnums;
 	List	   *survivor_columns;
 	int			nfilter_columns;
-} PgBatchSourceLayout;
+} SourceLayout;
 
-static Plan *pg_batch_plan_base(PlannerInfo *root, RelOptInfo *rel,
-								CustomPath *best_path, List *tlist,
-								List *clauses, List *custom_plans);
-static Plan *pg_batch_plan_agg(PlannerInfo *root, RelOptInfo *rel,
-							   CustomPath *best_path, List *tlist,
-							   List *clauses, List *custom_plans);
-static List *pg_batch_query_agg_specs(PlannerInfo *root);
+static Plan *plan_base(PlannerInfo *root, RelOptInfo *rel,
+					   CustomPath *best_path, List *tlist,
+					   List *clauses, List *custom_plans);
+static Plan *plan_aggregate(PlannerInfo *root, RelOptInfo *rel,
+							CustomPath *best_path, List *tlist,
+							List *clauses, List *custom_plans);
+static List *query_aggregate_specs(PlannerInfo *root);
 
 static const CustomPathMethods pg_batch_base_path_methods = {
 	.CustomName = "PgBatchFilterProject",
-	.PlanCustomPath = pg_batch_plan_base,
+	.PlanCustomPath = plan_base,
 };
 
 static const CustomPathMethods pg_batch_agg_path_methods = {
 	.CustomName = "PgBatchAgg",
-	.PlanCustomPath = pg_batch_plan_agg,
+	.PlanCustomPath = plan_aggregate,
 };
 
 static const CustomScanMethods pg_batch_scan_plan_methods = {
@@ -67,7 +67,7 @@ static const CustomScanMethods pg_batch_agg_plan_methods = {
 };
 
 static bool
-pg_batch_is_scalar_operand(Node *node)
+is_scalar_operand(Node *node)
 {
 	return IsA(node, Const) ||
 		(IsA(node, Param) &&
@@ -76,7 +76,7 @@ pg_batch_is_scalar_operand(Node *node)
 }
 
 static bool
-pg_batch_function_is_safe(Oid funcid)
+function_is_safe(Oid funcid)
 {
 	HeapTuple	tuple;
 	Form_pg_proc proc;
@@ -107,9 +107,9 @@ pg_batch_match_qual(Node *clause, uint8 *var_argno)
 		return NULL;
 	args[0] = pg_batch_strip_relabel(linitial(op->args));
 	args[1] = pg_batch_strip_relabel(lsecond(op->args));
-	if (IsA(args[0], Var) && pg_batch_is_scalar_operand(args[1]))
+	if (IsA(args[0], Var) && is_scalar_operand(args[1]))
 		*var_argno = 0;
-	else if (pg_batch_is_scalar_operand(args[0]) && IsA(args[1], Var))
+	else if (is_scalar_operand(args[0]) && IsA(args[1], Var))
 		*var_argno = 1;
 	else
 		return NULL;
@@ -117,14 +117,14 @@ pg_batch_match_qual(Node *clause, uint8 *var_argno)
 	if (var->varattno <= 0 || var->varlevelsup != 0 ||
 		var->varreturningtype != VAR_RETURNING_DEFAULT)
 		return NULL;
-	if (!pg_batch_function_is_safe(op->opfuncid))
+	if (!function_is_safe(op->opfuncid))
 		return NULL;
 	return op;
 }
 
 static bool
-pg_batch_collect_relation_attrs(Node *node, Index relid, int natts,
-								bool *attrs)
+collect_relation_attrs(Node *node, Index relid, int natts,
+					   bool *attrs)
 {
 	List	   *vars;
 	ListCell   *lc;
@@ -158,9 +158,33 @@ pg_batch_collect_relation_attrs(Node *node, Index relid, int natts,
 	return result;
 }
 
+static Bitmapset *
+relation_attnums(Node *node, Index relid)
+{
+	Bitmapset  *result = NULL;
+	List	   *vars = pull_var_clause(node, PVC_RECURSE_AGGREGATES |
+									   PVC_RECURSE_WINDOWFUNCS |
+									   PVC_INCLUDE_PLACEHOLDERS);
+
+	foreach_ptr(Node, varnode, vars)
+	{
+		if (IsA(varnode, Var))
+		{
+			Var		   *var = castNode(Var, varnode);
+
+			if (var->varno == relid && var->varlevelsup == 0 &&
+				var->varattno > 0 &&
+				var->varreturningtype == VAR_RETURNING_DEFAULT)
+				result = bms_add_member(result, var->varattno);
+		}
+	}
+	list_free(vars);
+	return result;
+}
+
 static bool
-pg_batch_relation_supported(PlannerInfo *root, RelOptInfo *rel,
-							RangeTblEntry *rte)
+relation_supported(PlannerInfo *root, RelOptInfo *rel,
+				   RangeTblEntry *rte)
 {
 	Relation	relation;
 	bool		result = true;
@@ -174,7 +198,7 @@ pg_batch_relation_supported(PlannerInfo *root, RelOptInfo *rel,
 	relation = table_open(rte->relid, NoLock);
 	if (relation->rd_rel->relkind != RELKIND_RELATION ||
 		(relation->rd_rel->relam != HEAP_TABLE_AM_OID &&
-		 !pg_batch_relation_uses_tableam(relation)))
+		 pg_batch_bridge->find_provider(relation) == NULL))
 		result = false;
 	for (int i = 0; result && i < RelationGetNumberOfAttributes(relation); i++)
 	{
@@ -187,22 +211,22 @@ pg_batch_relation_supported(PlannerInfo *root, RelOptInfo *rel,
 	{
 		List	   *quals = extract_actual_clauses(rel->baserestrictinfo, false);
 
-		result = pg_batch_collect_relation_attrs((Node *) quals, rel->relid,
-												 RelationGetNumberOfAttributes(relation),
-												 NULL);
+		result = collect_relation_attrs((Node *) quals, rel->relid,
+										RelationGetNumberOfAttributes(relation),
+										NULL);
 		list_free(quals);
 	}
 	if (result)
-		result = pg_batch_collect_relation_attrs((Node *) rel->reltarget->exprs,
-												 rel->relid,
-												 RelationGetNumberOfAttributes(relation),
-												 NULL);
+		result = collect_relation_attrs((Node *) rel->reltarget->exprs,
+										rel->relid,
+										RelationGetNumberOfAttributes(relation),
+										NULL);
 	table_close(relation, NoLock);
 	return result;
 }
 
 static bool
-pg_batch_base_path_is_useful(PlannerInfo *root, RelOptInfo *rel)
+base_path_is_useful(PlannerInfo *root, RelOptInfo *rel)
 {
 	List	   *quals = extract_actual_clauses(rel->baserestrictinfo, false);
 	bool		result;
@@ -214,7 +238,7 @@ pg_batch_base_path_is_useful(PlannerInfo *root, RelOptInfo *rel)
 	 * the path only when a supported aggregate can consume batches directly.
 	 */
 	if (quals == NIL)
-		result = pg_batch_query_agg_specs(root) != NIL;
+		result = query_aggregate_specs(root) != NIL;
 	else
 	{
 		uint8		var_argno;
@@ -226,7 +250,7 @@ pg_batch_base_path_is_useful(PlannerInfo *root, RelOptInfo *rel)
 }
 
 static bool
-pg_batch_bitmapqual_uses_only_brin(Path *path)
+bitmapqual_uses_only_brin(Path *path)
 {
 	List	   *children;
 
@@ -243,14 +267,14 @@ pg_batch_bitmapqual_uses_only_brin(Path *path)
 		return false;
 	foreach_ptr(Path, child, children)
 	{
-		if (!pg_batch_bitmapqual_uses_only_brin(child))
+		if (!bitmapqual_uses_only_brin(child))
 			return false;
 	}
 	return true;
 }
 
 static CustomPath *
-pg_batch_make_base_path(RelOptInfo *rel, PgBatchHeapScanMode mode)
+make_base_path(RelOptInfo *rel, PgBatchHeapScanMode mode)
 {
 	CustomPath *path = makeNode(CustomPath);
 
@@ -264,15 +288,15 @@ pg_batch_make_base_path(RelOptInfo *rel, PgBatchHeapScanMode mode)
 }
 
 static void
-pg_batch_add_bitmap_paths(RelOptInfo *rel, List *candidate_paths)
+add_bitmap_paths(RelOptInfo *rel, List *candidate_paths)
 {
 	List	   *bitmap_paths = NIL;
 	ListCell   *lc;
 
 	/*
 	 * add_path() can free a dominated BitmapHeapPath. Keep shallow private
-	 * copies before adding any alternatives; their bitmapqual trees and parent
-	 * relation live for the whole planner invocation.
+	 * copies before adding any alternatives; their bitmapqual trees and
+	 * parent relation live for the whole planner invocation.
 	 */
 	foreach(lc, candidate_paths)
 	{
@@ -284,7 +308,7 @@ pg_batch_add_bitmap_paths(RelOptInfo *rel, List *candidate_paths)
 			candidate->param_info != NULL || candidate->parallel_aware)
 			continue;
 		bitmap = castNode(BitmapHeapPath, candidate);
-		if (!pg_batch_bitmapqual_uses_only_brin(bitmap->bitmapqual))
+		if (!bitmapqual_uses_only_brin(bitmap->bitmapqual))
 			continue;
 		copy = palloc_object(BitmapHeapPath);
 		memcpy(copy, bitmap, sizeof(BitmapHeapPath));
@@ -297,7 +321,7 @@ pg_batch_add_bitmap_paths(RelOptInfo *rel, List *candidate_paths)
 		Path	   *candidate = &bitmap->path;
 		CustomPath *path;
 
-		path = pg_batch_make_base_path(rel, PG_BATCH_HEAP_BITMAP);
+		path = make_base_path(rel, PG_BATCH_HEAP_BITMAP);
 		path->path.rows = candidate->rows;
 		path->path.disabled_nodes = candidate->disabled_nodes;
 		path->path.startup_cost = candidate->startup_cost;
@@ -310,8 +334,8 @@ pg_batch_add_bitmap_paths(RelOptInfo *rel, List *candidate_paths)
 }
 
 static void
-pg_batch_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
-						  RangeTblEntry *rte)
+set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
+				 RangeTblEntry *rte)
 {
 	Relation	relation;
 	List	   *candidate_paths;
@@ -319,13 +343,17 @@ pg_batch_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 
 	if (previous_set_rel_pathlist_hook != NULL)
 		previous_set_rel_pathlist_hook(root, rel, rti, rte);
-	if (!pg_batch_relation_supported(root, rel, rte))
+	if (!relation_supported(root, rel, rte))
 		return;
-	if (!pg_batch_base_path_is_useful(root, rel))
+	if (!base_path_is_useful(root, rel))
 		return;
 
-	/* Preserve the core paths before add_path() starts comparing alternatives. */
+	/*
+	 * Preserve the core paths before add_path() starts comparing
+	 * alternatives.
+	 */
 	candidate_paths = list_copy(rel->pathlist);
+
 	/*
 	 * This experiment deliberately remains heap-specific. The normal bitmap
 	 * path provides the BRIN plan; PgBatchScan only changes how matching heap
@@ -333,11 +361,11 @@ pg_batch_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	 */
 	relation = table_open(rte->relid, NoLock);
 	if (relation->rd_rel->relam == HEAP_TABLE_AM_OID)
-		pg_batch_add_bitmap_paths(rel, candidate_paths);
+		add_bitmap_paths(rel, candidate_paths);
 	table_close(relation, NoLock);
 	list_free(candidate_paths);
 
-	path = pg_batch_make_base_path(rel, PG_BATCH_HEAP_SEQ);
+	path = make_base_path(rel, PG_BATCH_HEAP_SEQ);
 	cost_seqscan(&path->path, root, rel, NULL);
 	/* Prefer the playground path until it has a real cost model. */
 	path->path.total_cost *= 0.90;
@@ -345,8 +373,8 @@ pg_batch_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 }
 
 static bool
-pg_batch_parse_agg(Aggref *agg, PgBatchAggKind *kind,
-				   AttrNumber *source_attnum)
+parse_aggregate(Aggref *agg, PgBatchAggKind *kind,
+				AttrNumber *source_attnum)
 {
 	TargetEntry *arg;
 	Node	   *expr;
@@ -382,7 +410,7 @@ pg_batch_parse_agg(Aggref *agg, PgBatchAggKind *kind,
 }
 
 static List *
-pg_batch_build_agg_specs(List *tlist)
+build_aggregate_specs(List *tlist)
 {
 	List	   *result = NIL;
 	ListCell   *lc;
@@ -394,7 +422,7 @@ pg_batch_build_agg_specs(List *tlist)
 		AttrNumber	attnum;
 
 		if (tle->resjunk || !IsA(tle->expr, Aggref) ||
-			!pg_batch_parse_agg(castNode(Aggref, tle->expr), &kind, &attnum))
+			!parse_aggregate(castNode(Aggref, tle->expr), &kind, &attnum))
 			return NIL;
 		result = lappend(result,
 						 list_make2(makeInteger(kind), makeInteger(attnum)));
@@ -403,17 +431,17 @@ pg_batch_build_agg_specs(List *tlist)
 }
 
 static List *
-pg_batch_query_agg_specs(PlannerInfo *root)
+query_aggregate_specs(PlannerInfo *root)
 {
 	if (!root->parse->hasAggs || root->parse->groupClause != NIL ||
 		root->parse->groupingSets != NIL || root->parse->havingQual != NULL ||
 		list_length(root->parse->rtable) != 1)
 		return NIL;
-	return pg_batch_build_agg_specs(root->processed_tlist);
+	return build_aggregate_specs(root->processed_tlist);
 }
 
 static Path *
-pg_batch_find_base_path(RelOptInfo *input_rel)
+find_base_path(RelOptInfo *input_rel)
 {
 	Path	   *best = NULL;
 	ListCell   *lc;
@@ -431,9 +459,9 @@ pg_batch_find_base_path(RelOptInfo *input_rel)
 }
 
 static void
-pg_batch_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
-							RelOptInfo *input_rel, RelOptInfo *output_rel,
-							void *extra)
+create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
+				   RelOptInfo *input_rel, RelOptInfo *output_rel,
+				   void *extra)
 {
 	Path	   *child;
 	CustomPath *path;
@@ -444,10 +472,10 @@ pg_batch_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 										 extra);
 	if (!pg_batch_enable || stage != UPPERREL_GROUP_AGG)
 		return;
-	agg_specs = pg_batch_query_agg_specs(root);
+	agg_specs = query_aggregate_specs(root);
 	if (agg_specs == NIL)
 		return;
-	child = pg_batch_find_base_path(input_rel);
+	child = find_base_path(input_rel);
 	if (child == NULL)
 		return;
 
@@ -465,11 +493,11 @@ pg_batch_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	add_path(output_rel, &path->path);
 }
 
-static PgBatchSourceLayout
-pg_batch_build_source_layout(PlannerInfo *root, RelOptInfo *rel, List *quals,
-							 List *targetlist)
+static SourceLayout
+build_source_layout(PlannerInfo *root, RelOptInfo *rel, List *quals,
+					List *targetlist)
 {
-	PgBatchSourceLayout layout = {0};
+	SourceLayout layout = {0};
 	RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
 	Relation	relation = table_open(rte->relid, NoLock);
 	TupleDesc	desc = RelationGetDescr(relation);
@@ -478,10 +506,10 @@ pg_batch_build_source_layout(PlannerInfo *root, RelOptInfo *rel, List *quals,
 	int		   *positions = palloc0_array(int, desc->natts + 1);
 	int			resno = 1;
 
-	if (!pg_batch_collect_relation_attrs((Node *) quals, rel->relid,
-										 desc->natts, filter_attrs) ||
-		!pg_batch_collect_relation_attrs((Node *) targetlist, rel->relid,
-										 desc->natts, survivor_attrs))
+	if (!collect_relation_attrs((Node *) quals, rel->relid,
+								desc->natts, filter_attrs) ||
+		!collect_relation_attrs((Node *) targetlist, rel->relid,
+								desc->natts, survivor_attrs))
 		elog(ERROR, "pg_batch found an unsupported variable");
 
 	/*
@@ -533,7 +561,7 @@ pg_batch_build_source_layout(PlannerInfo *root, RelOptInfo *rel, List *quals,
 }
 
 static CustomScan *
-pg_batch_make_custom_scan(const CustomScanMethods *methods)
+make_custom_scan(const CustomScanMethods *methods)
 {
 	CustomScan *scan = makeNode(CustomScan);
 
@@ -542,18 +570,24 @@ pg_batch_make_custom_scan(const CustomScanMethods *methods)
 }
 
 static Plan *
-pg_batch_plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
-				   List *tlist, List *clauses, List *custom_plans)
+plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
+		  List *tlist, List *clauses, List *custom_plans)
 {
-	PgBatchSourceLayout layout;
+	SourceLayout layout;
+	PgBatchBridgePlanResult source_result;
 	PgBatchHeapScanMode heap_scan_mode =
 		intVal(linitial(best_path->custom_private));
 	CustomScan *scan;
 	CustomScan *filter;
 	List	   *quals = extract_actual_clauses(clauses, false);
 	List	   *batch_quals = NIL;
-	List	   *residual;
-	int			nbatch_quals = 0;
+	List	   *residual = NIL;
+	List	   *local_quals = NIL;
+	List	   *source_exprs = NIL;
+	Node	   *source_private = (Node *) NIL;
+	const char *provider_name = "";
+	bool		dense_prefix = true;
+	int			qualno = 0;
 
 	if (heap_scan_mode == PG_BATCH_HEAP_BITMAP)
 	{
@@ -572,36 +606,87 @@ pg_batch_plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	}
 	else
 		Assert(custom_plans == NIL);
-	layout = pg_batch_build_source_layout(root, rel, quals, tlist);
+	MemSet(&source_result, 0, sizeof(source_result));
+	if (heap_scan_mode == PG_BATCH_HEAP_SEQ)
+	{
+		RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
+		Relation	relation = table_open(rte->relid, NoLock);
+		const PgBatchBridgeProviderOps *provider =
+			pg_batch_bridge->find_provider(relation);
+
+		if (provider != NULL)
+		{
+			PgBatchBridgePlanRequest request;
+			Bitmapset  *filter_attnums =
+				relation_attnums((Node *) quals, rel->relid);
+			Bitmapset  *project_attnums =
+				relation_attnums((Node *) tlist, rel->relid);
+
+			project_attnums = bms_del_members(project_attnums, filter_attnums);
+			MemSet(&request, 0, sizeof(request));
+			request.root = root;
+			request.rel = rel;
+			request.relation = relation;
+			request.clauses = quals;
+			request.filter_attnums = filter_attnums;
+			request.project_attnums = project_attnums;
+			provider->plan_scan(&request, &source_result);
+			if (source_result.nquals != list_length(quals) ||
+				source_result.qual_support == NULL)
+				elog(ERROR, "pg_batch provider returned an invalid qualification plan");
+			provider_name = provider->provider_name;
+			source_exprs = source_result.source_exprs;
+			source_private = source_result.source_private;
+			bms_free(filter_attnums);
+			bms_free(project_attnums);
+		}
+		table_close(relation, NoLock);
+	}
 	foreach_ptr(Node, qual, quals)
 	{
 		uint8		var_argno;
 
-		if (pg_batch_match_qual(qual, &var_argno) == NULL)
-			break;
-		batch_quals = lappend(batch_quals, qual);
-		nbatch_quals++;
+		if (source_result.qual_support != NULL &&
+			source_result.qual_support[qualno] == PG_BATCH_BRIDGE_QUAL_EXACT)
+		{
+			qualno++;
+			continue;
+		}
+		local_quals = lappend(local_quals, qual);
+		if (dense_prefix && pg_batch_match_qual(qual, &var_argno) != NULL)
+			batch_quals = lappend(batch_quals, qual);
+		else
+		{
+			dense_prefix = false;
+			residual = lappend(residual, qual);
+		}
+		qualno++;
 	}
-	residual = list_copy_tail(quals, nbatch_quals);
+	layout = build_source_layout(root, rel, local_quals, tlist);
 
-	scan = pg_batch_make_custom_scan(&pg_batch_scan_plan_methods);
+	scan = make_custom_scan(&pg_batch_scan_plan_methods);
 	scan->scan.scanrelid = rel->relid;
 	scan->scan.plan.targetlist = copyObject(layout.targetlist);
 	scan->scan.plan.plan_rows = rel->rows;
 	scan->scan.plan.plan_width = rel->reltarget->width;
 	scan->scan.plan.startup_cost = best_path->path.startup_cost;
 	scan->scan.plan.total_cost = best_path->path.total_cost;
-	scan->custom_exprs = copyObject(batch_quals);
+	scan->custom_exprs = list_concat(copyObject(source_exprs),
+									 copyObject(batch_quals));
 	scan->custom_plans = custom_plans;
-	/* Source attributes, compact filter prefix, and heap access method. */
+	/* Compact layout, heap path, and the independently supplied source plan. */
 	scan->custom_private =
-		list_make3(copyObject(layout.source_attnums),
+		list_make5(copyObject(layout.source_attnums),
 				   makeInteger(layout.nfilter_columns),
-				   makeInteger(heap_scan_mode));
+				   makeInteger(heap_scan_mode),
+				   makeString(pstrdup(provider_name)),
+				   copyObject(source_private));
+	scan->custom_private = lappend(scan->custom_private,
+								   makeInteger(list_length(source_exprs)));
 	scan->custom_scan_tlist = copyObject(layout.targetlist);
 	scan->custom_relids = bms_copy(rel->relids);
 
-	filter = pg_batch_make_custom_scan(&pg_batch_filter_plan_methods);
+	filter = make_custom_scan(&pg_batch_filter_plan_methods);
 	filter->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	filter->scan.plan.targetlist = tlist;
 	filter->scan.plan.qual = residual;
@@ -613,18 +698,19 @@ pg_batch_plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				   layout.survivor_columns);
 	filter->custom_scan_tlist = layout.targetlist;
 	filter->custom_relids = bms_copy(rel->relids);
+	list_free(local_quals);
 	return &filter->scan.plan;
 }
 
 static Plan *
-pg_batch_plan_agg(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
-				  List *tlist, List *clauses, List *custom_plans)
+plan_aggregate(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
+			   List *tlist, List *clauses, List *custom_plans)
 {
 	CustomScan *agg;
 
 	Assert(list_length(custom_plans) == 1);
 	Assert(clauses == NIL);
-	agg = pg_batch_make_custom_scan(&pg_batch_agg_plan_methods);
+	agg = make_custom_scan(&pg_batch_agg_plan_methods);
 	agg->scan.plan.targetlist = copyObject(tlist);
 	agg->custom_plans = custom_plans;
 	agg->custom_private = copyObject(best_path->custom_private);
@@ -639,9 +725,9 @@ pg_batch_planner_init(void)
 	RegisterCustomScanMethods(&pg_batch_filter_plan_methods);
 	RegisterCustomScanMethods(&pg_batch_agg_plan_methods);
 	previous_set_rel_pathlist_hook = set_rel_pathlist_hook;
-	set_rel_pathlist_hook = pg_batch_set_rel_pathlist;
+	set_rel_pathlist_hook = set_rel_pathlist;
 	previous_create_upper_paths_hook = create_upper_paths_hook;
-	create_upper_paths_hook = pg_batch_create_upper_paths;
+	create_upper_paths_hook = create_upper_paths;
 }
 
 void

@@ -1,5 +1,9 @@
 \set ON_ERROR_STOP on
 
+CREATE EXTENSION IF NOT EXISTS pg_batch_bridge;
+CREATE EXTENSION IF NOT EXISTS pg_batch_tam;
+CREATE EXTENSION IF NOT EXISTS pg_batch;
+
 DROP TABLE IF EXISTS pg_batch_bench_narrow;
 CREATE TABLE pg_batch_bench_narrow AS
 SELECT g AS c1,

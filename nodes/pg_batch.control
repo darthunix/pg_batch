@@ -1,4 +1,5 @@
 comment = 'Minimal batch executor playground'
 default_version = '0.1'
 module_pathname = '$libdir/pg_batch'
+requires = 'pg_batch_bridge'
 relocatable = true

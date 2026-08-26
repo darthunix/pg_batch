@@ -5,9 +5,9 @@
 The original measurements were taken on 2026-08-24 with PostgreSQL master
 `e42f1d0f1be` plus the heap deformation cursor required by this prototype. The
 heap and BRIN comparison was added on 2026-08-25 using the same build and
-database. All compared plans used the same PostgreSQL binary. The ordinary
-executor therefore used the unchanged row-at-a-time path from that patched
-binary.
+database, and the storage-group measurements were refreshed on 2026-08-26.
+All compared plans used the same PostgreSQL binary. The ordinary executor
+therefore used the unchanged row-at-a-time path from that patched binary.
 
 Parallel query and JIT were disabled. Relations and compressed snapshots were
 already warm. Snapshot construction time was measured separately and was not
@@ -29,16 +29,12 @@ The report uses these executor names:
   `PgBatchScan` still evaluates conditions for rows in groups that remain.
 - **Filter**: the source both skips groups and evaluates supported `int4`
   comparisons before it returns a batch.
-- **TAM filter**: the same reader and filtering code as **Filter**, reached
-  through `table_scan_getnextslot()` of the test table access method.
 
 These comparisons answer different questions. PostgreSQL versus Heap batch
 measures the executor changes over the same heap table. Heap batch versus
 Arrow batch also changes the data representation and bypasses a normal heap
 visibility scan. Arrow batch versus Prune isolates group skipping. Prune
 versus Filter shows the effect of evaluating simple conditions in the source.
-Filter versus TAM filter isolates the cost of going through the table access
-method.
 
 ## Test data
 
@@ -278,13 +274,14 @@ repeat the normal heap visibility work. Heap batch versus Arrow batch is the
 more useful comparison for deciding whether the same batch nodes can consume
 another native representation without converting it to row Datums.
 
-The simplified format dispatch was also compared with the exact pre-refactor
-library using the same PostgreSQL binary and heap tables. A 20-second,
-single-client `pgbench` run measured 3.956 ms versus 3.935 ms for the wide
-`count(*)` query, a 0.5% increase. The dense narrow query measured 18.617 ms
-versus 18.971 ms, so no slowdown was observed there. Short alternating samples
-were noisier because other work on the machine changed even ordinary executor
-timings.
+The split bridge build was also compared with the exact pre-refactor library
+using the same PostgreSQL binary and heap tables. Current versus old medians
+were 18.946 versus 18.681 ms for the dense query, 11.500 versus 11.266 ms for
+the pass-none query, 3.995 versus 4.030 ms for wide `count(*)`, 4.121 versus
+4.080 ms for an early filter and late projection, and 4.292 versus 4.137 ms
+for the reverse column order. The changes range from -0.9% to +3.7%; the
+largest absolute increase is 0.155 ms and this short query is also the noisiest
+case. The bridge hash lookup no longer appears in a heap-path profile.
 
 ## Heap plus BRIN versus a compressed table AM
 
@@ -307,19 +304,19 @@ Each compressed group stores min/max values, NULL presence, and up to 16 exact
 distinct values per column. The exact set is discarded after it overflows.
 This is deliberately simpler than a production Bloom or Fuse filter.
 
-Each timing is the median of 15 executions after three warm-ups. All eight
+Each timing is the median of 15 executions after three warm-ups. All seven
 modes were rotated in one backend. PostgreSQL and Heap batch force sequential
-heap access. PostgreSQL BRIN and Heap batch BRIN force bitmap access. The four
+heap access. PostgreSQL BRIN and Heap batch BRIN force bitmap access. The three
 Arrow modes read the compressed snapshot. In the query text below, `source`
 stands for the ordinary heap table in heap modes and for the test table-AM
 table in Arrow modes.
 
-| Query | PostgreSQL | Heap batch | PostgreSQL BRIN | Heap batch BRIN | Arrow batch | Prune | Filter | TAM filter |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1000-row range | 33.414 | 14.520 | 0.169 | 0.073 | 5.360 | 0.023 | 0.016 | 0.018 |
-| Impossible range | 30.402 | 12.206 | 0.036 | 0.020 | 3.990 | 0.008 | 0.004 | 0.007 |
-| Missing low-cardinality value | 31.992 | 11.413 | 0.165 | 0.150 | 3.965 | 0.011 | 0.004 | 0.008 |
-| Dense filter and sum | 36.991 | 18.785 | 41.517 | 20.942 | 7.848 | 6.590 | 5.955 | 5.993 |
+| Query | PostgreSQL | Heap batch | PostgreSQL BRIN | Heap batch BRIN | Arrow batch | Prune | Filter |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1000-row range | 33.675 | 14.877 | 0.178 | 0.077 | 6.458 | 0.031 | 0.018 |
+| Impossible range | 30.873 | 12.729 | 0.036 | 0.021 | 4.876 | 0.011 | 0.005 |
+| Missing low-cardinality value | 32.901 | 11.912 | 0.168 | 0.150 | 4.839 | 0.016 | 0.006 |
+| Dense filter and sum | 37.979 | 19.747 | 42.297 | 21.455 | 9.224 | 7.825 | 5.841 |
 
 All times are milliseconds.
 
@@ -332,13 +329,13 @@ WHERE c1 BETWEEN 1000001 AND 1001000;
 ```
 
 The result is 1000. BRIN opens 32 heap pages and exposes 5,024 visible rows for
-recheck. Heap batch BRIN processes those rows in 96 batches and takes 0.073 ms.
+recheck. Heap batch BRIN processes those rows in 96 batches and takes 0.077 ms.
 The compressed source rejects 488 of 489 groups, opens 4096 rows, and takes
-0.018 ms through the table AM.
+0.018 ms after filtering inside the table AM.
 
-The table AM is four times faster, but the absolute difference is only 0.055
-ms. Both approaches solve the important problem by avoiding almost the whole
-table. This result alone is not a strong reason to build a new table AM.
+The table AM is about four times faster, but the absolute difference is only
+0.059 ms. Both approaches solve the important problem by avoiding almost the
+whole table. This result alone is not a strong reason to build a new table AM.
 
 ### Query 2: a range that cannot match
 
@@ -349,8 +346,8 @@ WHERE c1 < 0;
 ```
 
 BRIN and compressed min/max metadata both prove that the result is empty
-without opening data pages or batches. Heap batch BRIN takes 0.020 ms and the
-table-AM path takes 0.007 ms. These numbers mostly measure fixed executor
+without opening data pages or batches. Heap batch BRIN takes 0.021 ms and the
+table-AM path takes 0.005 ms. These numbers mostly measure fixed executor
 startup cost.
 
 ### Query 3: a missing value handled by BRIN Bloom
@@ -367,7 +364,7 @@ does: the bitmap is empty and neither BRIN plan opens a heap page. Heap batch
 BRIN takes 0.150 ms.
 
 The compressed group's exact set is `{0, 2, 4, 6, 8, 10, 12, 14}` and likewise
-rejects all 489 groups without opening a batch. The table-AM path takes 0.008
+rejects all 489 groups without opening a batch. The table-AM path takes 0.006
 ms. Its in-memory exact metadata is faster than scanning the BRIN Bloom index,
 but both designs avoid the 2,000,000-row scan. This result shows why a fair
 heap comparison must consider the appropriate BRIN operator class, not only
@@ -385,13 +382,12 @@ WHERE c1 < 1500000
 The result uses 187,500 values. BRIN rejects the final quarter of the ordered
 heap but still visits 9,568 pages and exposes 1,502,176 rows. At this
 selectivity its bitmap overhead outweighs the pages it skips: Heap batch takes
-18.785 ms and Heap batch BRIN takes 20.942 ms.
+19.747 ms and Heap batch BRIN takes 21.455 ms.
 
-Arrow batch takes 7.848 ms even without group rejection. Pruning lowers that
-to 6.590 ms, and exact source filtering lowers it to about 6.0 ms. The roughly
-threefold difference from heap batching comes mainly from the compact native
-column representation and direct filtering, not from the table-AM call
-itself. Direct Filter and TAM filter differ by only 0.038 ms.
+Arrow batch takes 9.224 ms even without group rejection. Pruning lowers that
+to 7.825 ms, and exact source filtering lowers it to 5.841 ms. The roughly
+3.4-fold difference from heap batching comes mainly from the compact native
+column representation and direct filtering.
 
 ### Architectural conclusion
 
@@ -409,10 +405,9 @@ across a batch subtree. It has a large advantage when a query still processes
 a large fraction of the table. Those capabilities, rather than page rejection
 alone, are the stronger justification for a separate table AM.
 
-The timings do not show a performance reason to put that format specifically
-behind a table AM: direct Filter and TAM filter are effectively equal. They
-show the value of the native representation and source capabilities. A table
-AM would still be needed if that representation must become persistent table
+These timings show the value of the native representation and source
+capabilities, but do not compare different ways to integrate that source. A
+table AM would be needed if the representation must become persistent table
 storage with normal PostgreSQL DDL, MVCC, maintenance, and indexing semantics;
 a custom scan could be enough for a narrower experiment.
 

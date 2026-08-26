@@ -1,5 +1,6 @@
 \set ON_ERROR_STOP on
 
+LOAD 'pg_batch_tam';
 LOAD 'pg_batch';
 SET max_parallel_workers_per_gather = 0;
 SET jit = off;
@@ -32,12 +33,33 @@ BEGIN
 END
 $function$;
 
-SELECT pg_batch_build_snapshot('pg_batch_bench_narrow', 2000000, 8);
-SELECT pg_batch_build_snapshot('pg_batch_bench_wide', 250000, 60);
-SELECT pg_batch_build_snapshot('pg_batch_bench_plain', 1000000, 4);
+DROP TABLE IF EXISTS pg_batch_bench_narrow_tam;
+CREATE TABLE pg_batch_bench_narrow_tam
+(LIKE pg_batch_bench_narrow)
+USING pg_batch_compressed;
+INSERT INTO pg_batch_bench_narrow_tam SELECT * FROM pg_batch_bench_narrow;
+
+DROP TABLE IF EXISTS pg_batch_bench_wide_tam;
+CREATE TABLE pg_batch_bench_wide_tam
+(LIKE pg_batch_bench_wide)
+USING pg_batch_compressed;
+INSERT INTO pg_batch_bench_wide_tam SELECT * FROM pg_batch_bench_wide;
+
+DROP TABLE IF EXISTS pg_batch_bench_plain_tam;
+CREATE TABLE pg_batch_bench_plain_tam
+(LIKE pg_batch_bench_plain)
+USING pg_batch_compressed;
+INSERT INTO pg_batch_bench_plain_tam SELECT * FROM pg_batch_bench_plain;
+
+VACUUM (ANALYZE) pg_batch_bench_narrow_tam;
+VACUUM (ANALYZE) pg_batch_bench_wide_tam;
+VACUUM (ANALYZE) pg_batch_bench_plain_tam;
+
+SELECT pg_batch_build_snapshot('pg_batch_bench_narrow_tam', 2000000, 8);
+SELECT pg_batch_build_snapshot('pg_batch_bench_wide_tam', 250000, 60);
+SELECT pg_batch_build_snapshot('pg_batch_bench_plain_tam', 1000000, 4);
 
 SET pg_batch.enable = on;
-SET pg_batch.use_compressed = off;
 PREPARE batch_narrow_dense AS
 SELECT count(*) FROM pg_batch_bench_narrow
 WHERE c1 > 100 AND c2 < 1500000;
@@ -55,6 +77,24 @@ PREPARE batch_plain_count AS
 SELECT count(*) FROM pg_batch_bench_plain WHERE c1 < 1073741824;
 PREPARE batch_plain_sum AS
 SELECT sum(c4) FROM pg_batch_bench_plain WHERE c1 < 1073741824;
+
+PREPARE arrow_narrow_dense AS
+SELECT count(*) FROM pg_batch_bench_narrow_tam
+WHERE c1 > 100 AND c2 < 1500000;
+PREPARE arrow_narrow_none AS
+SELECT count(*) FROM pg_batch_bench_narrow_tam WHERE c1 < 0;
+PREPARE arrow_wide_late_projection AS
+SELECT c60 FROM pg_batch_bench_wide_tam WHERE c2 < 1000;
+PREPARE arrow_wide_early_projection AS
+SELECT c2 FROM pg_batch_bench_wide_tam WHERE c60 < 1058;
+PREPARE arrow_wide_count AS
+SELECT count(*) FROM pg_batch_bench_wide_tam WHERE c2 < 1000;
+PREPARE arrow_wide_sum AS
+SELECT sum(c60) FROM pg_batch_bench_wide_tam WHERE c2 < 1000;
+PREPARE arrow_plain_count AS
+SELECT count(*) FROM pg_batch_bench_plain_tam WHERE c1 < 1073741824;
+PREPARE arrow_plain_sum AS
+SELECT sum(c4) FROM pg_batch_bench_plain_tam WHERE c1 < 1073741824;
 
 SET pg_batch.enable = off;
 PREPARE plain_narrow_dense AS
@@ -86,6 +126,7 @@ CREATE TEMP TABLE pg_batch_timings
 CREATE FUNCTION pg_batch_measure(test_name text,
                                  plain_statement text,
                                  batch_statement text,
+                                 arrow_statement text,
                                  repetitions integer DEFAULT 15)
 RETURNS void
 LANGUAGE plpgsql
@@ -101,11 +142,10 @@ BEGIN
             PERFORM set_config('pg_batch.enable',
                                CASE WHEN executor_name = 'postgres'
                                     THEN 'off' ELSE 'on' END, false);
-            PERFORM set_config('pg_batch.use_compressed',
-                               CASE WHEN executor_name = 'arrow'
-                                    THEN 'on' ELSE 'off' END, false);
             statement_name := CASE WHEN executor_name = 'postgres'
-                                   THEN plain_statement ELSE batch_statement END;
+                                   THEN plain_statement
+                                   WHEN executor_name = 'heap'
+                                   THEN batch_statement ELSE arrow_statement END;
             EXECUTE format('EXECUTE %I', statement_name);
         END LOOP;
     END LOOP;
@@ -120,11 +160,10 @@ BEGIN
             PERFORM set_config('pg_batch.enable',
                                CASE WHEN executor_name = 'postgres'
                                     THEN 'off' ELSE 'on' END, false);
-            PERFORM set_config('pg_batch.use_compressed',
-                               CASE WHEN executor_name = 'arrow'
-                                    THEN 'on' ELSE 'off' END, false);
             statement_name := CASE WHEN executor_name = 'postgres'
-                                   THEN plain_statement ELSE batch_statement END;
+                                   THEN plain_statement
+                                   WHEN executor_name = 'heap'
+                                   THEN batch_statement ELSE arrow_statement END;
             started_at := clock_timestamp();
             EXECUTE format('EXECUTE %I', statement_name);
             INSERT INTO pg_batch_timings
@@ -136,23 +175,31 @@ END
 $function$;
 
 SELECT pg_batch_measure('narrow dense quals',
-                        'plain_narrow_dense', 'batch_narrow_dense');
+                        'plain_narrow_dense', 'batch_narrow_dense',
+                        'arrow_narrow_dense');
 SELECT pg_batch_measure('narrow pass none',
-                        'plain_narrow_none', 'batch_narrow_none');
+                        'plain_narrow_none', 'batch_narrow_none',
+                        'arrow_narrow_none');
 SELECT pg_batch_measure('wide early filter late projection',
                         'plain_wide_late_projection',
-                        'batch_wide_late_projection');
+                        'batch_wide_late_projection',
+                        'arrow_wide_late_projection');
 SELECT pg_batch_measure('wide late filter early projection',
                         'plain_wide_early_projection',
-                        'batch_wide_early_projection');
+                        'batch_wide_early_projection',
+                        'arrow_wide_early_projection');
 SELECT pg_batch_measure('wide count without projection',
-                        'plain_wide_count', 'batch_wide_count');
+                        'plain_wide_count', 'batch_wide_count',
+                        'arrow_wide_count');
 SELECT pg_batch_measure('wide sum from native batch',
-                        'plain_wide_sum', 'batch_wide_sum');
+                        'plain_wide_sum', 'batch_wide_sum',
+                        'arrow_wide_sum');
 SELECT pg_batch_measure('plain encoding count',
-                        'plain_plain_count', 'batch_plain_count');
+                        'plain_plain_count', 'batch_plain_count',
+                        'arrow_plain_count');
 SELECT pg_batch_measure('delta16 encoding sum',
-                        'plain_plain_sum', 'batch_plain_sum');
+                        'plain_plain_sum', 'batch_plain_sum',
+                        'arrow_plain_sum');
 
 SELECT relation_name,
        pg_size_pretty(logical_bytes) AS logical_size,
@@ -175,6 +222,6 @@ ORDER BY test,
              ELSE 3
          END;
 
-DROP FUNCTION pg_batch_measure(text, text, text, integer);
+DROP FUNCTION pg_batch_measure(text, text, text, text, integer);
 DROP FUNCTION pg_batch_build_snapshot(regclass, bigint, integer);
 DEALLOCATE ALL;

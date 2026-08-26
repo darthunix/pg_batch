@@ -1,5 +1,25 @@
+CREATE EXTENSION pg_batch_bridge;
+CREATE EXTENSION pg_batch_tam;
 CREATE EXTENSION pg_batch;
+
+\getenv libdir PG_LIBDIR
+\getenv dlsuffix PG_DLSUFFIX
+\set bridge_test :libdir '/pg_batch_bridge_test' :dlsuffix
+LOAD :'bridge_test';
+LOAD 'pg_batch_tam';
 LOAD 'pg_batch';
+
+CREATE FUNCTION pg_batch_bridge_test_bad_abi()
+RETURNS void
+AS :'bridge_test', 'pg_batch_bridge_test_bad_abi'
+LANGUAGE C;
+CREATE FUNCTION pg_batch_bridge_test_duplicate_provider()
+RETURNS void
+AS :'bridge_test', 'pg_batch_bridge_test_duplicate_provider'
+LANGUAGE C;
+
+SELECT pg_batch_bridge_test_bad_abi();
+SELECT pg_batch_bridge_test_duplicate_provider();
 
 SET max_parallel_workers_per_gather = 0;
 SET jit = off;
@@ -214,14 +234,16 @@ DEALLOCATE pg_batch_brin_gate;
 RESET enable_seqscan;
 DROP TABLE pg_batch_brin;
 
-CREATE TABLE pg_batch_arrow AS
-SELECT g AS c1,
+CREATE TABLE pg_batch_arrow(c1 int, c2 int, c3 int, c4 int)
+USING pg_batch_compressed;
+INSERT INTO pg_batch_arrow
+SELECT g,
        CASE WHEN g % 7 = 0 THEN NULL ELSE g + 1 END AS c2,
        CASE WHEN g % 2 = 0
             THEN 2147483647 - g
             ELSE -2147483647 + g
        END AS c3,
-       g * 1000 AS c4
+       g * 1000
 FROM generate_series(1, 130) AS g;
 ANALYZE pg_batch_arrow;
 
@@ -238,12 +260,16 @@ WHERE c2 < 100;
 
 SELECT pg_batch_compress('pg_batch_arrow') > 0 AS compressed;
 SET pg_batch.enable = on;
-SET pg_batch.use_compressed = on;
 
 EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
 SELECT count(*), count(c2), sum(c1), sum(c4)
 FROM pg_batch_arrow
 WHERE c2 < 100;
+
+EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT c1, c3
+FROM pg_batch_arrow
+WHERE c2 < 100 AND (c1 + c3) % 5 = 0;
 
 CREATE TEMP TABLE compressed_arrow_rows AS
 SELECT c1, c3
@@ -268,20 +294,22 @@ SELECT NOT EXISTS (
 
 SELECT pg_batch_compress('pg_batch_arrow') > 0 AS recompressed;
 
-CREATE TABLE pg_batch_groups AS
-SELECT g AS c1, (g % 4) * 2 AS c2, g + 1000 AS c3
+CREATE TABLE pg_batch_groups(c1 int, c2 int, c3 int)
+USING pg_batch_compressed;
+INSERT INTO pg_batch_groups
+SELECT g, (g % 4) * 2, g + 1000
 FROM generate_series(1, 384) AS g;
 ANALYZE pg_batch_groups;
 SELECT pg_batch_compress('pg_batch_groups', 128) > 0 AS grouped;
 
-SET pg_batch.compressed_scan_mode = prune;
+SET pg_batch_tam.scan_mode = prune;
 EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
 SELECT count(*) FROM pg_batch_groups WHERE c1 >= 130 AND c1 <= 140;
 
 EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
 SELECT count(*) FROM pg_batch_groups WHERE c2 = 3;
 
-SET pg_batch.compressed_scan_mode = filter;
+SET pg_batch_tam.scan_mode = filter;
 CREATE TEMP TABLE smart_direct AS
 SELECT c1, c3 FROM pg_batch_groups WHERE c2 = 2 AND c1 > 100;
 
@@ -303,12 +331,33 @@ ANALYZE pg_batch_tam;
 
 SELECT pg_batch_compress('pg_batch_tam', 128) > 0 AS tam_grouped;
 SET pg_batch.enable = on;
-SET pg_batch.compressed_via_tableam = on;
 EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
 SELECT count(*), sum(c3) FROM pg_batch_tam WHERE c2 = 2 AND c1 > 100;
 
 CREATE TEMP TABLE smart_tam AS
 SELECT c1, c3 FROM pg_batch_tam WHERE c2 = 2 AND c1 > 100;
+
+PREPARE pg_batch_tam_parameter(integer, integer) AS
+SELECT count(*), sum(c3)
+FROM pg_batch_tam
+WHERE c2 = $1 AND c1 > $2;
+EXECUTE pg_batch_tam_parameter(2, 100);
+EXECUTE pg_batch_tam_parameter(4, 200);
+DEALLOCATE pg_batch_tam_parameter;
+
+SELECT input.c2, scanned.n
+FROM (VALUES (0), (2), (4)) AS input(c2)
+CROSS JOIN LATERAL (
+    SELECT count(*) AS n
+    FROM pg_batch_tam
+    WHERE pg_batch_tam.c2 = input.c2 AND c1 > 100
+) AS scanned
+ORDER BY input.c2;
+
+SELECT count(*) = 1 AS tam_early_stop
+FROM (
+    SELECT c1 FROM pg_batch_tam WHERE c2 = 2 LIMIT 1
+) AS limited;
 
 SELECT NOT EXISTS (
            (TABLE smart_tam EXCEPT ALL TABLE smart_plain)
@@ -316,8 +365,15 @@ SELECT NOT EXISTS (
            (TABLE smart_plain EXCEPT ALL TABLE smart_tam)
        ) AS tam_rows_match;
 
+SET pg_batch_tam.enable = off;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM pg_batch_tam WHERE c2 = 2;
+RESET pg_batch_tam.enable;
+
 DROP TABLE pg_batch_tam;
 DROP TABLE pg_batch_groups;
 DROP TABLE pg_batch_arrow;
 DROP TABLE pg_batch_test;
 DROP EXTENSION pg_batch;
+DROP EXTENSION pg_batch_tam;
+DROP EXTENSION pg_batch_bridge;

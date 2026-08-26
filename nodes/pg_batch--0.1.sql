@@ -1,0 +1,1 @@
+-- Loading pg_batch installs planner hooks and batch executor nodes.
