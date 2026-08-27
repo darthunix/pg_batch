@@ -10,6 +10,10 @@ The hash-join measurements were added on 2026-08-26 with the same release
 build.
 The Arrow IPC FDW measurements were added on 2026-08-27 with the same build
 and database.
+The B-tree bitmap, BRIN, and heap sanity measurements were refreshed later that
+day after exact-page recheck elimination and the bitmap planner guard were
+added. The B-tree script temporarily removed the BRIN indexes in a transaction
+so every bitmap plan in that section was produced only by B-tree indexes.
 All compared plans used the same PostgreSQL binary. The ordinary executor
 therefore used the unchanged row-at-a-time path from that patched binary.
 
@@ -451,11 +455,11 @@ warm-ups. The four modes were rotated in one backend:
 
 | Query | Standard Seq, ms | Batch Seq, ms | Standard BRIN, ms | Batch BRIN, ms |
 |---|---:|---:|---:|---:|
-| Ordered heap, 1000-row range | 32.536 | 14.647 | 0.265 | 0.116 |
-| Ordered heap, medium range and sum | 39.533 | 22.349 | 18.323 | 10.314 |
-| Wide heap, range, filter, and late sum | 8.040 | 5.188 | 2.544 | 1.083 |
-| Ordered heap, impossible range | 30.522 | 12.415 | 0.040 | 0.024 |
-| Uncorrelated heap, forced BRIN range | 15.794 | 6.588 | 23.023 | 9.807 |
+| Ordered heap, 1000-row range | 34.360 | 15.710 | 0.270 | 0.120 |
+| Ordered heap, medium range and sum | 40.717 | 23.557 | 18.283 | 10.396 |
+| Wide heap, range, filter, and late sum | 8.794 | 5.742 | 2.587 | 1.456 |
+| Ordered heap, impossible range | 30.686 | 12.665 | 0.042 | 0.024 |
+| Uncorrelated heap, forced BRIN range | 16.464 | 7.159 | 23.472 | 10.407 |
 
 ### Query 1: a narrow range in an ordered heap
 
@@ -469,8 +473,8 @@ The result is 1000. The table contains 2,000,000 rows in 14,720 heap pages.
 BRIN visits 64 pages containing 8,704 visible rows. Its range summary cannot
 identify the exact 1000 rows, so both bitmap plans must check the condition
 again. Standard BRIN performs that work one row at a time. Batch BRIN forms 192
-source batches and evaluates the comparison in dense loops, reducing 0.265 ms
-to 0.116 ms. Most of the improvement over sequential scanning comes from BRIN;
+source batches and evaluates the comparison in dense loops, reducing 0.270 ms
+to 0.120 ms. Most of the improvement over sequential scanning comes from BRIN;
 batching then removes part of the remaining per-row executor cost.
 
 ### Query 2: a medium range followed by a batch aggregate
@@ -485,8 +489,8 @@ WHERE c1 BETWEEN 500001 AND 1000000
 The two conditions leave 399,998 rows and the result is 279,999,599,995. BRIN
 visits 3,712 pages containing 504,832 visible rows. This is large enough for
 both kinds of work to matter: page rejection reduces the scan, while dense
-filtering and `PgBatchAgg` reduce executor overhead. Batch BRIN is 1.78 times
-faster than Standard BRIN and 2.17 times faster than Batch Seq.
+filtering and `PgBatchAgg` reduce executor overhead. Batch BRIN is 1.76 times
+faster than Standard BRIN and 2.27 times faster than Batch Seq.
 
 ### Query 3: filtering before a late projection on a wide heap
 
@@ -501,7 +505,7 @@ The table has sixty `int4` columns. BRIN selects 1,696 of 8,384 pages and the
 range contains 50,880 visible rows. The second condition leaves 24,998 rows.
 Only those survivors need `c60`, so the query combines page rejection, dense
 filtering, lazy late-column deformation, and a batch sum. Batch BRIN takes
-1.083 ms versus 2.544 ms for Standard BRIN.
+1.456 ms versus 2.587 ms for Standard BRIN.
 
 ### Query 4: a range that cannot match
 
@@ -512,7 +516,7 @@ WHERE c1 < 0;
 ```
 
 BRIN proves from its summaries that no heap page can match. Both bitmap plans
-finish without opening a heap page. The difference between 0.040 and 0.024 ms
+finish without opening a heap page. The difference between 0.042 and 0.024 ms
 is mostly fixed executor overhead and is too small for a useful speedup claim.
 The important result is that adding the batch source does not force a heap
 scan when BRIN rejects every range.
@@ -538,6 +542,109 @@ coarse page rejection, while `PgBatchScan`, lazy projection, and `PgBatchAgg`
 remain responsible for efficient processing inside selected pages. No new
 table access method or persistent columnar format is needed for this case.
 
+## B-tree bitmap scans
+
+This run checks heap-page batching with exact B-tree bitmaps. It was repeated
+after adding exact-page recheck elimination and a conservative planner guard.
+Each number is the median of 15 executions after three warm-ups. Six modes were
+rotated in one backend, with JIT and parallel query disabled:
+
+- **Standard Seq** and **Batch Seq** read the complete heap.
+- **Standard Index** uses a row-at-a-time B-tree `Index Scan`.
+- **Standard Bitmap** uses PostgreSQL's `Bitmap Heap Scan`.
+- **Automatic** enables `pg_batch` with the default minimum of eight estimated
+  matching rows per heap page. The table says which plan was selected.
+- **Forced Batch** sets `pg_batch.bitmap_min_rows_per_page = 0` and therefore
+  measures the batch bitmap path even when the guard would reject it.
+
+| Query | Standard Seq, ms | Batch Seq, ms | Standard Index, ms | Standard Bitmap, ms | Automatic, ms (plan) | Forced Batch, ms |
+|---|---:|---:|---:|---:|---:|---:|
+| Ordered heap, 0.01% | 35.076 | 16.287 | 0.037 | 0.024 | 0.016 (standard) | 0.015 |
+| Ordered heap, 0.1% | 34.113 | 15.530 | 0.110 | 0.091 | 0.081 (standard) | 0.056 |
+| Ordered heap, 1% | 33.194 | 14.816 | 0.857 | 0.736 | 0.727 (standard) | 0.459 |
+| Ordered heap, 10% | 34.646 | 15.548 | 8.183 | 7.594 | 4.906 (batch) | 4.838 |
+| Ordered heap, 50% | 45.799 | 21.836 | 40.658 | 38.687 | 25.480 (batch) | 25.089 |
+| Random heap, 0.01% | 17.968 | 8.416 | 0.044 | 0.030 | 0.021 (standard) | 0.025 |
+| Random heap, 0.1% | 16.916 | 7.430 | 0.251 | 0.197 | 0.167 (standard) | 0.194 |
+| Random heap, 1% | 17.102 | 7.789 | 2.244 | 1.569 | 1.462 (standard) | 1.507 |
+| Random heap, 2% | 18.124 | 8.095 | 4.934 | 2.447 | 2.428 (standard) | 2.279 |
+| Random heap, 3% | 17.873 | 8.389 | 7.530 | 3.425 | 2.992 (standard) | 2.915 |
+| Random heap, 5% | 17.979 | 8.513 | 11.623 | 4.751 | 3.928 (batch) | 3.665 |
+| Random heap, 7.5% | 18.204 | 8.614 | 18.049 | 6.107 | 5.435 (batch) | 5.210 |
+| Random heap, 10% | 18.537 | 8.860 | 23.904 | 8.132 | 6.635 (batch) | 6.654 |
+| Random heap, 50% | 22.741 | 11.341 | 113.630 | 24.404 | 17.389 (batch) | 17.304 |
+| Random heap, two-index `BitmapAnd` | 19.254 | 10.969 | 24.156 | 4.091 | 3.739 (standard) | 3.580 |
+| Wide heap, residual filter, late projection | 8.930 | 7.355 | 2.293 | 2.386 | 2.291 (standard) | 3.394 |
+
+The very small timings are sensitive to fixed measurement noise. The plan
+choice, rather than the sub-0.1 ms difference, is the useful result in those
+rows.
+
+### Exact pages and the occupancy boundary
+
+The range query reads `c1`, counts its rows, and sums `c4`:
+
+```sql
+SELECT count(*), sum(c4)
+FROM pg_batch_bench_plain
+WHERE c1 BETWEEN 0 AND 107374182;
+```
+
+The B-tree has already proved both range conditions on an exact bitmap page.
+`PgBatchScan` now skips those checks and does not materialize `c1` as a filter
+Datum; at 5% the plan reports zero filter Datums and 99,998 skipped condition
+evaluations for 49,999 rows. The forced batch path is no slower than Standard
+Bitmap at the sparse 0.1% and 1% points, where the old implementation was 25%
+and 12% slower. It is 23% faster at 5%, 18% faster at 10%, and 29% faster at
+50% in this run.
+
+For the random heap, actual occupancy rises from about 5.5 rows per page at 3%
+to 9.2 at 5%. The default threshold of eight therefore leaves 3% and below on
+the ordinary bitmap path and selects batching at 5% and above. For the ordered
+heap the generic page estimate does not know the physical correlation, so the
+guard is deliberately conservative through 1%; forced batching shows that a
+future correlation-aware estimate could select it earlier.
+
+### BitmapAnd and a scalar residual
+
+The two-index query selects about 10% through each B-tree index:
+
+```sql
+SELECT count(*), sum(c4)
+FROM pg_batch_bench_plain
+WHERE c1 BETWEEN 0 AND 214748364
+  AND c2 BETWEEN 0 AND 214748364;
+```
+
+The benchmark raises only the planning value of `cpu_operator_cost` while
+preparing this query so both ordinary and batch cases use `BitmapAnd`; query
+execution itself is unchanged. The intersection leaves 10,034 rows on 635
+pages. The forced batch path takes 3.580 ms versus 4.091 ms for the ordinary
+bitmap executor and skips 40,136 redundant condition evaluations. The default
+guard remains conservative because PostgreSQL estimates a much lower page
+occupancy for this correlated intersection.
+
+The wide-table query combines an exact B-tree range, a scalar residual
+expression, and a projection of the sixtieth column:
+
+```sql
+SELECT sum(c60)
+FROM pg_batch_bench_wide
+WHERE c1 BETWEEN 100001 AND 150000
+  AND c2 % 7 = 0;
+```
+
+The exact range checks are skipped, but the residual expression still uses the
+scalar fallback over 50,000 rows and 1,667 small batches. Forced batching is
+42% slower here. The automatic guard detects this unsupported dense-loop shape
+and keeps the ordinary `Bitmap Heap Scan`, which takes 2.291 ms versus 2.386
+ms for Standard Bitmap in this run.
+
+The result is a safe initial policy: exact bitmap support is generic, forced
+mode remains available for experiments, and the default path is used only
+when estimated occupancy is high enough and every restriction can run in a
+dense column loop.
+
 ## Heap-path sanity check after adding source requests
 
 A separate longer run disabled the compressed source and bitmap scans, then
@@ -547,11 +654,11 @@ per sample.
 
 | Query | Heap batch, ms | PostgreSQL, ms |
 |---|---:|---:|
-| Narrow: two comparisons and `count(*)` | 18.900 | 44.674 |
-| Narrow: `c1 < 0` and `count(*)` | 11.845 | 30.344 |
-| Wide: filter `c2`, return `c60` | 3.938 | 5.765 |
-| Wide: filter `c60`, return `c2` | 4.158 | 11.736 |
-| Wide: filter `c2`, batch `count(*)` | 3.863 | 7.919 |
+| Narrow: two comparisons and `count(*)` | 20.110 | 44.989 |
+| Narrow: `c1 < 0` and `count(*)` | 12.113 | 30.258 |
+| Wide: filter `c2`, return `c60` | 4.714 | 6.484 |
+| Wide: filter `c60`, return `c2` | 5.065 | 11.916 |
+| Wide: filter `c2`, batch `count(*)` | 4.699 | 10.359 |
 
 This is a sanity check, not a direct before-and-after comparison with the old
 library. It did not reveal an obvious loss in the heap path after the source

@@ -71,7 +71,19 @@ and batch lifetime transitions.
 `PgBatchScan` reads up to 64 visible heap tuples from one pinned page, or asks a
 registered source to publish its next batch. Simple restrictions run in dense
 column loops. For heap tables the scan can be sequential or use pages selected
-by a BRIN bitmap.
+by a generic PostgreSQL bitmap. The bitmap may come from B-tree, BRIN, GiST,
+GIN, `BitmapAnd`, or `BitmapOr`; index ordering is not preserved. Direct
+ordered `Index Scan` and `Index Only Scan` remain row-at-a-time because their
+adjacent entries need not refer to the same pinned heap page.
+
+On exact bitmap pages, `PgBatchScan` does not repeat conditions already proved
+by the bitmap and does not request early materialization of columns used only
+by those conditions. Lossy pages still recheck every index condition. The
+`pg_batch.bitmap_min_rows_per_page` setting, which defaults to `8`, prevents an
+exact batch bitmap path when the planner expects too few matching rows on each
+heap page or when a restriction cannot use a dense column loop; `0` disables
+this conservative guard. BRIN-only bitmaps use the table's average rows per
+page because BRIN publishes complete lossy pages.
 
 `PgBatchFilterProject` checks residual expressions, updates the selection
 bitmap, and requests projection columns only for survivors. `PgBatchAgg`
@@ -199,7 +211,7 @@ PGPORT=5432 make \
     PG_CONFIG=/path/to/patched/postgres/bin/pg_config installcheck
 ```
 
-The suite checks heap, BRIN, table-AM, and FDW batches; native Arrow
+The suite checks heap, bitmap-index, table-AM, and FDW batches; native Arrow
 consumption; lazy `Datum` fallback; exact and pruning-only predicates;
 parameters; joins; rescans; early stop; disabled-source fallback; ABI
 rejection; and duplicate provider rejection.
@@ -209,7 +221,7 @@ rejection; and duplicate provider rejection.
 - `bridge/include/bridge.h` defines the common versioned ABI.
 - `bridge/include/arrow.h` defines the optional Arrow interface.
 - `bridge/bridge.c` owns the registry and slot attachments.
-- `nodes/planner.c` builds sequential and BRIN-backed custom plans.
+- `nodes/planner.c` builds sequential and bitmap-backed custom plans.
 - `nodes/slot.c` implements the custom slot and heap batch source.
 - `nodes/scan.c`, `filter.c`, `hash_join.c`, and `aggregate.c` implement the
   executor nodes.
@@ -233,6 +245,7 @@ psql -f benchmark/run_heap_compare.sql
 psql -f benchmark/run_compressed.sql
 psql -f benchmark/run_groups.sql
 psql -f benchmark/run_brin.sql
+psql -f benchmark/run_bitmap_index.sql
 psql -f benchmark/run_hash_join.sql
 psql -f benchmark/run_hash_join_large.sql
 psql -f benchmark/run_fdw.sql
@@ -244,6 +257,9 @@ batches, and the independent native source. `run_groups.sql` compares full
 heap scans, heap batches, BRIN, batch-over-BRIN, native batches, group pruning,
 and exact source filtering. Current measurements and query explanations are in
 [`benchmark/results.md`](benchmark/results.md).
+`run_bitmap_index.sql` compares ordered `Index Scan`, ordinary
+`Bitmap Heap Scan`, and batch-over-bitmap execution for B-tree indexes at
+different selectivities and heap orders.
 `run_fdw.sql` compares an ordinary heap scan, scalar `ForeignScan`, and direct
 batch FDW execution with source pushdown and lazy column decoding enabled or
 disabled.

@@ -33,6 +33,7 @@ typedef struct SourceLayout
 	List	   *targetlist;
 	List	   *source_attnums;
 	List	   *survivor_columns;
+	List	   *exact_filter_columns;
 	int			nfilter_columns;
 } SourceLayout;
 
@@ -351,7 +352,7 @@ base_path_is_useful(PlannerInfo *root, RelOptInfo *rel)
 }
 
 static bool
-bitmapqual_uses_only_brin(Path *path)
+bitmapqual_is_brin_only(Path *path)
 {
 	List	   *children;
 
@@ -368,7 +369,21 @@ bitmapqual_uses_only_brin(Path *path)
 		return false;
 	foreach_ptr(Path, child, children)
 	{
-		if (!bitmapqual_uses_only_brin(child))
+		if (!bitmapqual_is_brin_only(child))
+			return false;
+	}
+	return true;
+}
+
+static bool
+bitmap_restrictions_are_batchable(RelOptInfo *rel)
+{
+	foreach_ptr(RestrictInfo, rinfo, rel->baserestrictinfo)
+	{
+		uint8		var_argno;
+
+		if (!rinfo->pseudoconstant &&
+			pg_batch_match_qual((Node *) rinfo->clause, &var_argno) == NULL)
 			return false;
 	}
 	return true;
@@ -389,7 +404,7 @@ make_base_path(RelOptInfo *rel, PgBatchHeapScanMode mode)
 }
 
 static void
-add_bitmap_paths(RelOptInfo *rel, List *candidate_paths)
+add_bitmap_paths(PlannerInfo *root, RelOptInfo *rel, List *candidate_paths)
 {
 	List	   *bitmap_paths = NIL;
 	ListCell   *lc;
@@ -404,13 +419,36 @@ add_bitmap_paths(RelOptInfo *rel, List *candidate_paths)
 		Path	   *candidate = lfirst(lc);
 		BitmapHeapPath *bitmap;
 		BitmapHeapPath *copy;
+		double		rows_per_page;
 
 		if (!IsA(candidate, BitmapHeapPath) ||
 			candidate->param_info != NULL || candidate->parallel_aware)
 			continue;
 		bitmap = castNode(BitmapHeapPath, candidate);
-		if (!bitmapqual_uses_only_brin(bitmap->bitmapqual))
-			continue;
+		if (pg_batch_bitmap_min_rows_per_page > 0)
+		{
+			/* Keep automatic selection conservative around scalar residuals. */
+			if (!bitmap_restrictions_are_batchable(rel))
+				continue;
+			if (bitmapqual_is_brin_only(bitmap->bitmapqual))
+			{
+				/* BRIN publishes whole lossy pages, not just matching rows. */
+				rows_per_page = rel->pages > 0 ? rel->tuples / rel->pages : 0;
+			}
+			else
+			{
+				double		pages_fetched;
+				double		tuples_fetched;
+
+				pages_fetched = compute_bitmap_pages(root, rel,
+												 bitmap->bitmapqual,
+												 1.0, NULL, &tuples_fetched);
+				rows_per_page = pages_fetched > 0 ?
+					tuples_fetched / pages_fetched : 0;
+			}
+			if (rows_per_page < pg_batch_bitmap_min_rows_per_page)
+				continue;
+		}
 		copy = palloc_object(BitmapHeapPath);
 		memcpy(copy, bitmap, sizeof(BitmapHeapPath));
 		bitmap_paths = lappend(bitmap_paths, copy);
@@ -458,12 +496,13 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 
 	/*
 	 * This experiment deliberately remains heap-specific. The normal bitmap
-	 * path provides the BRIN plan; PgBatchScan only changes how matching heap
-	 * pages are exposed to its parent.
+	 * path, including its index AM and any BitmapAnd or BitmapOr tree, produces
+	 * a generic TIDBitmap. PgBatchScan only changes how matching heap pages are
+	 * exposed to its parent.
 	 */
 	relation = table_open(rte->relid, NoLock);
 	if (relation->rd_rel->relam == HEAP_TABLE_AM_OID)
-		add_bitmap_paths(rel, candidate_paths);
+		add_bitmap_paths(root, rel, candidate_paths);
 	table_close(relation, NoLock);
 
 	path = make_base_path(rel, PG_BATCH_HEAP_SEQ);
@@ -782,19 +821,22 @@ create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 
 static SourceLayout
 build_source_layout(PlannerInfo *root, RelOptInfo *rel, List *quals,
-					List *targetlist)
+					List *exact_quals, List *targetlist)
 {
 	SourceLayout layout = {0};
 	RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
 	Relation	relation = table_open(rte->relid, NoLock);
 	TupleDesc	desc = RelationGetDescr(relation);
 	bool	   *filter_attrs = palloc0_array(bool, desc->natts + 1);
+	bool	   *exact_filter_attrs = palloc0_array(bool, desc->natts + 1);
 	bool	   *survivor_attrs = palloc0_array(bool, desc->natts + 1);
 	int		   *positions = palloc0_array(int, desc->natts + 1);
 	int			resno = 1;
 
 	if (!collect_relation_attrs((Node *) quals, rel->relid,
 								desc->natts, filter_attrs) ||
+		!collect_relation_attrs((Node *) exact_quals, rel->relid,
+								desc->natts, exact_filter_attrs) ||
 		!collect_relation_attrs((Node *) targetlist, rel->relid,
 								desc->natts, survivor_attrs))
 		elog(ERROR, "pg_batch found an unsupported variable");
@@ -821,6 +863,15 @@ build_source_layout(PlannerInfo *root, RelOptInfo *rel, List *quals,
 	}
 	for (int attnum = 1; attnum <= desc->natts; attnum++)
 	{
+		if (exact_filter_attrs[attnum])
+		{
+			Assert(positions[attnum] > 0);
+			layout.exact_filter_columns =
+				lappend_int(layout.exact_filter_columns, positions[attnum] - 1);
+		}
+	}
+	for (int attnum = 1; attnum <= desc->natts; attnum++)
+	{
 		if (survivor_attrs[attnum] && !filter_attrs[attnum])
 		{
 			Form_pg_attribute attr = TupleDescAttr(desc, attnum - 1);
@@ -841,6 +892,7 @@ build_source_layout(PlannerInfo *root, RelOptInfo *rel, List *quals,
 	}
 
 	pfree(filter_attrs);
+	pfree(exact_filter_attrs);
 	pfree(survivor_attrs);
 	pfree(positions);
 	table_close(relation, NoLock);
@@ -868,8 +920,11 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	CustomScan *filter;
 	List	   *quals = extract_actual_clauses(clauses, false);
 	List	   *batch_quals = NIL;
+	List	   *batch_recheck_flags = NIL;
 	List	   *residual = NIL;
 	List	   *local_quals = NIL;
+	List	   *exact_quals = NIL;
+	List	   *bitmapqualorig = NIL;
 	List	   *source_exprs = NIL;
 	Node	   *source_private = (Node *) NIL;
 	const char *provider_name = "";
@@ -889,6 +944,7 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		if (!IsA(bitmap_plan, BitmapHeapScan))
 			elog(ERROR, "pg_batch expected a bitmap heap child plan");
 		bitmap_scan = castNode(BitmapHeapScan, bitmap_plan);
+		bitmapqualorig = bitmap_scan->bitmapqualorig;
 		custom_plans = list_make1(outerPlan(bitmap_scan));
 	}
 	else
@@ -936,6 +992,7 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	foreach_ptr(Node, qual, quals)
 	{
 		uint8		var_argno;
+		bool		recheck_only = false;
 
 		if (source_result.qual_support != NULL &&
 			source_result.qual_support[qualno] == PG_BATCH_BRIDGE_QUAL_EXACT)
@@ -944,16 +1001,27 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			continue;
 		}
 		local_quals = lappend(local_quals, qual);
+		if (heap_scan_mode == PG_BATCH_HEAP_BITMAP &&
+			list_member(bitmapqualorig, qual))
+			recheck_only = true;
 		if (dense_prefix && pg_batch_match_qual(qual, &var_argno) != NULL)
+		{
 			batch_quals = lappend(batch_quals, qual);
+			batch_recheck_flags =
+				lappend_int(batch_recheck_flags, recheck_only);
+			if (!recheck_only)
+				exact_quals = lappend(exact_quals, qual);
+		}
 		else
 		{
 			dense_prefix = false;
 			residual = lappend(residual, qual);
+			/* Residual expressions are still evaluated on exact pages. */
+			exact_quals = lappend(exact_quals, qual);
 		}
 		qualno++;
 	}
-	layout = build_source_layout(root, rel, local_quals, tlist);
+	layout = build_source_layout(root, rel, local_quals, exact_quals, tlist);
 
 	scan = make_custom_scan(&pg_batch_scan_plan_methods);
 	scan->scan.scanrelid = rel->relid;
@@ -965,7 +1033,7 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	scan->custom_exprs = list_concat(copyObject(source_exprs),
 									 copyObject(batch_quals));
 	scan->custom_plans = custom_plans;
-	/* Compact layout, heap path, and the independently supplied source plan. */
+	/* Compact layout, source plan, and exact-page recheck metadata. */
 	scan->custom_private =
 		list_make5(copyObject(layout.source_attnums),
 				   makeInteger(layout.nfilter_columns),
@@ -974,6 +1042,10 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				   copyObject(source_private));
 	scan->custom_private = lappend(scan->custom_private,
 								   makeInteger(list_length(source_exprs)));
+	scan->custom_private = lappend(scan->custom_private,
+								   batch_recheck_flags);
+	scan->custom_private = lappend(scan->custom_private,
+								   layout.exact_filter_columns);
 	scan->custom_scan_tlist = copyObject(layout.targetlist);
 	scan->custom_relids = bms_copy(rel->relids);
 
@@ -990,6 +1062,7 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	filter->custom_scan_tlist = layout.targetlist;
 	filter->custom_relids = bms_copy(rel->relids);
 	list_free(local_quals);
+	list_free(exact_quals);
 	return &filter->scan.plan;
 }
 

@@ -77,6 +77,7 @@ typedef enum PgBatchHeapScanMode
 
 extern bool pg_batch_enable;
 extern bool pg_batch_enable_hash_join;
+extern double pg_batch_bitmap_min_rows_per_page;
 extern const TupleTableSlotOps PgBatchSlotOps;
 extern const PgBatchBridgeAPI *pg_batch_bridge;
 

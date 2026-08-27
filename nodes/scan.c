@@ -24,6 +24,7 @@ typedef struct BatchQualState
 	NullableDatum constant;
 	int			column;
 	uint8		var_argno;
+	bool		recheck_only;
 } BatchQualState;
 
 typedef struct BatchScanState
@@ -34,11 +35,13 @@ typedef struct BatchScanState
 	PlanState  *bitmap_plan;
 	TIDBitmap  *tbm;
 	MemoryContext operator_context;
+	Bitmapset  *exact_filter_columns;
 	BatchQualState *quals;
 	int			nquals;
 	int			next_page_row;
 	PgBatchHeapScanMode heap_scan_mode;
 	bool		page_active;
+	bool		page_recheck;
 	bool		first_batch_on_page;
 	bool		bitmap_initialized;
 	const		PgBatchBridgeRequest *request;
@@ -49,13 +52,14 @@ typedef struct BatchScanState
 	uint64		source_rows;
 	uint64		lossy_pages;
 	uint64		exact_pages;
+	uint64		exact_rechecks_skipped;
 } BatchScanState;
 
 static const CustomExecMethods pg_batch_scan_exec_methods;
 
 static void
 init_qual(BatchQualState *qual, OpExpr *op, uint8 var_argno,
-		  PlanState *parent)
+		  bool recheck_only, PlanState *parent)
 {
 	Node	   *varnode = pg_batch_strip_relabel(list_nth(op->args, var_argno));
 	Node	   *other = pg_batch_strip_relabel(list_nth(op->args, 1 - var_argno));
@@ -68,6 +72,7 @@ init_qual(BatchQualState *qual, OpExpr *op, uint8 var_argno,
 							 op->inputcollid, NULL, NULL);
 	qual->column = var->varattno - 1;
 	qual->var_argno = var_argno;
+	qual->recheck_only = recheck_only;
 	if (IsA(other, Const))
 	{
 		qual->constant.value = castNode(Const, other)->constvalue;
@@ -117,6 +122,10 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 	const char *provider_name = strVal(list_nth(cscan->custom_private, 3));
 	Node	   *source_private = list_nth(cscan->custom_private, 4);
 	int			nsource_exprs = intVal(list_nth(cscan->custom_private, 5));
+	List	   *batch_recheck_flags =
+		(List *) list_nth(cscan->custom_private, 6);
+	List	   *exact_filter_items =
+		(List *) list_nth(cscan->custom_private, 7);
 	List	   *source_exprs = list_copy_head(cscan->custom_exprs,
 											  nsource_exprs);
 	List	   *local_quals = list_copy_tail(cscan->custom_exprs,
@@ -184,14 +193,21 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 												  &TTSOpsBufferHeapTuple);
 	}
 	state->nquals = list_length(local_quals);
+	Assert(list_length(batch_recheck_flags) == state->nquals);
 	state->quals = palloc0_array(BatchQualState, state->nquals);
 	foreach_ptr(OpExpr, op, local_quals)
 	{
 		uint8		var_argno = 0;
+		bool		recheck_only =
+			list_nth_int(batch_recheck_flags, i) != 0;
 
 		Assert(pg_batch_match_qual((Node *) op, &var_argno) != NULL);
-		init_qual(&state->quals[i++], op, var_argno, &node->ss.ps);
+		init_qual(&state->quals[i++], op, var_argno, recheck_only,
+				  &node->ss.ps);
 	}
+	foreach_int(column, exact_filter_items)
+		state->exact_filter_columns =
+			bms_add_member(state->exact_filter_columns, column);
 	state->operator_context =
 		AllocSetContextCreate(node->ss.ps.ps_ExprContext->ecxt_per_query_memory,
 							  "pg_batch operator", ALLOCSET_START_SMALL_SIZES);
@@ -233,7 +249,7 @@ heap_next_page(BatchScanState *state)
 	{
 		if (!state->bitmap_initialized)
 			bitmap_begin(state);
-		/* PgBatchScan rechecks every restriction, including exact pages. */
+		/* Preserve whether the table AM requires index-qual rechecks. */
 		found = table_scan_bitmap_next_tuple(state->scan, state->heap_slot,
 											 &recheck,
 											 &state->lossy_pages,
@@ -246,6 +262,8 @@ heap_next_page(BatchScanState *state)
 		return false;
 
 	state->page_active = true;
+	state->page_recheck =
+		state->heap_scan_mode == PG_BATCH_HEAP_BITMAP && recheck;
 	state->first_batch_on_page = true;
 	state->next_page_row = 0;
 	ExecClearTuple(state->heap_slot);
@@ -296,9 +314,10 @@ next_batch(BatchScanState *state, PgBatchSlot *bslot)
 		{
 			/*
 			 * A core heap callback prunes the page and performs MVCC checks.
-			 * For bitmap scans it also follows the TIDs selected by BRIN. We
-			 * then publish batches over rs_vistuples while the scan and
-			 * PgBatchSlot both keep the buffer pinned.
+			 * For bitmap scans it also follows the TIDs selected by any index
+			 * AM or bitmap expression. We then publish batches over
+			 * rs_vistuples while the scan and PgBatchSlot both keep the buffer
+			 * pinned.
 			 */
 			if (!heap_next_page(state))
 			{
@@ -355,8 +374,12 @@ filter_batch(BatchScanState *state, PgBatchSlot *bslot)
 	PgBatchBridgeBatch *batch = pg_batch_get_batch(&bslot->base);
 	MemoryContext oldcontext;
 	int			initial = pg_batch_row_count(batch);
+	const Bitmapset *filter_columns = state->request->filter_columns;
 
-	pg_batch_prepare_columns(batch, state->request->filter_columns,
+	if (state->heap_scan_mode == PG_BATCH_HEAP_BITMAP &&
+		!state->page_recheck)
+		filter_columns = state->exact_filter_columns;
+	pg_batch_prepare_columns(batch, filter_columns,
 							 batch->selection, PG_BATCH_FILTER_PHASE);
 	ResetExprContext(econtext);
 	oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
@@ -366,6 +389,12 @@ filter_batch(BatchScanState *state, PgBatchSlot *bslot)
 		NullableDatum *other = &qual->fcinfo->args[1 - qual->var_argno];
 		MemoryContext oldoperator;
 		bool		track_function;
+
+		if (qual->recheck_only && !state->page_recheck)
+		{
+			state->exact_rechecks_skipped += pg_batch_row_count(batch);
+			continue;
+		}
 
 		if (qual->other_expr != NULL)
 			other->value = ExecEvalExpr(qual->other_expr, econtext,
@@ -545,6 +574,7 @@ scan_rescan(CustomScanState *node)
 	if (state->bitmap_plan != NULL && state->bitmap_plan->chgParam == NULL)
 		ExecReScan(state->bitmap_plan);
 	state->page_active = false;
+	state->page_recheck = false;
 	state->first_batch_on_page = false;
 	state->next_page_row = 0;
 	state->done = false;
@@ -579,6 +609,8 @@ scan_explain(CustomScanState *node, List *ancestors,
 								   state->exact_pages, es);
 			ExplainPropertyInteger("Lossy Heap Blocks", NULL,
 								   state->lossy_pages, es);
+			ExplainPropertyInteger("Exact Rechecks Skipped", NULL,
+								   state->exact_rechecks_skipped, es);
 		}
 		if (state->provider != NULL && state->provider->explain != NULL)
 			state->provider->explain(state->provider_state, es);

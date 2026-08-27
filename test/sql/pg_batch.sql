@@ -234,6 +234,99 @@ DEALLOCATE pg_batch_brin_gate;
 RESET enable_seqscan;
 DROP TABLE pg_batch_brin;
 
+CREATE TABLE pg_batch_bitmap AS
+SELECT g AS id,
+       g % 100 AS c1,
+       (g / 100) % 100 AS c2,
+       CASE WHEN g % 17 = 0 THEN NULL ELSE g + 3 END AS c3,
+       repeat('x', 80) AS padding
+FROM generate_series(1, 20000) AS g;
+CREATE INDEX pg_batch_bitmap_c1_idx ON pg_batch_bitmap(c1);
+CREATE INDEX pg_batch_bitmap_c2_idx ON pg_batch_bitmap(c2);
+VACUUM (ANALYZE) pg_batch_bitmap;
+
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_indexonlyscan = off;
+SET pg_batch.enable = on;
+RESET pg_batch.bitmap_min_rows_per_page;
+EXPLAIN (COSTS OFF)
+SELECT count(*), sum(c3) FROM pg_batch_bitmap WHERE c1 = 7;
+
+EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT count(*), sum(c3)
+FROM pg_batch_bitmap
+WHERE c1 BETWEEN 0 AND 19;
+
+EXPLAIN (COSTS OFF)
+SELECT count(*), sum(c3)
+FROM pg_batch_bitmap
+WHERE c1 BETWEEN 0 AND 19 AND (id + c3) % 7 = 0;
+
+SET pg_batch.bitmap_min_rows_per_page = 0;
+EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT count(*), sum(c3) FROM pg_batch_bitmap WHERE c1 = 7;
+
+EXPLAIN (COSTS OFF)
+SELECT count(*), sum(c3)
+FROM pg_batch_bitmap
+WHERE c1 BETWEEN 10 AND 14 AND c2 BETWEEN 20 AND 29;
+
+EXPLAIN (COSTS OFF)
+SELECT count(*), sum(c3)
+FROM pg_batch_bitmap
+WHERE c3 > 0 AND (c1 = 7 OR c2 = 11);
+
+SET pg_batch.enable = off;
+CREATE TEMP TABLE plain_btree_rows AS
+SELECT id, c1, c3, padding
+FROM pg_batch_bitmap
+WHERE c1 = 7 AND c3 IS NOT NULL AND (id + c3) % 7 = 0;
+CREATE TEMP TABLE plain_bitmap_and AS
+SELECT count(*) AS n, sum(c3) AS total
+FROM pg_batch_bitmap
+WHERE c1 BETWEEN 10 AND 14 AND c2 BETWEEN 20 AND 29;
+CREATE TEMP TABLE plain_bitmap_or AS
+SELECT count(*) AS n, sum(c3) AS total
+FROM pg_batch_bitmap
+WHERE c3 > 0 AND (c1 = 7 OR c2 = 11) AND id % 11 = 0;
+
+SET pg_batch.enable = on;
+CREATE TEMP TABLE batch_btree_rows AS
+SELECT id, c1, c3, padding
+FROM pg_batch_bitmap
+WHERE c1 = 7 AND c3 IS NOT NULL AND (id + c3) % 7 = 0;
+CREATE TEMP TABLE batch_bitmap_and AS
+SELECT count(*) AS n, sum(c3) AS total
+FROM pg_batch_bitmap
+WHERE c1 BETWEEN 10 AND 14 AND c2 BETWEEN 20 AND 29;
+CREATE TEMP TABLE batch_bitmap_or AS
+SELECT count(*) AS n, sum(c3) AS total
+FROM pg_batch_bitmap
+WHERE c3 > 0 AND (c1 = 7 OR c2 = 11) AND id % 11 = 0;
+
+SELECT NOT EXISTS (
+           (TABLE batch_btree_rows EXCEPT ALL TABLE plain_btree_rows)
+           UNION ALL
+           (TABLE plain_btree_rows EXCEPT ALL TABLE batch_btree_rows)
+       ) AS btree_rows_match,
+       NOT EXISTS (
+           (TABLE batch_bitmap_and EXCEPT ALL TABLE plain_bitmap_and)
+           UNION ALL
+           (TABLE plain_bitmap_and EXCEPT ALL TABLE batch_bitmap_and)
+       ) AS bitmap_and_match,
+       NOT EXISTS (
+           (TABLE batch_bitmap_or EXCEPT ALL TABLE plain_bitmap_or)
+           UNION ALL
+           (TABLE plain_bitmap_or EXCEPT ALL TABLE batch_bitmap_or)
+       ) AS bitmap_or_match;
+
+RESET enable_indexonlyscan;
+RESET enable_indexscan;
+RESET enable_seqscan;
+RESET pg_batch.bitmap_min_rows_per_page;
+DROP TABLE pg_batch_bitmap;
+
 CREATE TABLE pg_batch_arrow(c1 int, c2 int, c3 int, c4 int)
 USING pg_batch_compressed;
 INSERT INTO pg_batch_arrow

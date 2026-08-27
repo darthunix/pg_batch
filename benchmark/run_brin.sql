@@ -97,6 +97,8 @@ BEGIN
     PERFORM set_config('enable_bitmapscan',
                        CASE WHEN executor_name LIKE '%_brin'
                             THEN 'on' ELSE 'off' END, false);
+    PERFORM set_config('enable_indexscan', 'off', false);
+    PERFORM set_config('enable_indexonlyscan', 'off', false);
 END
 $function$;
 
