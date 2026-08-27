@@ -224,6 +224,30 @@ materialize_filters(PgBatchSlot *bslot, const int *columns,
 }
 
 static void
+sort_columns_by_attnum(PgBatchSlot *bslot, int *columns, int ncolumns)
+{
+	/*
+	 * The compact batch layout follows expression use, not heap layout. Keep
+	 * filter evaluation in planner order, but deform its input columns in
+	 * physical order so that each tuple cursor only moves forward.
+	 */
+	for (int i = 1; i < ncolumns; i++)
+	{
+		int			column = columns[i];
+		AttrNumber	attnum = bslot->source_attnums[column];
+		int			j = i;
+
+		while (j > 0 &&
+			   bslot->source_attnums[columns[j - 1]] > attnum)
+		{
+			columns[j] = columns[j - 1];
+			j--;
+		}
+		columns[j] = column;
+	}
+}
+
+static void
 heap_prepare_columns(PgBatchBridgeBatch *batch,
 					 const Bitmapset *columns,
 					 const uint64 *selected_rows,
@@ -245,6 +269,7 @@ heap_prepare_columns(PgBatchBridgeBatch *batch,
 		allocate_column(bslot, column);
 		requested_columns[ncolumns++] = column;
 	}
+	sort_columns_by_attnum(bslot, requested_columns, ncolumns);
 	if (phase == PG_BATCH_FILTER_PHASE)
 	{
 		/* Keep filter deformation column-major like filter evaluation. */
@@ -416,6 +441,7 @@ batch_slot_getsomeattrs(TupleTableSlot *slot, int natts)
 	PgBatchMaterializePhase phase;
 	uint64		local_rowbits;
 	uint64	   *rowbits;
+	MemoryContext oldcontext;
 
 	if (bslot->current_row < 0 || bslot->current_row >= batch->nrows)
 		elog(ERROR, "pg_batch slot has no current row (current %d, rows %d)",
@@ -423,6 +449,7 @@ batch_slot_getsomeattrs(TupleTableSlot *slot, int natts)
 	if (natts > bslot->ncolumns)
 		elog(ERROR, "pg_batch requested too many attributes");
 
+	oldcontext = MemoryContextSwitchTo(bslot->batch_context);
 	if (slot->tts_nvalid < natts)
 		needed = bms_add_range(needed, slot->tts_nvalid, natts - 1);
 	phase = natts <= bslot->nfilter_columns ?
@@ -457,6 +484,7 @@ batch_slot_getsomeattrs(TupleTableSlot *slot, int natts)
 	bms_free(needed);
 	if (batch->nwords > 1)
 		pfree(rowbits);
+	MemoryContextSwitchTo(oldcontext);
 }
 
 static Datum
@@ -498,7 +526,8 @@ slot_materialize(TupleTableSlot *slot)
 	if (bslot->materialized_tuple != NULL)
 		return;
 	batch_slot_getsomeattrs(slot, slot->tts_tupleDescriptor->natts);
-	oldcontext = MemoryContextSwitchTo(slot->tts_mcxt);
+	/* The executor may allocate an extra slot in a non-freeable Bump context. */
+	oldcontext = MemoryContextSwitchTo(bslot->batch_context);
 	bslot->materialized_tuple =
 		heap_form_tuple(slot->tts_tupleDescriptor,
 						slot->tts_values, slot->tts_isnull);

@@ -76,6 +76,7 @@ typedef enum PgBatchHeapScanMode
 } PgBatchHeapScanMode;
 
 extern bool pg_batch_enable;
+extern bool pg_batch_enable_hash_join;
 extern const TupleTableSlotOps PgBatchSlotOps;
 extern const PgBatchBridgeAPI *pg_batch_bridge;
 
@@ -192,7 +193,12 @@ pg_batch_get_datum_column(PgBatchBridgeBatch *batch, int column,
 extern OpExpr *pg_batch_match_qual(Node *clause, uint8 *var_argno);
 extern Node *pg_batch_create_scan_state(CustomScan *cscan);
 extern Node *pg_batch_create_filter_state(CustomScan *cscan);
+extern Node *pg_batch_create_hash_join_state(CustomScan *cscan);
+extern TupleTableSlot *pg_batch_hash_join_output_slot(CustomScanState *state);
 extern Node *pg_batch_create_agg_state(CustomScan *cscan);
+
+/* Return the batch-producing slot of a pg_batch plan node. */
+extern TupleTableSlot *pg_batch_result_batch_slot(PlanState *planstate);
 
 extern void pg_batch_init_children(CustomScanState *css, EState *estate,
 								   int eflags);

@@ -716,6 +716,177 @@ SELECT count(*) FROM pg_batch_tam WHERE c2 = 2;
 (3 rows)
 
 RESET pg_batch_tam.enable;
+CREATE TABLE pg_batch_join_outer(k1 int, k2 int, v int);
+CREATE TABLE pg_batch_join_inner(k1 int, k2 int, v int)
+USING pg_batch_compressed;
+INSERT INTO pg_batch_join_outer
+SELECT CASE WHEN g % 29 = 0 THEN NULL ELSE g % 40 END,
+       g % 7, g
+FROM generate_series(1, 130) AS g;
+INSERT INTO pg_batch_join_inner
+SELECT CASE WHEN g % 31 = 0 THEN NULL ELSE g % 40 END,
+       g % 7, g * 3
+FROM generate_series(1, 80) AS g;
+ANALYZE pg_batch_join_outer;
+ANALYZE pg_batch_join_inner;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SET pg_batch.enable = off;
+CREATE TEMP TABLE plain_join_rows AS
+SELECT o.v AS outer_v, i.v AS inner_v, o.v + i.v AS projected
+FROM pg_batch_join_outer o
+JOIN pg_batch_join_inner i
+  ON o.k1 = i.k1 AND o.k2 = i.k2 AND o.v < i.v
+WHERE o.v > 10;
+CREATE TEMP TABLE plain_join_agg AS
+SELECT count(*) AS n, count(i.v) AS nn,
+       sum(o.v) AS outer_total, sum(i.v) AS inner_total
+FROM pg_batch_join_outer o
+JOIN pg_batch_join_inner i
+  ON o.k1 = i.k1 AND o.k2 = i.k2
+WHERE o.v > 10;
+SELECT pg_batch_compress('pg_batch_join_inner') > 0 AS join_compressed;
+ join_compressed 
+-----------------
+ t
+(1 row)
+
+SET pg_batch.enable = on;
+EXPLAIN (COSTS OFF)
+SELECT o.v, i.v
+FROM pg_batch_join_outer o
+JOIN pg_batch_join_inner i ON o.k1 = i.k1 AND o.k2 = i.k2
+WHERE o.v > 10;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Custom Scan (PgBatchHashJoin)
+   Hash Buckets: 0
+   Planned Partitions: 1
+   ->  Custom Scan (PgBatchFilterProject)
+         ->  Custom Scan (PgBatchScan) on pg_batch_join_outer o
+               Batch Size: 64
+               Batch Source: Heap
+   ->  Custom Scan (PgBatchFilterProject)
+         ->  Custom Scan (PgBatchScan) on pg_batch_join_inner i
+               Batch Size: 64
+               Batch Source: pg_batch_compressed_tam
+               Batch Provider: pg_batch_compressed_tam
+(12 rows)
+
+CREATE TEMP TABLE batch_join_rows AS
+SELECT o.v AS outer_v, i.v AS inner_v, o.v + i.v AS projected
+FROM pg_batch_join_outer o
+JOIN pg_batch_join_inner i
+  ON o.k1 = i.k1 AND o.k2 = i.k2 AND o.v < i.v
+WHERE o.v > 10;
+CREATE TEMP TABLE batch_join_agg AS
+SELECT count(*) AS n, count(i.v) AS nn,
+       sum(o.v) AS outer_total, sum(i.v) AS inner_total
+FROM pg_batch_join_outer o
+JOIN pg_batch_join_inner i
+  ON o.k1 = i.k1 AND o.k2 = i.k2
+WHERE o.v > 10;
+SELECT NOT EXISTS (
+           (TABLE batch_join_rows EXCEPT ALL TABLE plain_join_rows)
+           UNION ALL
+           (TABLE plain_join_rows EXCEPT ALL TABLE batch_join_rows)
+       ) AS join_rows_match,
+       NOT EXISTS (
+           (TABLE batch_join_agg EXCEPT ALL TABLE plain_join_agg)
+           UNION ALL
+           (TABLE plain_join_agg EXCEPT ALL TABLE batch_join_agg)
+       ) AS join_aggregates_match;
+ join_rows_match | join_aggregates_match 
+-----------------+-----------------------
+ t               | t
+(1 row)
+
+-- Use the join's hash function to exercise fallback and repartitioning skew.
+CREATE TABLE pg_batch_join_spill_outer(k int, v int);
+CREATE TABLE pg_batch_join_spill_inner(k int, v int);
+CREATE FUNCTION pg_temp.pg_batch_test_murmur(v int4) RETURNS bigint
+LANGUAGE plpgsql IMMUTABLE STRICT AS $$
+DECLARE h bigint := v::bigint & 4294967295;
+BEGIN
+  h := (h # (h >> 16)) & 4294967295;
+  h := ((h::numeric * 2246822507) % 4294967296)::bigint;
+  h := (h # (h >> 13)) & 4294967295;
+  h := ((h::numeric * 3266489909) % 4294967296)::bigint;
+  RETURN (h # (h >> 16)) & 4294967295;
+END
+$$;
+INSERT INTO pg_batch_join_spill_outer
+SELECT g, g FROM generate_series(1, 100000) AS g
+WHERE (pg_temp.pg_batch_test_murmur(g) & 7) = 0;
+-- Rows absent from the build side exercise the complete spill key filter.
+INSERT INTO pg_batch_join_spill_outer
+SELECT g, g FROM generate_series(200001, 220000) AS g
+WHERE (pg_temp.pg_batch_test_murmur(g) & 7) = 0;
+INSERT INTO pg_batch_join_spill_inner
+SELECT g, g * 3 FROM generate_series(1, 100000) AS g
+WHERE (pg_temp.pg_batch_test_murmur(g) & 7) = 0;
+ANALYZE pg_batch_join_spill_outer;
+ANALYZE pg_batch_join_spill_inner;
+SET work_mem = '64kB';
+SET pg_batch.enable = on;
+CREATE TEMP TABLE batch_join_spill AS
+SELECT count(*) AS n, sum(o.v) AS outer_total, sum(i.v) AS inner_total
+FROM pg_batch_join_spill_outer o
+JOIN pg_batch_join_spill_inner i ON o.k = i.k
+WHERE o.v > 0;
+SET pg_batch.enable = off;
+CREATE TEMP TABLE plain_join_spill AS
+SELECT count(*) AS n, sum(o.v) AS outer_total, sum(i.v) AS inner_total
+FROM pg_batch_join_spill_outer o
+JOIN pg_batch_join_spill_inner i ON o.k = i.k
+WHERE o.v > 0;
+SELECT NOT EXISTS (
+           (TABLE batch_join_spill EXCEPT ALL TABLE plain_join_spill)
+           UNION ALL
+           (TABLE plain_join_spill EXCEPT ALL TABLE batch_join_spill)
+       ) AS join_spill_match;
+ join_spill_match 
+------------------
+ t
+(1 row)
+
+INSERT INTO pg_batch_join_spill_outer
+SELECT g, g FROM generate_series(100001, 150000) AS g
+WHERE (pg_temp.pg_batch_test_murmur(g) & 7) = 0;
+INSERT INTO pg_batch_join_spill_inner
+SELECT g, g * 3 FROM generate_series(100001, 150000) AS g
+WHERE (pg_temp.pg_batch_test_murmur(g) & 7) = 0;
+ANALYZE pg_batch_join_spill_outer;
+ANALYZE pg_batch_join_spill_inner;
+SET pg_batch.enable = on;
+CREATE TEMP TABLE batch_join_repartition AS
+SELECT count(*) AS n, sum(o.v) AS outer_total, sum(i.v) AS inner_total
+FROM pg_batch_join_spill_outer o
+JOIN pg_batch_join_spill_inner i ON o.k = i.k
+WHERE o.v > 0;
+SET pg_batch.enable = off;
+CREATE TEMP TABLE plain_join_repartition AS
+SELECT count(*) AS n, sum(o.v) AS outer_total, sum(i.v) AS inner_total
+FROM pg_batch_join_spill_outer o
+JOIN pg_batch_join_spill_inner i ON o.k = i.k
+WHERE o.v > 0;
+SELECT NOT EXISTS (
+           (TABLE batch_join_repartition EXCEPT ALL TABLE plain_join_repartition)
+           UNION ALL
+           (TABLE plain_join_repartition EXCEPT ALL TABLE batch_join_repartition)
+       ) AS join_repartition_match;
+ join_repartition_match 
+------------------------
+ t
+(1 row)
+
+RESET work_mem;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+DROP TABLE pg_batch_join_spill_inner;
+DROP TABLE pg_batch_join_spill_outer;
+DROP TABLE pg_batch_join_inner;
+DROP TABLE pg_batch_join_outer;
 DROP TABLE pg_batch_tam;
 DROP TABLE pg_batch_groups;
 DROP TABLE pg_batch_arrow;

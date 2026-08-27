@@ -155,13 +155,10 @@ fetch_batch(BatchFilterState *state)
 			pg_batch_finish_batch(slot);
 			continue;
 		}
-		if (state->request->return_batch)
-			pg_batch_prepare_columns(batch, state->request->survivor_columns,
-									 batch->selection,
-									 PG_BATCH_PROJECT_PHASE);
-		else
+		/* A batch-aware parent prepares survivor columns when it uses them. */
+		if (!state->request->return_batch)
 			pg_batch_materialize_columns(batch,
-										 state->request->survivor_columns,
+									 state->request->survivor_columns,
 										 batch->selection,
 										 PG_BATCH_PROJECT_PHASE);
 		state->output_rows += rows;

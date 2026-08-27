@@ -15,8 +15,9 @@ nodes/  ----->  bridge/  <-----  tam/
   API, attaches batch requests and active batches to `TupleTableSlot *`, and
   registers independent batch sources. Plan nodes keep the returned opaque
   binding, so normal batch operations do not search for the slot attachment.
-- `nodes/` provides `PgBatchScan`, `PgBatchFilterProject`, `PgBatchAgg`, and the
-  custom batch slot. It knows nothing about the test table access method.
+- `nodes/` provides `PgBatchScan`, `PgBatchFilterProject`, `PgBatchHashJoin`,
+  `PgBatchAgg`, and the custom batch slot. It knows nothing about the test
+  table access method.
 - `tam/` provides a heap-compatible test table access method and a
   backend-local compressed columnar snapshot. It knows nothing about the
   custom nodes or their private slot structure.
@@ -68,6 +69,33 @@ by a BRIN bitmap.
 bitmap, and requests projection columns only for survivors. `PgBatchAgg`
 consumes full batches for `count(*)`, `count(column)`, and `sum(int4)` without
 turning them into a row stream.
+
+`PgBatchHashJoin` is a deliberately narrow `int4` experiment. It supports a
+serial, unparameterized inner join with one or more direct `int4 = int4` hash
+keys. The build table, probe windows, and output stay columnar. Output columns
+are gathered lazily, so an unused projection does not have to be converted to
+Datum. Ordinary parents can still consume the same output slot one row at a
+time, while `PgBatchAgg` consumes its published batches directly.
+
+The in-memory table uses open addressing for distinct keys and short chains
+only for real duplicates. A unique-key build uses a fused lookup/output loop.
+Direct safe `int4` conditions between the two inputs are evaluated over the
+candidate batch; other join conditions retain the normal scalar expression
+fallback.
+
+The join uses PostgreSQL's hash memory limit and `BufFile` temporary files.
+When the build side does not fit, the join keeps the partitions that fit in
+memory and writes the others as private 64-row column blocks. Probe rows for
+resident partitions are joined immediately. A complete compact key filter
+rejects probe rows that cannot match before their projection columns are
+materialized or written. Input rows are grouped by partition in one pass, and
+small writes are buffered until a full block is available. If a partition
+would need at least six build chunks, it is partitioned once more with the next
+hash bits. Data that remains skewed is read in bounded build chunks, with its
+probe file rescanned for every chunk. The spill format is private to this node
+and does not extend the bridge ABI.
+Set `pg_batch.enable_hash_join = off` to keep the other batch nodes enabled
+while comparing against PostgreSQL's Hash Join.
 
 For heap batches, the compact slot stores only columns used by the query.
 Filter columns precede projection-only columns. Every source row keeps a
@@ -151,7 +179,8 @@ disabled-source fallback, ABI rejection, and duplicate provider rejection.
 - `bridge/bridge.c` owns the registry and slot attachments.
 - `nodes/planner.c` builds sequential and BRIN-backed custom plans.
 - `nodes/slot.c` implements the custom slot and heap batch source.
-- `nodes/scan.c`, `filter.c`, and `aggregate.c` implement the executor nodes.
+- `nodes/scan.c`, `filter.c`, `hash_join.c`, and `aggregate.c` implement the
+  executor nodes.
 - `tam/provider.c` classifies source predicates and manages scans.
 - `tam/compressed.c` owns snapshots, native columns, group pruning, and source
   filtering.
@@ -167,6 +196,8 @@ psql -f benchmark/run_heap_compare.sql
 psql -f benchmark/run_compressed.sql
 psql -f benchmark/run_groups.sql
 psql -f benchmark/run_brin.sql
+psql -f benchmark/run_hash_join.sql
+psql -f benchmark/run_hash_join_large.sql
 ```
 
 `run_heap_compare.sql` checks that the bridge refactoring does not slow the

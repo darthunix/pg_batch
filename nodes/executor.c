@@ -5,6 +5,28 @@
 
 #include "internal.h"
 
+TupleTableSlot *
+pg_batch_result_batch_slot(PlanState *planstate)
+{
+	TupleTableSlot *slot = planstate->ps_ResultTupleSlot;
+
+	if (slot != NULL && slot->tts_ops == &PgBatchSlotOps)
+		return slot;
+	if (IsA(planstate, CustomScanState))
+	{
+		CustomScanState *custom = castNode(CustomScanState, planstate);
+		TupleTableSlot *batch_slot = pg_batch_hash_join_output_slot(custom);
+
+		if (batch_slot != NULL)
+			return batch_slot;
+		slot = custom->ss.ss_ScanTupleSlot;
+		if (slot != NULL && slot->tts_ops == &PgBatchSlotOps)
+			return slot;
+	}
+	elog(ERROR, "pg_batch child does not publish batches");
+	return NULL;
+}
+
 void
 pg_batch_init_children(CustomScanState *css, EState *estate, int eflags)
 {

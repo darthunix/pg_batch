@@ -11,6 +11,7 @@ PGDLLEXPORT void _PG_init(void);
 PGDLLEXPORT void _PG_fini(void);
 
 bool		pg_batch_enable = true;
+bool		pg_batch_enable_hash_join = true;
 const PgBatchBridgeAPI *pg_batch_bridge;
 
 static void
@@ -37,6 +38,10 @@ _PG_init(void)
 							 "Enable pg_batch custom paths.", NULL,
 							 &pg_batch_enable, true, PGC_USERSET, 0,
 							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_batch.enable_hash_join",
+							 "Enable pg_batch hash join paths.", NULL,
+							 &pg_batch_enable_hash_join, true, PGC_USERSET, 0,
+								 NULL, NULL, NULL);
 	pg_batch_planner_init();
 }
 

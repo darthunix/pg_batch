@@ -6,6 +6,8 @@ The original measurements were taken on 2026-08-24 with PostgreSQL master
 `e42f1d0f1be` plus the heap deformation cursor required by this prototype. The
 heap and BRIN comparison was added on 2026-08-25 using the same build and
 database, and the storage-group measurements were refreshed on 2026-08-26.
+The hash-join measurements were added on 2026-08-26 with the same release
+build.
 All compared plans used the same PostgreSQL binary. The ordinary executor
 therefore used the unchanged row-at-a-time path from that patched binary.
 
@@ -29,6 +31,10 @@ The report uses these executor names:
   `PgBatchScan` still evaluates conditions for rows in groups that remain.
 - **Filter**: the source both skips groups and evaluates supported `int4`
   comparisons before it returns a batch.
+- **Heap batch hash join**: `PgBatchHashJoin` builds and probes native `int4`
+  columns from heap batches and feeds `PgBatchAgg` without a scalar boundary.
+- **Arrow batch hash join**: the same join and aggregate nodes consume the
+  compressed source's Arrow views.
 
 These comparisons answer different questions. PostgreSQL versus Heap batch
 measures the executor changes over the same heap table. Heap batch versus
@@ -539,15 +545,211 @@ per sample.
 
 | Query | Heap batch, ms | PostgreSQL, ms |
 |---|---:|---:|
-| Narrow: two comparisons and `count(*)` | 18.389 | 43.177 |
-| Narrow: `c1 < 0` and `count(*)` | 11.017 | 28.956 |
-| Wide: filter `c2`, return `c60` | 3.883 | 5.759 |
-| Wide: filter `c60`, return `c2` | 4.105 | 11.350 |
-| Wide: filter `c2`, batch `count(*)` | 3.912 | 8.068 |
+| Narrow: two comparisons and `count(*)` | 18.900 | 44.674 |
+| Narrow: `c1 < 0` and `count(*)` | 11.845 | 30.344 |
+| Wide: filter `c2`, return `c60` | 3.938 | 5.765 |
+| Wide: filter `c60`, return `c2` | 4.158 | 11.736 |
+| Wide: filter `c2`, batch `count(*)` | 3.863 | 7.919 |
 
 This is a sanity check, not a direct before-and-after comparison with the old
 library. It did not reveal an obvious loss in the heap path after the source
 request was added.
+
+## Batch `int4` hash join
+
+This experiment uses a 1,000,000-row probe table and a 200,000-row build
+table. The build key is unique and every probe key has one match. Three
+in-memory queries separate lookup, output gathering, and an extra join
+condition. The main query gathers both payloads and removes the first 100
+probe rows:
+
+```sql
+SELECT count(*), sum(p.v), sum(b.v)
+FROM pg_batch_join_probe p
+JOIN pg_batch_join_build b ON p.k = b.k
+WHERE p.v > 100;
+```
+
+The count-only query projects no payload columns. The residual query adds
+`p.v < b.v` to the join condition, so the batch node evaluates the direct
+`int4` comparison over candidate rows before aggregation.
+
+The PostgreSQL plans use a serial core Hash Join followed by Aggregate. The
+batch plans use `PgBatchScan`, `PgBatchHashJoin`, and `PgBatchAgg`. The Arrow
+case changes only both sources to backend-local compressed snapshots. Each
+number below is the median of 11 alternating executions after three warm-ups.
+The benchmark sets `pg_batch.enable` before every execution and plans the
+query in that mode.
+
+| Query / memory mode | Executor | Median, ms | PostgreSQL time |
+|---|---|---:|---:|
+| Count only, 64 MB | PostgreSQL | 61.302 | 100.0% |
+| Count only, 64 MB | Heap batch | 15.274 | 24.9% |
+| Count only, 64 MB | Arrow batch | 10.391 | 17.0% |
+| Payload filter, 64 MB | PostgreSQL | 72.469 | 100.0% |
+| Payload filter, 64 MB | Heap batch | 26.121 | 36.0% |
+| Payload filter, 64 MB | Arrow batch | 18.129 | 25.0% |
+| Join residual, 64 MB | PostgreSQL | 64.492 | 100.0% |
+| Join residual, 64 MB | Heap batch | 25.514 | 39.6% |
+| Join residual, 64 MB | Arrow batch | 15.210 | 23.6% |
+| Payload filter, 1 MB spill | PostgreSQL | 117.939 | 100.0% |
+| Payload filter, 1 MB spill | Heap batch | 56.797 | 48.2% |
+| Payload filter, 1 MB spill | Arrow batch | 44.790 | 38.0% |
+
+The distinct-key hash table uses open addressing, with chains only for true
+duplicate keys. The common unique-key case fuses lookup with result-pair
+creation. This makes heap batching about 2.5x to 4.0x faster than the core
+plan in the in-memory cases above. Native Arrow inputs also avoid heap
+deformation. Spill is about 2.0x faster here.
+
+The Arrow spill case uses the same private spill representation and join code
+as the heap case. Its remaining advantage comes before spill: the source
+already exposes native columns, while the heap source must deform tuples into
+columns first.
+
+The spill path now keeps build partitions in memory while it writes the
+others. Probe rows for those resident partitions are joined during the first
+probe pass. A compact filter containing every build hash rejects keys that
+cannot match before projection-only columns are materialized or written. The
+filter uses one bit lookup per row: two lookups rejected slightly more rows but
+made the all-match case unnecessarily expensive.
+
+With 1 MB `work_mem`, PostgreSQL's hash memory limit is 2 MB. The batch join
+selected eight partitions and kept one of them in memory. It retained 25,147
+of 200,000 build rows and immediately joined 125,719 probe rows. Spill output
+fell from 14.5 MB to 12.7 MB, and only 874,181 of 999,900 probe rows were
+written and read again. Total memory reported for the join, including the
+resident table, spill buffers, and the 128 kB key filter, peaked at 961 kB.
+
+The filter is most useful when many probe keys are absent. Three additional
+tables keep 50%, 10%, or none of their probe keys in the build key range. The
+query still requests both payloads:
+
+```sql
+SELECT count(*), sum(p.v), sum(b.v)
+FROM probe p
+JOIN build b ON p.k = b.k;
+```
+
+Each result below is the median of 31 alternating executions after three
+warm-ups:
+
+| Probe keys present in build | PostgreSQL, ms | Heap batch, ms | PostgreSQL time |
+|---:|---:|---:|---:|
+| 100% | 111.497 | 55.129 | 49.4% |
+| 50% | 102.830 | 45.481 | 44.2% |
+| 10% | 89.371 | 36.576 | 40.9% |
+| 0% | 82.990 | 32.040 | 38.6% |
+
+In the zero-match run, the filter rejected 827,098 of 1,000,000 probe rows.
+Only 151,283 rows were written to a probe file, and the heap source formed the
+payload column for 172,902 rows rather than for the whole input. The difference
+between those counts is the resident portion, which also needs its payload but
+does not touch a temporary file.
+
+An internal measurement switch, removed after the experiment, isolated the
+filter cost from the resident path:
+
+| Probe keys present in build | Filter off, ms | Filter on, ms | Time change |
+|---:|---:|---:|---:|
+| 100% | 54.901 | 55.611 | +1.3% |
+| 50% | 57.373 | 45.130 | -21.3% |
+| 10% | 53.281 | 35.999 | -32.4% |
+| 0% | 51.425 | 30.832 | -40.0% |
+
+The resident optimization was also measured separately before adding the key
+filter. It reduced the regular 1 MB spill case from 57.731 to 55.349 ms, a
+4.1% improvement. The gain is intentionally smaller than the 12.6% reduction
+in probe spill because hashing and result production remain unchanged.
+
+More memory lets a larger fraction of the build stay resident:
+
+| `work_mem` | PostgreSQL, ms | Heap batch, ms | Resident probe fraction |
+|---:|---:|---:|---:|
+| 1 MB | 117.939 | 56.797 | 12.6% |
+| 2 MB | 111.645 | 55.880 | about 25% |
+| 4 MB | 102.683 | 55.701 | 49.9% |
+
+The 4 MB plan used two partitions and avoided temporary-file traffic for
+499,360 probe rows. Its runtime changed less than its spill volume because the
+query still hashes, joins, gathers, and aggregates every matching row.
+
+### Spill page and build-format experiments
+
+The executor batch remains 64 rows. A prototype independently enlarged spill
+records according to the memory budget. It reduced the number of records from
+about 16,000 to a few hundred, but `BufFile` already combines small writes. In
+alternating measurements the larger records improved the all-match case from
+55.708 to 55.048 ms and the no-match case from 52.884 to 52.090 ms, only
+1.2--1.5%. This was below the 3% retention threshold, so the extra format and
+reader state were removed.
+
+Time Profiler samples were also taken for the two-column and seventeen-column
+spill queries. `load_build_chunk()` accounted for about 6% and 8% of batch
+join CPU respectively. The current spill file and `BuildStore` are both
+column-oriented, so a separate build representation would mainly replace one
+column copy with another. The profile did not meet the 10% threshold for that
+experiment, and no second build format was added.
+
+The wide query forces eight payload columns from each side:
+
+```sql
+SELECT count(*),
+       sum(p.v1), ..., sum(p.v8),
+       sum(b.v1), ..., sum(b.v8)
+FROM probe_wide p
+JOIN build_wide b ON p.k = b.k;
+```
+
+At 1 MB it took 188.715 ms in the batch executor and 231.023 ms in PostgreSQL,
+so the batch path used 81.7% of PostgreSQL time. This case narrows the gain
+because both executors must move sixteen payload columns through temporary
+storage and aggregation.
+
+### Larger spill
+
+A separate run scales the same unique-key join to 10,000,000 probe rows and
+2,000,000 build rows with 8 MB `work_mem`. Two warm-ups were followed by seven
+alternating executions:
+
+| Executor | Median, ms | PostgreSQL time |
+|---|---:|---:|
+| PostgreSQL | 1,244.659 | 100.0% |
+| Heap batch | 596.725 | 47.9% |
+
+The batch plan kept 249,733 build rows and joined 1,248,665 probe rows without
+temporary files. It wrote 126.9 MB for the remaining rows and reported 7.1 MB
+peak memory. This is still a warm-cache machine-local test, but it confirms
+that resident routing remains bounded and useful at ten times the original
+row count.
+
+The spill writer first computes each selected row's hash and links rows into
+per-partition lists. It then appends them to 64-row buffers, avoiding both a
+scan of the input batch per partition and many short temporary-file records.
+The disk format remains simple: block header, row hashes, then one validity
+word and dense `int32` values for each column.
+
+Two controlled-skew checks use keys whose three low `murmurhash32` bits are
+zero, so they enter the same initial partition. With 64 kB `work_mem`, 12,595
+build and probe rows need fewer than six build chunks; the join keeps the
+multi-pass fallback because another write is more expensive. The 125,044-row
+case would reread all probe rows for each chunk, so the join partitions both
+files once more using higher hash bits. This reduced probe rows read from
+2,876,012 to 125,044. Separate same-cluster measurements compare the previous
+and current batch spill paths:
+
+| Spill case | Previous, ms | Current, ms | Time change |
+|---|---:|---:|---:|
+| Regular 1 MB spill | 84.916 | 57.463 | -32.3% |
+| 12,595 skewed rows, bounded multi-pass fallback | 1.795 | 1.723 | -4.0% |
+| 125,044 skewed rows, secondary partitioning | 45.108 | 34.877 | -22.7% |
+
+The six-pass threshold matters. Forcing the small case through another
+partitioning level increased it from about 1.6 to 2.9 ms, while disabling
+secondary partitioning increased the large case from about 34 to 40 ms. The
+skew keys were selected using the prototype's `murmurhash32`; PostgreSQL's
+Hash Join uses a different hash function and therefore does not see the same
+skew. Its timing is not used as a baseline for these two stress checks.
 
 ## Limits of the measurements
 
@@ -567,6 +769,9 @@ request was added.
 - The BRIN batch path is serial and heap-specific. It deliberately reads
   `HeapScanDesc` page state as a playground shortcut; a production extension
   would need a supported core interface.
+- `PgBatchHashJoin` currently supports only serial, unparameterized inner
+  joins with direct `int4 = int4` keys. Its path cost is only a placeholder,
+  and its spill files are private to one executor node.
 - These are warm-cache, serial, single-machine measurements. They validate the
   mechanism; they are not a general throughput claim for cold I/O or concurrent
   workloads.

@@ -12,6 +12,7 @@ typedef struct AggSpec
 {
 	PgBatchAggKind kind;
 	int			column;
+	Bitmapset  *column_mask;
 	int64		value;
 	bool		has_value;
 } AggSpec;
@@ -56,26 +57,6 @@ static const CustomExecMethods pg_batch_agg_exec_methods = {
 	.ExplainCustomScan = agg_explain,
 };
 
-static TupleTableSlot *
-child_batch_slot(PlanState *planstate)
-{
-	CustomScanState *custom = castNode(CustomScanState, planstate);
-
-	return custom->ss.ss_ScanTupleSlot;
-}
-
-static int
-find_source_column(const PgBatchBridgeRequest * request,
-				   AttrNumber source_attnum)
-{
-	for (int i = 0; i < request->ncolumns; i++)
-	{
-		if (request->source_attnums[i] == source_attnum)
-			return i;
-	}
-	return -1;
-}
-
 static void
 reset_aggregate_values(BatchAggState *state)
 {
@@ -100,7 +81,7 @@ agg_begin(CustomScanState *node, EState *estate, int eflags)
 
 	pg_batch_init_children(node, estate, eflags);
 	state->child = linitial(node->custom_ps);
-	child_slot = child_batch_slot(state->child);
+	child_slot = pg_batch_result_batch_slot(state->child);
 	request = pg_batch_bridge->get_request(
 										   pg_batch_slot_cast(child_slot)->binding);
 	survivor_columns = bms_copy(request->survivor_columns);
@@ -111,15 +92,16 @@ agg_begin(CustomScanState *node, EState *estate, int eflags)
 	{
 		List	   *item = lfirst_node(List, lc);
 		AggSpec    *agg = &state->aggs[i++];
-		AttrNumber	source_attnum = intVal(lsecond(item));
 
 		agg->kind = intVal(linitial(item));
-		agg->column = agg->kind == PG_BATCH_AGG_COUNT_STAR ? -1 :
-			find_source_column(request, source_attnum);
+		agg->column = intVal(lsecond(item));
 		if (agg->kind != PG_BATCH_AGG_COUNT_STAR && agg->column < 0)
 			elog(ERROR, "pg_batch aggregate input is missing from child slot");
 		if (agg->column >= 0)
+		{
 			survivor_columns = bms_add_member(survivor_columns, agg->column);
+			agg->column_mask = bms_make_singleton(agg->column);
+		}
 	}
 	pg_batch_set_request(child_slot, request->filter_columns,
 						 survivor_columns, true);
@@ -157,6 +139,8 @@ advance_aggregates(BatchAggState *state,
 		{
 			PgBatchArrowView column;
 
+			pg_batch_prepare_columns(batch, agg->column_mask,
+								 batch->selection, PG_BATCH_PROJECT_PHASE);
 			if (unlikely(batch->ops->get_native_interface != NULL) &&
 				pg_batch_get_arrow_column(batch, agg->column, &column))
 			{
