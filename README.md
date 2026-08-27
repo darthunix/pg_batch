@@ -5,10 +5,13 @@ whether independent extensions can exchange batches through ordinary tuple
 slots, keep source-native columns between plan nodes, and postpone conversion
 to PostgreSQL `Datum` values.
 
-The repository is split into three components:
+The repository is split into four components:
 
 ```text
 nodes/  ----->  bridge/  <-----  tam/
+                    ^
+                    |
+                   fdw/
 ```
 
 - `bridge/` is the only shared dependency. It provides a versioned rendezvous
@@ -21,6 +24,9 @@ nodes/  ----->  bridge/  <-----  tam/
 - `tam/` provides a heap-compatible test table access method and a
   backend-local compressed columnar snapshot. It knows nothing about the
   custom nodes or their private slot structure.
+- `fdw/` is an independent Arrow IPC test source. It has both an ordinary
+  row-at-a-time FDW path and a direct bridge callback that returns native
+  Arrow batches to the same nodes.
 
 The `.control` and extension SQL files retain their full extension names
 because PostgreSQL looks them up by those names. Public bridge headers are
@@ -42,10 +48,12 @@ lets a source read filter columns first and materialize projection columns only
 for surviving rows.
 
 At execution time the bridge attaches a request to the scan slot. A table
-access method or another source reads that request and publishes a batch on the
-same slot. Every batch must provide lazy `Datum` materialization, which is the
+access method may publish through its normal slot callback. A source without
+such a callback, including an FDW, may instead return a batch from the optional
+provider `next_batch` operation; `PgBatchScan` publishes it on the same slot.
+Every batch must provide lazy `Datum` materialization, which is the
 format-neutral fallback for ordinary PostgreSQL consumers. A batch may also
-publish optional named native interfaces. The test columnar source publishes
+publish optional named native interfaces. The test columnar sources publish
 Arrow C Data views; filters and aggregates consume those buffers directly.
 
 The attachment lookup is only for boundaries that receive an ordinary
@@ -121,6 +129,26 @@ exact small value set until it overflows. `pg_batch_tam.scan_mode` selects:
 The snapshot is not durable and is not kept in sync with the heap storage. It
 exists only to test the contract between a source and unrelated batch nodes.
 
+## Test Arrow FDW
+
+`pg_batch_fdw` checks the same bridge contract without a table access method.
+It reads an Arrow IPC Stream through the vendored nanoarrow 0.9.0 library. Its
+planner recognizes secure built-in `int4` comparisons against constants and
+parameters. Supported restrictions run over native Arrow values before a
+batch is returned; other expressions stay in `PgBatchFilterProject`.
+
+The reader first decodes columns needed by filters. Projection-only columns
+are decoded only for record batches with surviving rows. The IPC reader must
+still read each complete record body, so this is CPU-side column pruning, not
+physical column I/O pruning. `EXPLAIN ANALYZE` reports record batches, 64-row
+windows, removed rows, bytes read, decoded filter and projection columns, and
+Datum conversions.
+
+This is intentionally a narrow test format: all foreign columns must be
+`int4`, and the stream must use modern uncompressed record batches without
+dictionaries. Local file access and the export helper are superuser-only. The
+ordinary `ForeignScan` path remains available when `pg_batch.enable` is off.
+
 ## Build and test
 
 Apply the included PostgreSQL patch to a master checkout:
@@ -130,9 +158,10 @@ git -C ../postgres am \
     ../pg_batch/patches/postgres/0001-Expose-incremental-heap-tuple-deformation.patch
 ```
 
-Then build and install all three components:
+Clone submodules, then build and install all four components:
 
 ```sh
+git submodule update --init
 make PG_CONFIG=/path/to/patched/postgres/bin/pg_config
 make PG_CONFIG=/path/to/patched/postgres/bin/pg_config install
 ```
@@ -142,8 +171,10 @@ Create and load them in dependency order:
 ```sql
 CREATE EXTENSION pg_batch_bridge;
 CREATE EXTENSION pg_batch_tam;
+CREATE EXTENSION pg_batch_fdw;
 CREATE EXTENSION pg_batch;
 LOAD 'pg_batch_tam';
+LOAD 'pg_batch_fdw';
 LOAD 'pg_batch';
 ```
 
@@ -168,9 +199,10 @@ PGPORT=5432 make \
     PG_CONFIG=/path/to/patched/postgres/bin/pg_config installcheck
 ```
 
-The suite checks heap and BRIN batches, native Arrow consumption, lazy `Datum`
-fallback, exact and pruning-only predicates, parameters, rescans, early stop,
-disabled-source fallback, ABI rejection, and duplicate provider rejection.
+The suite checks heap, BRIN, table-AM, and FDW batches; native Arrow
+consumption; lazy `Datum` fallback; exact and pruning-only predicates;
+parameters; joins; rescans; early stop; disabled-source fallback; ABI
+rejection; and duplicate provider rejection.
 
 ## Source layout
 
@@ -185,6 +217,11 @@ disabled-source fallback, ABI rejection, and duplicate provider rejection.
 - `tam/compressed.c` owns snapshots, native columns, group pruning, and source
   filtering.
 - `tam/tableam.c` is the heap-compatible test table access method boundary.
+- `fdw/planner.c` implements both the PostgreSQL FDW callbacks and bridge
+  predicate classification.
+- `fdw/scan.c` reads Arrow IPC record batches, applies source filters, and
+  exposes lazy native or Datum columns.
+- `fdw/export.c` writes ordinary `int4` tables as test Arrow IPC streams.
 
 ## Benchmark
 
@@ -198,6 +235,7 @@ psql -f benchmark/run_groups.sql
 psql -f benchmark/run_brin.sql
 psql -f benchmark/run_hash_join.sql
 psql -f benchmark/run_hash_join_large.sql
+psql -f benchmark/run_fdw.sql
 ```
 
 `run_heap_compare.sql` checks that the bridge refactoring does not slow the
@@ -206,3 +244,6 @@ batches, and the independent native source. `run_groups.sql` compares full
 heap scans, heap batches, BRIN, batch-over-BRIN, native batches, group pruning,
 and exact source filtering. Current measurements and query explanations are in
 [`benchmark/results.md`](benchmark/results.md).
+`run_fdw.sql` compares an ordinary heap scan, scalar `ForeignScan`, and direct
+batch FDW execution with source pushdown and lazy column decoding enabled or
+disabled.

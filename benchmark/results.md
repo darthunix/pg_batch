@@ -8,6 +8,8 @@ heap and BRIN comparison was added on 2026-08-25 using the same build and
 database, and the storage-group measurements were refreshed on 2026-08-26.
 The hash-join measurements were added on 2026-08-26 with the same release
 build.
+The Arrow IPC FDW measurements were added on 2026-08-27 with the same build
+and database.
 All compared plans used the same PostgreSQL binary. The ordinary executor
 therefore used the unchanged row-at-a-time path from that patched binary.
 
@@ -751,6 +753,90 @@ skew keys were selected using the prototype's `murmurhash32`; PostgreSQL's
 Hash Join uses a different hash function and therefore does not see the same
 skew. Its timing is not used as a baseline for these two stress checks.
 
+## Arrow IPC FDW and the direct batch-provider boundary
+
+This experiment checks whether an FDW can keep its normal `ForeignScan` path
+and also return source-native batches directly to the independent batch nodes.
+It uses the same PostgreSQL build and the existing narrow and wide tables. The
+tables were exported once as uncompressed Arrow IPC Streams with 4,096 rows
+per record batch. The narrow file was 64,239,064 bytes and the wide file was
+60,187,520 bytes. Exporting 2,000,000 narrow rows took 121.7 ms; exporting
+250,000 wide rows took 92.4 ms. Export time is not included below.
+
+Every result is the median of 11 alternating executions after three warm-ups.
+Parallel query, JIT, and index paths were disabled. Files and relations were
+warm. The five modes are:
+
+- **Heap**: ordinary PostgreSQL `Seq Scan` and scalar executor over the local
+  heap table. This is a storage and executor reference, not the same source.
+- **FDW row**: the same Arrow reader applies supported filters, then returns
+  survivors one row at a time through a normal `ForeignScan` slot.
+- **FDW batch, no push**: `PgBatchScan` receives every 64-row window and its
+  dense loop applies the filter over native Arrow values.
+- **FDW batch, push**: the FDW applies supported comparisons before publishing
+  a window. `PgBatchAgg` consumes the surviving batches directly.
+- **FDW batch, eager**: the previous mode, but every Arrow column is decoded
+  for every record batch. This is a control for lazy column decoding.
+
+The dense narrow query scans all 2,000,000 rows, keeps 1,499,898, and sums the
+late `c8` column:
+
+```sql
+SELECT count(*), sum(c8)
+FROM pg_batch_bench_narrow_fdw
+WHERE c1 > 100 AND c2 < 1500000;
+```
+
+The pass-none query scans the same source but returns no rows:
+
+```sql
+SELECT count(*)
+FROM pg_batch_bench_narrow_fdw
+WHERE c1 < 0;
+```
+
+The wide queries each keep 997 of 250,000 rows. The first filters on early
+`c2` and sums late `c60`; the second reverses those roles:
+
+```sql
+SELECT sum(c60) FROM pg_batch_bench_wide_fdw WHERE c2 < 1000;
+SELECT sum(c2)  FROM pg_batch_bench_wide_fdw WHERE c60 < 1058;
+```
+
+| Query | Heap, ms | FDW row, ms | Batch no push, ms | Batch push, ms | Batch eager, ms |
+|---|---:|---:|---:|---:|---:|
+| Narrow: two filters, count and sum 1,499,898 rows | 60.771 | 76.644 | 12.707 | 10.172 | 10.787 |
+| Narrow: filter rejects all rows | 34.017 | 5.983 | 7.173 | 5.119 | 5.976 |
+| Wide: filter `c2`, sum `c60` for 997 rows | 8.907 | 3.399 | 2.698 | 2.424 | 3.416 |
+| Wide: filter `c60`, sum `c2` for 997 rows | 13.380 | 3.217 | 2.647 | 2.471 | 3.480 |
+
+The row FDW is slow on the dense query because 1.5 million survivors cross
+the scalar `ForeignScan` boundary and its test fallback materializes all eight
+columns for each row. Direct batches avoid that boundary, keep Arrow `int32`
+buffers through filtering and aggregation, and form no Datum values for these
+queries. Moving a supported filter into the source saves another 9--20% here
+because empty windows are never published and selected windows arrive with
+their final selection bitmap.
+
+The wide lazy plan read all 60,187,520 bytes, because Arrow IPC Stream record
+bodies are not column-addressable. It nevertheless decoded only 63 column
+arrays: the filter column in all 62 record batches and the projection column
+in the one record batch with survivors. Eager mode decoded 3,720 arrays. That
+raised execution time from 2.424 to 3.416 ms for the early-filter query and
+from 2.471 to 3.480 ms for the late-filter query. This validates separate
+filter and projection requests even when they cannot reduce physical I/O.
+
+With pushdown disabled, the same 3,907 windows reach `PgBatchScan`; with exact
+pushdown only 16 nonempty windows are published. Both modes decode the same 63
+arrays for the selective wide query. The remaining 0.2--0.3 ms difference is
+the cost of crossing the source boundary and invoking the executor filter for
+all windows, rather than a data-format conversion.
+
+The result is the intended interface check: no FDW callback or PostgreSQL core
+FDW API changed. One optional `next_batch` operation in the bridge lets an
+independent FDW bypass scalar `ForeignScan` only when a batch-aware custom path
+is selected. The normal FDW path remains usable by ordinary PostgreSQL nodes.
+
 ## Limits of the measurements
 
 - The prototype prepares all requested filter columns before evaluating the
@@ -761,6 +847,9 @@ skew. Its timing is not used as a baseline for these two stress checks.
 - The table access method is a heap-compatible interface test. The compressed
   snapshot is backend-local, already in memory, and is not maintained after
   table changes.
+- The Arrow FDW accepts only local, uncompressed Arrow IPC Streams containing
+  `int4` columns. It reads every record body before lazily decoding requested
+  arrays, has a placeholder row estimate, and is not a general-purpose FDW.
 - PostgreSQL versus Arrow timings include representation, visibility, and
   column-selection differences. They are not a pure measure of batching.
 - The custom path cost is deliberately reduced by 10% after basic usefulness

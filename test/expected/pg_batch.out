@@ -17,7 +17,7 @@ AS :'bridge_test', 'pg_batch_bridge_test_duplicate_provider'
 LANGUAGE C;
 SELECT pg_batch_bridge_test_bad_abi();
 ERROR:  incompatible provider ABI
-DETAIL:  Expected version 1 and at least 72 bytes, got version 2 and 72 bytes.
+DETAIL:  Expected version 1 and at least 80 bytes, got version 2 and 80 bytes.
 SELECT pg_batch_bridge_test_duplicate_provider();
 ERROR:  pg_batch provider "pg_batch_bridge_test_duplicate" is already registered
 SET max_parallel_workers_per_gather = 0;

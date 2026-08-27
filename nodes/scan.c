@@ -174,7 +174,7 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 		state->scan = table_beginscan_bm(node->ss.ss_currentRelation,
 										 estate->es_snapshot, 0, NULL, flags);
 	}
-	else
+	else if (state->provider == NULL || state->provider->next_batch == NULL)
 		state->scan = table_beginscan(node->ss.ss_currentRelation,
 									  estate->es_snapshot, 0, NULL, 0);
 	if (state->provider == NULL)
@@ -259,9 +259,21 @@ next_batch(BatchScanState *state, PgBatchSlot *bslot)
 
 	if (state->provider != NULL)
 	{
-		bool		found = table_scan_getnextslot(state->scan,
-												   ForwardScanDirection,
-												   &bslot->base);
+		bool		found;
+
+		if (state->provider->next_batch != NULL)
+		{
+			PgBatchBridgeBatch *batch =
+				state->provider->next_batch(state->provider_state);
+
+			found = batch != NULL;
+			if (found)
+				pg_batch_bridge->publish_batch(bslot->binding, batch);
+		}
+		else
+			found = table_scan_getnextslot(state->scan,
+										   ForwardScanDirection,
+										   &bslot->base);
 
 		if (!found)
 		{

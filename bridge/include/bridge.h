@@ -216,11 +216,14 @@ typedef struct PgBatchBridgeRequest
 /*
  * Borrowed planner input passed to one provider's plan_scan() callback.
  *
- * clauses contains bare relation restrictions in executor order. Attribute
- * bitmaps contain one-based physical relation attribute numbers; projection
- * attributes already used by filters are omitted from project_attnums. The
- * provider must not modify this structure or retain pointers from it after
- * plan_scan() returns.
+ * clauses contains bare relation restrictions in executor order.
+ * restrictinfos contains the corresponding RestrictInfo nodes in exactly the
+ * same order. Providers that move work below the scan boundary must use them
+ * to preserve PostgreSQL's security ordering. Attribute bitmaps contain
+ * one-based physical relation attribute numbers; projection attributes
+ * already used by filters are omitted from project_attnums. The provider must
+ * not modify this structure or retain pointers from it after plan_scan()
+ * returns.
  */
 typedef struct PgBatchBridgePlanRequest
 {
@@ -228,6 +231,7 @@ typedef struct PgBatchBridgePlanRequest
 	RelOptInfo *rel;
 	Relation	relation;
 	List	   *clauses;
+	List	   *restrictinfos;
 	const Bitmapset *filter_attnums;
 	const Bitmapset *project_attnums;
 }			PgBatchBridgePlanRequest;
@@ -291,6 +295,13 @@ typedef struct PgBatchBridgeProviderOps
 								  PgBatchBridgePlanResult * result);
 	/* Start a scan and return opaque state for the remaining callbacks. */
 	void	   *(*begin_scan) (const PgBatchBridgeExecRequest * request);
+	/*
+	 * Return the next source-owned batch, or NULL at end of scan. This is used
+	 * by sources such as FDWs that do not have a table AM callback through
+	 * which to publish a batch. A NULL callback keeps the existing table-AM
+	 * driven path.
+	 */
+	PgBatchBridgeBatch *(*next_batch) (void *provider_state);
 	/* Reset provider state so the same plan can be scanned from the start. */
 	void		(*rescan) (void *provider_state);
 	/* End the scan and release all resources owned by provider_state. */

@@ -10,3 +10,4 @@
 /pg_batch.log
 /benchmark/artifacts/
 /pg_batch-*.log
+/build/

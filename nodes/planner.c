@@ -198,11 +198,37 @@ relation_attnums(Node *node, Index relid)
 	return result;
 }
 
+/* Match the bare clauses returned by extract_actual_clauses() to their rinfos. */
+static List *
+restriction_infos_for_clauses(List *restrictinfos, List *clauses)
+{
+	List	   *result = NIL;
+
+	foreach_ptr(Node, clause, clauses)
+	{
+		RestrictInfo *match = NULL;
+
+		foreach_ptr(RestrictInfo, rinfo, restrictinfos)
+		{
+			if ((Node *) rinfo->clause == clause)
+			{
+				match = rinfo;
+				break;
+			}
+		}
+		if (match == NULL)
+			elog(ERROR, "pg_batch could not match a scan restriction");
+		result = lappend(result, match);
+	}
+	return result;
+}
+
 static bool
 relation_supported(PlannerInfo *root, RelOptInfo *rel,
 				   RangeTblEntry *rte)
 {
 	Relation	relation;
+	const PgBatchBridgeProviderOps *provider;
 	bool		result = true;
 
 	if (!pg_batch_enable || root->parse->commandType != CMD_SELECT ||
@@ -211,9 +237,11 @@ relation_supported(PlannerInfo *root, RelOptInfo *rel,
 		rel->lateral_relids != NULL)
 		return false;
 	relation = table_open(rte->relid, NoLock);
-	if (relation->rd_rel->relkind != RELKIND_RELATION ||
-		(relation->rd_rel->relam != HEAP_TABLE_AM_OID &&
-		 pg_batch_bridge->find_provider(relation) == NULL))
+	provider = pg_batch_bridge->find_provider(relation);
+	if (relation->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+		result = provider != NULL && provider->next_batch != NULL;
+	else if (relation->rd_rel->relkind != RELKIND_RELATION ||
+			 (relation->rd_rel->relam != HEAP_TABLE_AM_OID && provider == NULL))
 		result = false;
 	for (int i = 0; result && i < RelationGetNumberOfAttributes(relation); i++)
 	{
@@ -413,6 +441,7 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	Relation	relation;
 	List	   *candidate_paths;
 	CustomPath *path;
+	Path	   *foreign_path = NULL;
 
 	if (previous_set_rel_pathlist_hook != NULL)
 		previous_set_rel_pathlist_hook(root, rel, rti, rte);
@@ -436,10 +465,34 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	if (relation->rd_rel->relam == HEAP_TABLE_AM_OID)
 		add_bitmap_paths(rel, candidate_paths);
 	table_close(relation, NoLock);
-	list_free(candidate_paths);
 
 	path = make_base_path(rel, PG_BATCH_HEAP_SEQ);
-	cost_seqscan(&path->path, root, rel, NULL);
+	if (rte->relkind == RELKIND_FOREIGN_TABLE)
+	{
+		foreach_ptr(Path, candidate, candidate_paths)
+		{
+			if (!IsA(candidate, ForeignPath) || candidate->param_info != NULL ||
+				candidate->parallel_aware)
+				continue;
+			if (foreign_path == NULL ||
+				candidate->total_cost < foreign_path->total_cost)
+				foreign_path = candidate;
+		}
+		if (foreign_path == NULL)
+		{
+			list_free(candidate_paths);
+			return;
+		}
+		path->path.rows = foreign_path->rows;
+		path->path.disabled_nodes = foreign_path->disabled_nodes;
+		path->path.startup_cost = foreign_path->startup_cost;
+		path->path.total_cost = foreign_path->total_cost;
+		/* The direct provider does not promise the FDW path's ordering. */
+		path->path.pathkeys = NIL;
+	}
+	else
+		cost_seqscan(&path->path, root, rel, NULL);
+	list_free(candidate_paths);
 	/* Prefer the playground path until it has a real cost model. */
 	path->path.total_cost *= 0.90;
 	add_path(rel, &path->path);
@@ -490,7 +543,7 @@ can_make_batch_input(PlannerInfo *root, Path *path)
 	if (IsA(path, CustomPath) &&
 		castNode(CustomPath, path)->methods == &pg_batch_base_path_methods)
 		return true;
-	if (path->pathtype != T_SeqScan)
+	if (path->pathtype != T_SeqScan && !IsA(path, ForeignPath))
 		return false;
 	rte = planner_rt_fetch(rel->relid, root);
 	return relation_supported(root, rel, rte);
@@ -546,7 +599,7 @@ make_batch_input(Path *source)
 	if (IsA(source, CustomPath) &&
 		castNode(CustomPath, source)->methods == &pg_batch_base_path_methods)
 		return source;
-	Assert(source->pathtype == T_SeqScan);
+	Assert(source->pathtype == T_SeqScan || IsA(source, ForeignPath));
 	path = make_base_path(source->parent, PG_BATCH_HEAP_SEQ);
 	path->path.pathtarget = source->pathtarget;
 	path->path.rows = source->rows;
@@ -851,6 +904,8 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		if (provider != NULL)
 		{
 			PgBatchBridgePlanRequest request;
+			List	   *restrictinfos =
+				restriction_infos_for_clauses(clauses, quals);
 			Bitmapset  *filter_attnums =
 				relation_attnums((Node *) quals, rel->relid);
 			Bitmapset  *project_attnums =
@@ -862,6 +917,7 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			request.rel = rel;
 			request.relation = relation;
 			request.clauses = quals;
+			request.restrictinfos = restrictinfos;
 			request.filter_attnums = filter_attnums;
 			request.project_attnums = project_attnums;
 			provider->plan_scan(&request, &source_result);
@@ -873,6 +929,7 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			source_private = source_result.source_private;
 			bms_free(filter_attnums);
 			bms_free(project_attnums);
+			list_free(restrictinfos);
 		}
 		table_close(relation, NoLock);
 	}
