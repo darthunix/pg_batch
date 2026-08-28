@@ -27,10 +27,11 @@ nodes/  ----->  bridge/  <-----  tam/
 - `fdw/` is an independent Arrow IPC test source. It has both an ordinary
   row-at-a-time FDW path and a direct bridge callback that returns native
   Arrow batches to the same nodes.
-- `runtime/` provides common batch traversal, lazy Datum/native adapters, and
-  borrowed vector views. `kernels/` provides type-specific operations over
-  those views. Both are statically linked into consumers, so they add no
-  loaded module or cross-extension function-call ABI.
+- `runtime/` provides common batch traversal, lazy Datum/native adapters,
+  borrowed vector views, and an owned Datum buffer for collecting scalar
+  slots. `kernels/` provides type-specific operations over those views. Both
+  are statically linked into consumers, so they add no loaded module or
+  cross-extension function-call ABI.
 
 `nodes`, `tam`, and `fdw` all consume the same runtime and kernel libraries.
 The bridge remains their only shared runtime service; the static libraries
@@ -240,12 +241,13 @@ PGPORT=5432 make \
     PG_CONFIG=/path/to/patched/postgres/bin/pg_config installcheck
 ```
 
-The suite also builds a separate C module through the installed `pkg-config`
-metadata, without private node headers. It checks heap, bitmap-index,
-table-AM, and FDW batches; native Arrow
-consumption; lazy `Datum` fallback; exact and pruning-only predicates;
-parameters; scalar and SIMD filter kernels; joins; rescans; early stop;
-disabled-source fallback; ABI rejection; and duplicate provider rejection.
+The suite also builds separate C modules through the installed `pkg-config`
+metadata, without private node headers. They check the reusable kernels and a
+70-row owned Datum buffer containing by-value, copied by-reference, and NULL
+values. The SQL tests cover heap, bitmap-index, table-AM, and FDW batches;
+native Arrow consumption; lazy `Datum` fallback; exact and pruning-only
+predicates; parameters; joins; rescans; early stop; disabled-source fallback;
+ABI rejection; and duplicate provider rejection.
 
 ## Source layout
 
@@ -253,7 +255,8 @@ disabled-source fallback; ABI rejection; and duplicate provider rejection.
 - `bridge/include/arrow.h` defines the optional Arrow interface.
 - `bridge/bridge.c` owns the registry and slot attachments.
 - `runtime/` builds `libpg_batch_runtime.a` and provides common selection,
-  column access, native/Datum adapters, and borrowed vector views.
+  column access, native/Datum adapters, borrowed vector views, and the
+  reusable scalar-to-Datum batch buffer used by `PgBatchPack`.
 - `kernels/` builds `libpg_batch_kernels.a` and provides direct `int4`
   comparisons, reductions, and hashing, with optional SIMD for dense
   comparisons.
@@ -282,6 +285,7 @@ psql -f benchmark/run_compressed.sql
 psql -f benchmark/run_kernels.sql
 psql -f benchmark/run_reductions.sql
 psql -f benchmark/run_hash_kernel.sql
+psql -f benchmark/run_pack.sql
 psql -f benchmark/run_groups.sql
 psql -f benchmark/run_brin.sql
 psql -f benchmark/run_bitmap_index.sql
@@ -303,6 +307,8 @@ sparse Datum and packed int32 columns.
 `run_hash_kernel.sql` compares the current hash join with another library
 over one or two heap and packed keys, including sparse, spill, and early-limit
 cases.
+`run_pack.sql` compares two node libraries while `PgBatchPack` collects one or
+two `Datum` columns from a large scalar `generate_series` input.
 
 ```sh
 psql -v variant=before -v batch_library=/path/to/before/pg_batch \

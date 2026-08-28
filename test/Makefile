@@ -1,6 +1,6 @@
 PG_CONFIG ?= pg_config
 
-MODULES = pg_batch_bridge_test pg_batch_kernels_test
+MODULES = pg_batch_bridge_test pg_batch_kernels_test pg_batch_runtime_test
 REGRESS = pg_batch pg_batch_fdw
 REGRESS_OPTS = --dlpath=$(CURDIR)
 PG_PKGLIBDIR := $(shell $(PG_CONFIG) --pkglibdir)

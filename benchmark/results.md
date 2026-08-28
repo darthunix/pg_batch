@@ -1119,6 +1119,36 @@ noise. The full heap, packed, sparse, and spill paths did not regress. Separate
 heap-filter and reduction runs also remained within the earlier measurements;
 packed exact filters improved because they now share the SIMD kernel.
 
+## Reusable owned Datum buffer
+
+`PgBatchPack` previously owned its column arrays, NULL flags, Datum copying,
+and batch operation table. The runtime now provides `PgBatchDatumBuffer` as an
+installed row-to-batch building block. It keeps column arrays and selection
+words between batches, resets a child context for pass-by-reference values,
+and publishes an eagerly materialized Datum batch of any positive capacity.
+`PgBatchPack` retains only child execution, bridge publication, and node
+instrumentation.
+
+The external PGXS test fills a 70-row buffer with `int4`, `text`, and NULL
+values. It resets the source memory after every appended row, verifies both
+selection words and the copied text, then resets and reuses the same buffer.
+
+`run_pack.sql` compares committed version `1a777fc` with the shared buffer.
+Both node libraries were loaded by absolute path in separate backends against
+the same warm heap table. Five warm-ups precede 31 samples. The first query
+packs one million `int4` rows from `generate_series`; the second packs two
+columns and 1,000,003 rows, exercising a partial final batch.
+
+| Packed scalar input | `1a777fc`, ms | Datum buffer, ms | Change |
+|---|---:|---:|---:|
+| One column, exact 64-row batches | 58.889 | 60.270 | +2.3% |
+| Two columns, partial final batch | 111.620 | 113.155 | +1.4% |
+
+Both changes are below the 3% regression threshold. The shared call boundary
+has a small per-row cost, while retaining the arrays removes per-batch array
+allocations. Dedicated by-value paths keep the common one- and two-column
+cases within the threshold without exposing the buffer representation.
+
 ## Limits of the measurements
 
 - The prototype prepares all requested filter columns before evaluating the

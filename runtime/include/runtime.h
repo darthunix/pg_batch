@@ -15,6 +15,9 @@
 #include "bridge.h"
 #include "vector.h"
 
+/* A reusable owner of an eagerly materialized column-major Datum batch. */
+typedef struct PgBatchDatumBuffer PgBatchDatumBuffer;
+
 static inline int
 pg_batch_row_count(const PgBatchBridgeBatch *batch)
 {
@@ -87,5 +90,38 @@ extern void pg_batch_get_int4_vector(PgBatchBridgeBatch *batch, int column,
 									 const uint64 *selected_rows,
 									 PgBatchBridgeMaterializePhase phase,
 									 PgBatchInt4Vector *result);
+
+/*
+ * Create a row-to-batch buffer in parent_context. tuple_desc is borrowed and
+ * must outlive the buffer. The first ncolumns attributes are copied from each
+ * appended slot, whose descriptor must be binary-compatible with tuple_desc.
+ * capacity may be larger than 64 rows.
+ */
+extern PgBatchDatumBuffer *pg_batch_datum_buffer_create(
+	MemoryContext parent_context, TupleDesc tuple_desc,
+	int ncolumns, int capacity);
+
+/*
+ * Discard copied pass-by-reference values and start an empty batch. A caller
+ * must first remove any previously returned batch from its bridge binding.
+ */
+extern void pg_batch_datum_buffer_reset(PgBatchDatumBuffer *buffer);
+
+/* Return true after capacity rows have been appended or the batch is sealed. */
+extern bool pg_batch_datum_buffer_is_full(const PgBatchDatumBuffer *buffer);
+
+/*
+ * Append one slot, copying pass-by-reference values into buffer-owned memory.
+ * The slot is fully materialized through ncolumns before it may be reused.
+ */
+extern void pg_batch_datum_buffer_append_slot(PgBatchDatumBuffer *buffer,
+										  TupleTableSlot *slot);
+
+/*
+ * Seal and return the current batch, or NULL when the buffer is empty. The
+ * returned batch and its column views remain valid until reset().
+ */
+extern PgBatchBridgeBatch *pg_batch_datum_buffer_finish(
+	PgBatchDatumBuffer *buffer, Oid table_oid);
 
 #endif							/* PG_BATCH_RUNTIME_H */

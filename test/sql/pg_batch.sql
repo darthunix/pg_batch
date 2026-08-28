@@ -6,8 +6,10 @@ CREATE EXTENSION pg_batch;
 \getenv dlsuffix PG_DLSUFFIX
 \set bridge_test :libdir '/pg_batch_bridge_test' :dlsuffix
 \set kernels_test :libdir '/pg_batch_kernels_test' :dlsuffix
+\set runtime_test :libdir '/pg_batch_runtime_test' :dlsuffix
 LOAD :'bridge_test';
 LOAD :'kernels_test';
+LOAD :'runtime_test';
 LOAD 'pg_batch_tam';
 LOAD 'pg_batch';
 
@@ -23,10 +25,15 @@ CREATE FUNCTION pg_batch_kernels_test()
 RETURNS boolean
 AS :'kernels_test', 'pg_batch_kernels_test'
 LANGUAGE C;
+CREATE FUNCTION pg_batch_datum_buffer_test()
+RETURNS boolean
+AS :'runtime_test', 'pg_batch_datum_buffer_test'
+LANGUAGE C;
 
 SELECT pg_batch_bridge_test_bad_abi();
 SELECT pg_batch_bridge_test_duplicate_provider();
 SELECT pg_batch_kernels_test() AS installed_kernels_ok;
+SELECT pg_batch_datum_buffer_test() AS installed_datum_buffer_ok;
 
 SET max_parallel_workers_per_gather = 0;
 SET jit = off;
