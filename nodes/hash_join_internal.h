@@ -99,9 +99,14 @@ typedef struct BatchHashJoinState
 	CustomScanState css;
 	PlanState  *outer_plan;
 	PlanState  *inner_plan;
-	TupleTableSlot *outer_slot;
-	TupleTableSlot *inner_slot;
-	TupleTableSlot *probe_slot;
+	const PgBatchBridgeProducerOps *outer_producer;
+	const PgBatchBridgeProducerOps *inner_producer;
+	PgBatchBridgeBinding *outer_request_binding;
+	PgBatchBridgeBinding *inner_request_binding;
+	TupleTableSlot *outer_result_slot;
+	TupleTableSlot *inner_result_slot;
+	PgBatchBridgeBinding *outer_result_binding;
+	PgBatchBridgeBinding *inner_result_binding;
 	TupleTableSlot *output_slot;
 	TupleTableSlot *raw_slot;
 	const PgBatchBridgeRequest *output_request;

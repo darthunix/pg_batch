@@ -6,6 +6,7 @@ OBJS = \
 	executor.o \
 	scan.o \
 	filter.o \
+	pack.o \
 	hash_join.o \
 	hash_join_spill.o \
 	aggregate.o

@@ -254,6 +254,49 @@ typedef struct PgBatchBridgePlanResult
 }			PgBatchBridgePlanResult;
 
 /*
+ * Stable mapping from a plan node's output tuple to its published batch.
+ *
+ * batch_columns has one zero-based compact batch column for every target
+ * entry in the Plan. The producer allocates the array in the current planner
+ * context; a consumer must copy the values it keeps in its own plan data.
+ */
+typedef struct PgBatchBridgeOutputLayout
+{
+	int			ncolumns;
+	const int  *batch_columns;
+} PgBatchBridgeOutputLayout;
+
+/*
+ * Operations implemented by an extension whose plan nodes publish batches.
+ *
+ * This is separate from PgBatchBridgeProviderOps: a provider supplies batches
+ * at a scan boundary, while a producer describes a complete executor node
+ * whose output can be consumed as batches by another extension. When its
+ * request has return_batch set, every nonempty ExecProcNode() result must be
+ * a bridge-attached slot with an active batch. It need not be the request
+ * binding's slot: pass-through nodes may return a child's slot.
+ */
+typedef struct PgBatchBridgeProducerOps
+{
+	/* Set to PG_BATCH_BRIDGE_ABI_VERSION and sizeof(this structure). */
+	uint32		abi_version;
+	Size		struct_size;
+	/* Stable name stored in parent plans and used again during execution. */
+	const char *producer_name;
+	/* Return true when this Path will publish batches through the bridge. */
+	bool		(*supports_path) (const Path *path);
+	/* Describe how Plan target entries map to compact batch columns. */
+	void		(*get_output_layout) (const Plan *plan,
+								  PgBatchBridgeOutputLayout *result);
+	/*
+	 * Return the binding through which a parent configures this node's batch
+	 * request. The slot returned by ExecProcNode() may have a different
+	 * binding; consumers must find the active batch from that returned slot.
+	 */
+	PgBatchBridgeBinding *(*get_request_binding) (struct PlanState *planstate);
+} PgBatchBridgeProducerOps;
+
+/*
  * Borrowed execution input passed once to begin_scan() for a provider selected
  * at planning time. source_private is the saved provider plan; source_exprs
  * contains its executor-ready expressions. slot_request remains valid until
@@ -328,6 +371,15 @@ typedef struct PgBatchBridgeAPI
 	const		PgBatchBridgeProviderOps *(*find_provider) (Relation relation);
 	/* Find a registered provider by its exact stable name, or return NULL. */
 	const		PgBatchBridgeProviderOps *(*get_provider) (const char *provider_name);
+
+	/* Register a batch-producing plan-node implementation. */
+	void		(*register_producer) (const PgBatchBridgeProducerOps * producer);
+	/* Remove a producer after all plans using it have finished. */
+	void		(*unregister_producer) (const char *producer_name);
+	/* Find the sole registered producer claiming path, or return NULL. */
+	const		PgBatchBridgeProducerOps *(*find_producer) (const Path *path);
+	/* Find a producer by the stable name stored in a parent plan. */
+	const		PgBatchBridgeProducerOps *(*get_producer) (const char *producer_name);
 
 	/*
 	 * Find an existing slot binding without creating one. This lookup is meant

@@ -1069,7 +1069,6 @@ hash_join_publish_resident_probe(BatchHashJoinState *state, bool final_batch)
 	block->selection = pg_batch_nrows_mask(nrows);
 	block->batch.nrows = nrows;
 	block->batch.consumed = false;
-	state->probe_slot = NULL;
 	state->probe_batch = &block->batch;
 	state->probe_from_spill = true;
 	state->probe_from_resident = true;
@@ -1128,7 +1127,6 @@ hash_join_fetch_spilled_probe_batch(BatchHashJoinState *state)
 		if (read_spill_block(state, state->active_probe_file,
 							 &state->probe_block))
 		{
-			state->probe_slot = NULL;
 			state->probe_batch = &state->probe_block.batch;
 			state->probe_from_spill = true;
 			state->spill_probe_reads += state->probe_block.nrows;

@@ -48,12 +48,15 @@ _PG_init(void)
 							 "batch bitmap path.",
 							 NULL, &pg_batch_bitmap_min_rows_per_page,
 							 8.0, 0.0, PG_BATCH_SIZE, PGC_USERSET, 0,
-							 NULL, NULL, NULL);
+								 NULL, NULL, NULL);
 	pg_batch_planner_init();
+	pg_batch_bridge->register_producer(&pg_batch_producer_ops);
 }
 
 void
 _PG_fini(void)
 {
+	if (pg_batch_bridge != NULL)
+		pg_batch_bridge->unregister_producer(PG_BATCH_PRODUCER_NAME);
 	pg_batch_planner_fini();
 }

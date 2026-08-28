@@ -527,6 +527,33 @@ SELECT NOT EXISTS (
            (TABLE plain_join_agg EXCEPT ALL TABLE batch_join_agg)
        ) AS join_aggregates_match;
 
+-- Pack a scalar child on either side of a batch hash join.
+EXPLAIN (COSTS OFF)
+SELECT count(*), sum(o.v), sum(x.payload)
+FROM pg_batch_join_outer o
+JOIN (VALUES (1, 100), (2, 200), (3, 300)) x(k, payload)
+  ON o.k1 = x.k
+WHERE o.v > 10;
+
+SELECT count(*) AS rows, sum(o.v) AS outer_total,
+       sum(x.payload) AS packed_total
+FROM pg_batch_join_outer o
+JOIN (VALUES (1, 100), (2, 200), (3, 300)) x(k, payload)
+  ON o.k1 = x.k
+WHERE o.v > 10;
+
+EXPLAIN (COSTS OFF)
+SELECT count(*), sum(g.k), sum(i.v)
+FROM generate_series(1, 130) g(k)
+JOIN pg_batch_join_inner i ON i.k1 = g.k
+WHERE i.v > 0;
+
+SELECT count(*) AS rows, sum(g.k) AS packed_total,
+       sum(i.v) AS inner_total
+FROM generate_series(1, 130) g(k)
+JOIN pg_batch_join_inner i ON i.k1 = g.k
+WHERE i.v > 0;
+
 -- Use the join's hash function to exercise fallback and repartitioning skew.
 CREATE TABLE pg_batch_join_spill_outer(k int, v int);
 CREATE TABLE pg_batch_join_spill_inner(k int, v int);

@@ -987,6 +987,70 @@ SELECT NOT EXISTS (
  t               | t
 (1 row)
 
+-- Pack a scalar child on either side of a batch hash join.
+EXPLAIN (COSTS OFF)
+SELECT count(*), sum(o.v), sum(x.payload)
+FROM pg_batch_join_outer o
+JOIN (VALUES (1, 100), (2, 200), (3, 300)) x(k, payload)
+  ON o.k1 = x.k
+WHERE o.v > 10;
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Custom Scan (PgBatchAgg)
+   ->  Custom Scan (PgBatchHashJoin)
+         Hash Buckets: 0
+         Planned Partitions: 1
+         ->  Custom Scan (PgBatchFilterProject)
+               ->  Custom Scan (PgBatchScan) on pg_batch_join_outer o
+                     Batch Size: 64
+                     Batch Source: Heap
+         ->  Custom Scan (PgBatchPack)
+               Batch Size: 64
+               ->  Values Scan on "*VALUES*"
+(11 rows)
+
+SELECT count(*) AS rows, sum(o.v) AS outer_total,
+       sum(x.payload) AS packed_total
+FROM pg_batch_join_outer o
+JOIN (VALUES (1, 100), (2, 200), (3, 300)) x(k, payload)
+  ON o.k1 = x.k
+WHERE o.v > 10;
+ rows | outer_total | packed_total 
+------+-------------+--------------
+    9 |         738 |         1800
+(1 row)
+
+EXPLAIN (COSTS OFF)
+SELECT count(*), sum(g.k), sum(i.v)
+FROM generate_series(1, 130) g(k)
+JOIN pg_batch_join_inner i ON i.k1 = g.k
+WHERE i.v > 0;
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Custom Scan (PgBatchAgg)
+   ->  Custom Scan (PgBatchHashJoin)
+         Hash Buckets: 0
+         Planned Partitions: 1
+         ->  Custom Scan (PgBatchPack)
+               Batch Size: 64
+               ->  Function Scan on generate_series g
+         ->  Custom Scan (PgBatchFilterProject)
+               ->  Custom Scan (PgBatchScan) on pg_batch_join_inner i
+                     Batch Size: 64
+                     Batch Source: pg_batch_compressed_tam
+                     Batch Provider: pg_batch_compressed_tam
+(12 rows)
+
+SELECT count(*) AS rows, sum(g.k) AS packed_total,
+       sum(i.v) AS inner_total
+FROM generate_series(1, 130) g(k)
+JOIN pg_batch_join_inner i ON i.k1 = g.k
+WHERE i.v > 0;
+ rows | packed_total | inner_total 
+------+--------------+-------------
+   76 |         1507 |        9081
+(1 row)
+
 -- Use the join's hash function to exercise fallback and repartitioning skew.
 CREATE TABLE pg_batch_join_spill_outer(k int, v int);
 CREATE TABLE pg_batch_join_spill_inner(k int, v int);

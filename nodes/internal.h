@@ -194,6 +194,7 @@ pg_batch_get_datum_column(PgBatchBridgeBatch *batch, int column,
 extern OpExpr *pg_batch_match_qual(Node *clause, uint8 *var_argno);
 extern Node *pg_batch_create_scan_state(CustomScan *cscan);
 extern Node *pg_batch_create_filter_state(CustomScan *cscan);
+extern Node *pg_batch_create_pack_state(CustomScan *cscan);
 extern Node *pg_batch_create_hash_join_state(CustomScan *cscan);
 extern TupleTableSlot *pg_batch_hash_join_output_slot(CustomScanState *state);
 extern Node *pg_batch_create_agg_state(CustomScan *cscan);
@@ -208,5 +209,9 @@ extern void pg_batch_rescan_children(CustomScanState *css);
 
 extern void pg_batch_planner_init(void);
 extern void pg_batch_planner_fini(void);
+
+extern const PgBatchBridgeProducerOps pg_batch_producer_ops;
+
+#define PG_BATCH_PRODUCER_NAME "pg_batch_nodes"
 
 #endif							/* PG_BATCH_H */

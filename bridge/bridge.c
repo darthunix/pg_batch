@@ -34,11 +34,16 @@ struct PgBatchBridgeBinding
 
 static HTAB *slot_entries;
 static List *providers;
+static List *producers;
 
 static void register_provider(const PgBatchBridgeProviderOps *provider);
 static void unregister_provider(const char *provider_name);
 static const PgBatchBridgeProviderOps *find_provider(Relation relation);
 static const PgBatchBridgeProviderOps *get_provider(const char *provider_name);
+static void register_producer(const PgBatchBridgeProducerOps *producer);
+static void unregister_producer(const char *producer_name);
+static const PgBatchBridgeProducerOps *find_producer(const Path *path);
+static const PgBatchBridgeProducerOps *get_producer(const char *producer_name);
 static PgBatchBridgeBinding *find_binding(TupleTableSlot *slot);
 static PgBatchBridgeBinding *attach_slot(TupleTableSlot *slot,
 										 const AttrNumber *source_attnums,
@@ -67,6 +72,10 @@ static const PgBatchBridgeAPI bridge_api = {
 	.unregister_provider = unregister_provider,
 	.find_provider = find_provider,
 	.get_provider = get_provider,
+	.register_producer = register_producer,
+	.unregister_producer = unregister_producer,
+	.find_producer = find_producer,
+	.get_producer = get_producer,
 	.find_binding = find_binding,
 	.attach_slot = attach_slot,
 	.set_request = set_request,
@@ -220,6 +229,74 @@ get_provider(const char *provider_name)
 	{
 		if (strcmp(provider->provider_name, provider_name) == 0)
 			return provider;
+	}
+	return NULL;
+}
+
+static void
+register_producer(const PgBatchBridgeProducerOps *producer)
+{
+	MemoryContext oldcontext;
+
+	if (producer == NULL || producer->producer_name == NULL ||
+		producer->producer_name[0] == '\0' ||
+		producer->supports_path == NULL ||
+		producer->get_output_layout == NULL ||
+		producer->get_request_binding == NULL)
+		elog(ERROR, "invalid pg_batch producer registration");
+	validate_abi(producer->abi_version, producer->struct_size,
+				 "producer", sizeof(PgBatchBridgeProducerOps));
+	foreach_ptr(const PgBatchBridgeProducerOps, existing, producers)
+	{
+		if (strcmp(existing->producer_name, producer->producer_name) == 0)
+		{
+			if (existing == producer)
+				return;
+			elog(ERROR, "pg_batch producer \"%s\" is already registered",
+				 producer->producer_name);
+		}
+	}
+	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+	producers = lappend(producers, (void *) producer);
+	MemoryContextSwitchTo(oldcontext);
+}
+
+static void
+unregister_producer(const char *producer_name)
+{
+	const PgBatchBridgeProducerOps *producer = get_producer(producer_name);
+
+	if (producer != NULL)
+		producers = list_delete_ptr(producers, (void *) producer);
+}
+
+static const PgBatchBridgeProducerOps *
+find_producer(const Path *path)
+{
+	const PgBatchBridgeProducerOps *result = NULL;
+
+	foreach_ptr(const PgBatchBridgeProducerOps, producer, producers)
+	{
+		if (!producer->supports_path(path))
+			continue;
+		if (result != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_OBJECT),
+					 errmsg("multiple pg_batch producers support one plan path"),
+					 errdetail("Producers \"%s\" and \"%s\" both claimed the path.",
+							   result->producer_name, producer->producer_name)));
+		result = producer;
+	}
+	return result;
+}
+
+static const PgBatchBridgeProducerOps *
+get_producer(const char *producer_name)
+{
+	foreach_ptr(const PgBatchBridgeProducerOps, producer, producers)
+	{
+		if (strcmp(producer->producer_name, producer_name) == 0)
+			return producer;
 	}
 	return NULL;
 }
