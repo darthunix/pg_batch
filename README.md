@@ -224,7 +224,8 @@ disabled-source fallback; ABI rejection; and duplicate provider rejection.
 - `bridge/include/arrow.h` defines the optional Arrow interface.
 - `bridge/bridge.c` owns the registry and slot attachments.
 - `runtime/include/runtime.h` provides common selection and column access.
-- `kernels/` provides direct scalar and optional SIMD `int4` comparisons.
+- `kernels/` provides direct `int4` comparisons and scalar reductions, with
+  optional SIMD for dense comparisons.
 - `nodes/planner.c` builds sequential and bitmap-backed custom plans.
 - `nodes/slot.c` implements the custom slot and heap batch source.
 - `nodes/scan.c`, `filter.c`, `hash_join.c`, and `aggregate.c` implement the
@@ -248,6 +249,7 @@ psql -f benchmark/setup.sql
 psql -f benchmark/run_heap_compare.sql
 psql -f benchmark/run_compressed.sql
 psql -f benchmark/run_kernels.sql
+psql -f benchmark/run_reductions.sql
 psql -f benchmark/run_groups.sql
 psql -f benchmark/run_brin.sql
 psql -f benchmark/run_bitmap_index.sql
@@ -264,6 +266,8 @@ and exact source filtering. Current measurements and query explanations are in
 [`benchmark/results.md`](benchmark/results.md).
 `run_kernels.sql` compares the direct scalar and optional SIMD int4 filter
 kernels over Datum and packed int32 columns.
+`run_reductions.sql` compares scalar int4 reduction kernels over dense and
+sparse Datum and packed int32 columns.
 `run_bitmap_index.sql` compares ordered `Index Scan`, ordinary
 `Bitmap Heap Scan`, and batch-over-bitmap execution for B-tree indexes at
 different selectivities and heap orders.

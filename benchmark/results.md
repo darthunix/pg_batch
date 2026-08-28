@@ -988,6 +988,45 @@ wide heap queries, tuple deformation and projection dominate, so SIMD adds
 only about 1% after the direct scalar comparison. No measured heap query was
 slower than the committed version.
 
+## Reusable int4 reduction kernels
+
+This experiment adds one scalar reduction kernel over the same Datum and
+packed-`int32` column views as the filter kernels. `PgBatchAgg` groups
+`count(column)`, `sum(int4)`, `min(int4)`, and `max(int4)` by input column and
+requests all needed results in one pass. `count(*)` only counts the batch
+selection and does not materialize a column.
+
+`run_reductions.sql` alternates the PostgreSQL and batch plans for 31 samples
+after five warm-ups. The committed `da57e22` library and the new library were
+loaded in separate backends against the same warm server and tables. The
+table reports medians from those runs. A negative change means that the new
+code is faster.
+
+| Query | `da57e22`, ms | Reduction kernel, ms | Change | Versus PostgreSQL |
+|---|---:|---:|---:|---:|
+| Heap `count(*)` | 7.255 | 7.189 | -0.9% | -76.0% |
+| Heap `sum(c4)` | 15.560 | 14.730 | -5.3% | -62.4% |
+| Heap `count(c4), sum(c4)` | 22.337 | 13.733 | -38.5% | -68.3% |
+| Heap `sum(c4), sum(c8)` | 28.805 | 27.015 | -6.2% | -45.0% |
+| Heap sparse `count(c4), sum(c4)` | 6.531 | 6.124 | -6.2% | -62.7% |
+| Heap all four reductions | 54.209* | 15.513 | -71.4% | -71.4% |
+| Packed `int32` `sum(c4)` | 5.599 | 4.456 | -20.4% | -91.0% |
+| Packed `int32` `count(c4), sum(c4)` | 8.020 | 4.481 | -44.1% | -92.0% |
+| Packed `int32` sparse `count(c4), sum(c4)` | 2.046 | 1.815 | -11.3% | -91.5% |
+| Packed `int32` all four reductions | 64.821* | 5.255 | -91.9% | -92.0% |
+
+The old version did not support `min/max`; rows marked with `*` therefore
+compare the new `PgBatchAgg` with its ordinary PostgreSQL aggregate fallback.
+The direct regression checks are the other rows. They show no slowdown for
+the existing `count/sum` cases. Fusing `count` and `sum` removes a second scan
+of the same column and improves the heap case by 38.5% and the packed case by
+44.1% relative to `da57e22`.
+
+The first generic implementation checked every requested operation for every
+value. A specialized scalar sum loop removed a small heap regression and also
+improved packed input. Since every existing aggregate case is now at least as
+fast as `da57e22`, this stage does not add separate SIMD reduction code.
+
 ## Limits of the measurements
 
 - The prototype prepares all requested filter columns before evaluating the

@@ -191,3 +191,143 @@ pg_batch_filter_int4(const PgBatchInt4Vector *column, int nrows, int nwords,
 										 op, scalar);
 	}
 }
+
+static inline void
+reduce_value(PgBatchInt4Reduction *result, uint32 flags, int32 value)
+{
+	if (flags & PG_BATCH_INT4_REDUCE_SUM)
+		result->sum += value;
+	if (!result->has_value)
+	{
+		if (flags & PG_BATCH_INT4_REDUCE_MIN)
+			result->min = value;
+		if (flags & PG_BATCH_INT4_REDUCE_MAX)
+			result->max = value;
+		result->has_value = true;
+	}
+	else
+	{
+		if ((flags & PG_BATCH_INT4_REDUCE_MIN) && value < result->min)
+			result->min = value;
+		if ((flags & PG_BATCH_INT4_REDUCE_MAX) && value > result->max)
+			result->max = value;
+	}
+}
+
+static int64
+reduce_sum(const PgBatchInt4Vector *column, int first_row, int nrows,
+		   uint64 rows)
+{
+	int64		sum = 0;
+
+	if (rows == word_mask(nrows, 0))
+	{
+		if (column->layout == PG_BATCH_INT4_DATUM)
+		{
+			const Datum *values = column->data.datum.values + first_row;
+
+			for (int row = 0; row < nrows; row++)
+				sum += DatumGetInt32(values[row]);
+		}
+		else
+		{
+			const int32 *values = column->data.packed.values +
+				column->data.packed.offset + first_row;
+
+			for (int row = 0; row < nrows; row++)
+				sum += values[row];
+		}
+		return sum;
+	}
+
+	if (column->layout == PG_BATCH_INT4_DATUM)
+	{
+		const Datum *values = column->data.datum.values + first_row;
+
+		while (rows != 0)
+		{
+			int			bitno = pg_rightmost_one_pos64(rows);
+
+			sum += DatumGetInt32(values[bitno]);
+			rows &= rows - 1;
+		}
+	}
+	else
+	{
+		const int32 *values = column->data.packed.values +
+			column->data.packed.offset + first_row;
+
+		while (rows != 0)
+		{
+			int			bitno = pg_rightmost_one_pos64(rows);
+
+			sum += values[bitno];
+			rows &= rows - 1;
+		}
+	}
+	return sum;
+}
+
+void
+pg_batch_reduce_int4(const PgBatchInt4Vector *column, int nrows, int nwords,
+					 const uint64 *selection, uint32 flags,
+					 PgBatchInt4Reduction *result)
+{
+	uint32		value_flags = flags & (PG_BATCH_INT4_REDUCE_SUM |
+									 PG_BATCH_INT4_REDUCE_MIN |
+									 PG_BATCH_INT4_REDUCE_MAX);
+
+	Assert(nrows > 0);
+	Assert(nwords == (nrows + 63) / 64);
+	Assert(flags != 0);
+	MemSet(result, 0, sizeof(*result));
+
+	for (int word = 0; word < nwords; word++)
+	{
+		int			first_row = word * 64;
+		int			word_nrows = Min(64, nrows - first_row);
+		uint64		rows = selection[word] & word_mask(nrows, word);
+
+		if (rows == 0)
+			continue;
+		if (column->layout == PG_BATCH_INT4_DATUM &&
+			(word >= column->data.datum.nwords ||
+			 (column->data.datum.available[word] & rows) != rows))
+			elog(ERROR, "pg_batch int4 kernel received unavailable Datum rows");
+
+		rows &= not_null_mask(column, first_row, word_nrows);
+		if (rows == 0)
+			continue;
+		if (flags & PG_BATCH_INT4_REDUCE_COUNT)
+			result->count += pg_popcount64(rows);
+		if (value_flags == 0)
+		{
+			result->has_value = true;
+			continue;
+		}
+		if (value_flags == PG_BATCH_INT4_REDUCE_SUM)
+		{
+			result->sum += reduce_sum(column, first_row, word_nrows, rows);
+			result->has_value = true;
+			continue;
+		}
+
+		if (rows == word_mask(nrows, word))
+		{
+			for (int row = first_row; row < first_row + word_nrows; row++)
+				reduce_value(result, value_flags, row_value(column, row));
+		}
+		else
+		{
+			while (rows != 0)
+			{
+				int			bitno = pg_rightmost_one_pos64(rows);
+				uint64		bit = UINT64CONST(1) << bitno;
+				int			row = first_row + bitno;
+
+				reduce_value(result, value_flags, row_value(column, row));
+				rows &= ~bit;
+			}
+		}
+	}
+}

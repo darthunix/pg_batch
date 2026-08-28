@@ -68,7 +68,9 @@ typedef enum PgBatchAggKind
 {
 	PG_BATCH_AGG_COUNT_STAR = 1,
 	PG_BATCH_AGG_COUNT_COLUMN,
-	PG_BATCH_AGG_SUM_INT4
+	PG_BATCH_AGG_SUM_INT4,
+	PG_BATCH_AGG_MIN_INT4,
+	PG_BATCH_AGG_MAX_INT4
 } PgBatchAggKind;
 
 typedef enum PgBatchHeapScanMode
@@ -141,6 +143,10 @@ extern void pg_batch_materialize_columns(PgBatchBridgeBatch *batch,
 										 PgBatchMaterializePhase phase);
 extern bool pg_batch_get_arrow_column(PgBatchBridgeBatch *batch, int column,
 									  PgBatchArrowView *result);
+extern void pg_batch_get_int4_vector(PgBatchBridgeBatch *batch, int column,
+									 const uint64 *selected_rows,
+									 PgBatchMaterializePhase phase,
+									 PgBatchInt4Vector *result);
 extern void pg_batch_select_row(TupleTableSlot *slot, int row);
 
 extern OpExpr *pg_batch_match_qual(Node *clause, uint8 *var_argno);

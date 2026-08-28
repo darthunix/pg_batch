@@ -45,7 +45,9 @@ SELECT c1, c8
 FROM pg_batch_fdw_foreign
 WHERE c2 < 50 AND (c1 + c3) % 5 = 0;
 CREATE TEMP TABLE pg_batch_fdw_plain_agg AS
-SELECT count(*) AS n, count(c2) AS nn, sum(c8) AS total
+SELECT count(*) AS n, count(c2) AS nn, sum(c8) AS total,
+       min(c2) AS minimum, max(c2) AS maximum,
+       min(c8) AS projected_minimum, max(c8) AS projected_maximum
 FROM pg_batch_fdw_foreign
 WHERE c2 < 100;
 
@@ -55,7 +57,9 @@ SELECT c1, c8
 FROM pg_batch_fdw_foreign
 WHERE c2 < 50 AND (c1 + c3) % 5 = 0;
 CREATE TEMP TABLE pg_batch_fdw_batch_agg AS
-SELECT count(*) AS n, count(c2) AS nn, sum(c8) AS total
+SELECT count(*) AS n, count(c2) AS nn, sum(c8) AS total,
+       min(c2) AS minimum, max(c2) AS maximum,
+       min(c8) AS projected_minimum, max(c8) AS projected_maximum
 FROM pg_batch_fdw_foreign
 WHERE c2 < 100;
 

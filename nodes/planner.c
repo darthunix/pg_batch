@@ -919,6 +919,10 @@ parse_aggregate(Aggref *agg, PgBatchAggKind *kind, Node **source_expr)
 		*kind = PG_BATCH_AGG_COUNT_COLUMN;
 	else if (agg->aggfnoid == F_SUM_INT4)
 		*kind = PG_BATCH_AGG_SUM_INT4;
+	else if (agg->aggfnoid == F_MIN_INT4)
+		*kind = PG_BATCH_AGG_MIN_INT4;
+	else if (agg->aggfnoid == F_MAX_INT4)
+		*kind = PG_BATCH_AGG_MAX_INT4;
 	else
 		return false;
 	return true;

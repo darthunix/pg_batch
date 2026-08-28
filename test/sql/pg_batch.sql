@@ -49,6 +49,11 @@ SELECT CASE
 FROM generate_series(1, 130) AS g;
 ANALYZE pg_batch_kernel_values;
 
+CREATE TEMP TABLE pg_batch_kernel_nulls(v integer);
+INSERT INTO pg_batch_kernel_nulls
+SELECT NULL::integer FROM generate_series(1, 70);
+ANALYZE pg_batch_kernel_nulls;
+
 SET pg_batch.enable = on;
 SET pg_batch.enable_simd = on;
 CREATE TEMP TABLE pg_batch_kernel_simd AS
@@ -118,6 +123,52 @@ DROP FUNCTION pg_batch_test_eq(integer, integer);
 
 RESET pg_batch.enable_simd;
 
+SET pg_batch.enable = on;
+CREATE TEMP TABLE pg_batch_reduction_batch AS
+SELECT 'mixed' AS test, count(*) AS n, count(v) AS nn, sum(v) AS total,
+       min(v) AS minimum, max(v) AS maximum
+FROM pg_batch_kernel_values
+UNION ALL
+SELECT 'empty', count(*), count(v), sum(v), min(v), max(v)
+FROM pg_batch_kernel_values WHERE v > '2147483647'::integer
+UNION ALL
+SELECT 'nulls', count(*), count(v), sum(v), min(v), max(v)
+FROM pg_batch_kernel_nulls;
+
+EXPLAIN (COSTS OFF)
+SELECT count(*), count(v), sum(v), min(v), max(v)
+FROM pg_batch_kernel_values;
+
+SET pg_batch.enable = off;
+CREATE TEMP TABLE pg_batch_reduction_plain AS
+SELECT 'mixed' AS test, count(*) AS n, count(v) AS nn, sum(v) AS total,
+       min(v) AS minimum, max(v) AS maximum
+FROM pg_batch_kernel_values
+UNION ALL
+SELECT 'empty', count(*), count(v), sum(v), min(v), max(v)
+FROM pg_batch_kernel_values WHERE v > '2147483647'::integer
+UNION ALL
+SELECT 'nulls', count(*), count(v), sum(v), min(v), max(v)
+FROM pg_batch_kernel_nulls;
+
+SELECT NOT EXISTS (
+           (TABLE pg_batch_reduction_batch
+            EXCEPT ALL TABLE pg_batch_reduction_plain)
+           UNION ALL
+           (TABLE pg_batch_reduction_plain
+            EXCEPT ALL TABLE pg_batch_reduction_batch)
+       ) AS reductions_match;
+
+SET pg_batch.enable = on;
+EXPLAIN (COSTS OFF)
+SELECT avg(v) FROM pg_batch_kernel_values;
+EXPLAIN (COSTS OFF)
+SELECT count(DISTINCT v) FROM pg_batch_kernel_values;
+EXPLAIN (COSTS OFF)
+SELECT count(v) FILTER (WHERE v > 0) FROM pg_batch_kernel_values;
+EXPLAIN (COSTS OFF)
+SELECT v, count(*) FROM pg_batch_kernel_values GROUP BY v;
+
 EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
 SELECT c6 FROM pg_batch_test WHERE c2 < 10;
 
@@ -150,7 +201,10 @@ FROM pg_batch_test
 WHERE (c2 + c3) % 7 = 0 AND c4 > 10;
 
 CREATE TEMP TABLE batch_agg AS
-SELECT count(*) AS n, count(c6) AS nn, sum(c2) AS total
+SELECT count(*) AS n, count(c2) AS nn, sum(c2) AS total,
+       min(c2) AS minimum, max(c2) AS maximum,
+       sum(c6) AS other_total, min(c6) AS other_minimum,
+       max(c6) AS other_maximum
 FROM pg_batch_test
 WHERE c3 > 30;
 
@@ -161,7 +215,10 @@ FROM pg_batch_test
 WHERE (c2 + c3) % 7 = 0 AND c4 > 10;
 
 CREATE TEMP TABLE plain_agg AS
-SELECT count(*) AS n, count(c6) AS nn, sum(c2) AS total
+SELECT count(*) AS n, count(c2) AS nn, sum(c2) AS total,
+       min(c2) AS minimum, max(c2) AS maximum,
+       sum(c6) AS other_total, min(c6) AS other_minimum,
+       max(c6) AS other_maximum
 FROM pg_batch_test
 WHERE c3 > 30;
 
@@ -426,7 +483,9 @@ FROM pg_batch_arrow
 WHERE c2 < 100 AND (c1 + c3) % 5 = 0;
 CREATE TEMP TABLE plain_arrow_agg AS
 SELECT count(*) AS n, count(c2) AS nn, sum(c1) AS total,
-       sum(c4) AS delta16_total
+       min(c1) AS minimum, max(c1) AS maximum,
+       sum(c4) AS delta16_total, min(c4) AS delta16_minimum,
+       max(c4) AS delta16_maximum
 FROM pg_batch_arrow
 WHERE c2 < 100;
 
@@ -449,7 +508,9 @@ FROM pg_batch_arrow
 WHERE c2 < 100 AND (c1 + c3) % 5 = 0;
 CREATE TEMP TABLE compressed_arrow_agg AS
 SELECT count(*) AS n, count(c2) AS nn, sum(c1) AS total,
-       sum(c4) AS delta16_total
+       min(c1) AS minimum, max(c1) AS maximum,
+       sum(c4) AS delta16_total, min(c4) AS delta16_minimum,
+       max(c4) AS delta16_maximum
 FROM pg_batch_arrow
 WHERE c2 < 100;
 

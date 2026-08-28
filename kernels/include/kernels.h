@@ -56,6 +56,25 @@ typedef struct PgBatchInt4Vector
 	} data;
 } PgBatchInt4Vector;
 
+/* Values that one int4 reduction pass should calculate. */
+typedef enum PgBatchInt4ReduceFlag
+{
+	PG_BATCH_INT4_REDUCE_COUNT = 1 << 0,
+	PG_BATCH_INT4_REDUCE_SUM = 1 << 1,
+	PG_BATCH_INT4_REDUCE_MIN = 1 << 2,
+	PG_BATCH_INT4_REDUCE_MAX = 1 << 3
+} PgBatchInt4ReduceFlag;
+
+/* Partial result for one column and one batch. */
+typedef struct PgBatchInt4Reduction
+{
+	int64		count;
+	int64		sum;
+	int32		min;
+	int32		max;
+	bool		has_value;
+} PgBatchInt4Reduction;
+
 /* Map a built-in int4 comparison and normalize a Var on the right. */
 extern bool pg_batch_int4_compare_op(Oid funcid, uint8 var_argno,
 									 PgBatchInt4Op *result);
@@ -65,6 +84,12 @@ extern void pg_batch_filter_int4(const PgBatchInt4Vector *column,
 								 int nrows, int nwords, uint64 *selection,
 								 PgBatchInt4Op op, int32 scalar,
 								 bool enable_simd);
+
+/* Calculate the requested reductions without changing the row selection. */
+extern void pg_batch_reduce_int4(const PgBatchInt4Vector *column,
+								 int nrows, int nwords,
+								 const uint64 *selection, uint32 flags,
+								 PgBatchInt4Reduction *result);
 
 extern bool pg_batch_int4_simd_available(void);
 

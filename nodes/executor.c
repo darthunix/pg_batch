@@ -5,6 +5,40 @@
 
 #include "internal.h"
 
+void
+pg_batch_get_int4_vector(PgBatchBridgeBatch *batch, int column,
+						 const uint64 *selected_rows,
+						 PgBatchMaterializePhase phase,
+						 PgBatchInt4Vector *result)
+{
+	PgBatchArrowView arrow;
+
+	if (unlikely(batch->ops->get_native_interface != NULL) &&
+		pg_batch_get_arrow_column(batch, column, &arrow))
+	{
+		const struct ArrowArray *array = arrow.array;
+
+		if (strcmp(arrow.schema->format, "i") != 0)
+			elog(ERROR, "pg_batch int4 kernel received a non-int4 Arrow column");
+		result->layout = PG_BATCH_INT4_PACKED;
+		result->data.packed.values = array->buffers[1];
+		result->data.packed.validity =
+			array->null_count == 0 ? NULL : array->buffers[0];
+		result->data.packed.offset = array->offset;
+	}
+	else
+	{
+		PgBatchBridgeDatumColumn datum;
+
+		pg_batch_get_datum_column(batch, column, selected_rows, phase, &datum);
+		result->layout = PG_BATCH_INT4_DATUM;
+		result->data.datum.values = datum.values;
+		result->data.datum.isnull = datum.isnull;
+		result->data.datum.available = datum.valid_rows;
+		result->data.datum.nwords = datum.nwords;
+	}
+}
+
 TupleTableSlot *
 pg_batch_result_batch_slot(PlanState *planstate)
 {

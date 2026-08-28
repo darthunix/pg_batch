@@ -11,18 +11,28 @@
 typedef struct AggSpec
 {
 	PgBatchAggKind kind;
+	/* Index into BatchAggState.inputs, or -1 for count(*). */
+	int			input;
+} AggSpec;
+
+typedef struct AggInput
+{
 	int			column;
 	Bitmapset  *column_mask;
-	int64		value;
-	bool		has_value;
-} AggSpec;
+	uint32		flags;
+	PgBatchInt4Reduction value;
+} AggInput;
 
 typedef struct BatchAggState
 {
 	CustomScanState css;
 	PlanState  *child;
 	AggSpec    *aggs;
+	AggInput   *inputs;
 	int			naggs;
+	int			ninputs;
+	int64		count_star;
+	bool		has_count_star;
 	bool		emitted;
 	uint64		input_batches;
 	uint64		input_rows;
@@ -60,12 +70,29 @@ static const CustomExecMethods pg_batch_agg_exec_methods = {
 static void
 reset_aggregate_values(BatchAggState *state)
 {
-	for (int i = 0; i < state->naggs; i++)
-	{
-		state->aggs[i].value = 0;
-		state->aggs[i].has_value = false;
-	}
+	state->count_star = 0;
+	for (int i = 0; i < state->ninputs; i++)
+		MemSet(&state->inputs[i].value, 0, sizeof(state->inputs[i].value));
 	state->emitted = false;
+}
+
+static uint32
+aggregate_flag(PgBatchAggKind kind)
+{
+	switch (kind)
+	{
+		case PG_BATCH_AGG_COUNT_COLUMN:
+			return PG_BATCH_INT4_REDUCE_COUNT;
+		case PG_BATCH_AGG_SUM_INT4:
+			return PG_BATCH_INT4_REDUCE_SUM;
+		case PG_BATCH_AGG_MIN_INT4:
+			return PG_BATCH_INT4_REDUCE_MIN;
+		case PG_BATCH_AGG_MAX_INT4:
+			return PG_BATCH_INT4_REDUCE_MAX;
+		case PG_BATCH_AGG_COUNT_STAR:
+			break;
+	}
+	pg_unreachable();
 }
 
 static void
@@ -88,20 +115,40 @@ agg_begin(CustomScanState *node, EState *estate, int eflags)
 
 	state->naggs = list_length(cscan->custom_private);
 	state->aggs = palloc0_array(AggSpec, state->naggs);
+	state->inputs = palloc0_array(AggInput, state->naggs);
 	foreach(lc, cscan->custom_private)
 	{
 		List	   *item = lfirst_node(List, lc);
 		AggSpec    *agg = &state->aggs[i++];
+		int			column = intVal(lsecond(item));
 
 		agg->kind = intVal(linitial(item));
-		agg->column = intVal(lsecond(item));
-		if (agg->kind != PG_BATCH_AGG_COUNT_STAR && agg->column < 0)
-			elog(ERROR, "pg_batch aggregate input is missing from child slot");
-		if (agg->column >= 0)
+		agg->input = -1;
+		if (agg->kind == PG_BATCH_AGG_COUNT_STAR)
 		{
-			survivor_columns = bms_add_member(survivor_columns, agg->column);
-			agg->column_mask = bms_make_singleton(agg->column);
+			state->has_count_star = true;
+			continue;
 		}
+		if (column < 0)
+			elog(ERROR, "pg_batch aggregate input is missing from child slot");
+		for (int input = 0; input < state->ninputs; input++)
+		{
+			if (state->inputs[input].column == column)
+			{
+				agg->input = input;
+				break;
+			}
+		}
+		if (agg->input < 0)
+		{
+			AggInput   *input = &state->inputs[state->ninputs];
+
+			agg->input = state->ninputs++;
+			input->column = column;
+			input->column_mask = bms_make_singleton(column);
+			survivor_columns = bms_add_member(survivor_columns, column);
+		}
+		state->inputs[agg->input].flags |= aggregate_flag(agg->kind);
 	}
 	pg_batch_set_request(child_slot, request->filter_columns,
 						 survivor_columns, true);
@@ -122,89 +169,53 @@ add_int64_checked(int64 *target, int64 addend)
 }
 
 static void
+merge_reduction(AggInput *input, const PgBatchInt4Reduction *partial)
+{
+	PgBatchInt4Reduction *value = &input->value;
+
+	if (input->flags & PG_BATCH_INT4_REDUCE_COUNT)
+		add_int64_checked(&value->count, partial->count);
+	if (!partial->has_value)
+		return;
+	if (input->flags & PG_BATCH_INT4_REDUCE_SUM)
+		add_int64_checked(&value->sum, partial->sum);
+	if (!value->has_value)
+	{
+		if (input->flags & PG_BATCH_INT4_REDUCE_MIN)
+			value->min = partial->min;
+		if (input->flags & PG_BATCH_INT4_REDUCE_MAX)
+			value->max = partial->max;
+		value->has_value = true;
+		return;
+	}
+	if ((input->flags & PG_BATCH_INT4_REDUCE_MIN) &&
+		partial->min < value->min)
+		value->min = partial->min;
+	if ((input->flags & PG_BATCH_INT4_REDUCE_MAX) &&
+		partial->max > value->max)
+		value->max = partial->max;
+}
+
+static void
 advance_aggregates(BatchAggState *state,
 				   PgBatchBridgeBatch *batch, int selected)
 {
-	for (int i = 0; i < state->naggs; i++)
+	if (state->has_count_star)
+		add_int64_checked(&state->count_star, selected);
+
+	for (int i = 0; i < state->ninputs; i++)
 	{
-		AggSpec    *agg = &state->aggs[i];
+		AggInput   *input = &state->inputs[i];
+		PgBatchInt4Vector column;
+		PgBatchInt4Reduction partial;
 
-		if (agg->kind == PG_BATCH_AGG_COUNT_STAR)
-		{
-			add_int64_checked(&agg->value, selected);
-			agg->has_value = true;
-			continue;
-		}
-
-		{
-			PgBatchArrowView column;
-
-			pg_batch_prepare_columns(batch, agg->column_mask,
+		pg_batch_prepare_columns(batch, input->column_mask,
 								 batch->selection, PG_BATCH_PROJECT_PHASE);
-			if (unlikely(batch->ops->get_native_interface != NULL) &&
-				pg_batch_get_arrow_column(batch, agg->column, &column))
-			{
-				const struct ArrowArray *array = column.array;
-				const int32 *values = array->buffers[1];
-
-				Assert(strcmp(column.schema->format, "i") == 0);
-				for (int word = 0; word < batch->nwords; word++)
-				{
-					uint64		rows = pg_batch_selection_word(batch, word);
-
-					while (rows != 0)
-					{
-						int			bitno = pg_rightmost_one_pos64(rows);
-						uint64		bit = UINT64CONST(1) << bitno;
-						int			row = word * 64 + bitno;
-
-						if (pg_batch_arrow_row_is_valid(array, row))
-						{
-							if (agg->kind == PG_BATCH_AGG_COUNT_COLUMN)
-								add_int64_checked(&agg->value, 1);
-							else
-								add_int64_checked(&agg->value,
-												  values[array->offset + row]);
-							agg->has_value = true;
-						}
-						rows &= ~bit;
-					}
-				}
-				continue;
-			}
-		}
-		{
-			PgBatchBridgeDatumColumn column;
-
-			pg_batch_get_datum_column(batch, agg->column, batch->selection,
-									  PG_BATCH_PROJECT_PHASE, &column);
-			for (int word = 0; word < batch->nwords; word++)
-			{
-				uint64		rows = pg_batch_selection_word(batch, word);
-
-				if (word >= column.nwords ||
-					(column.valid_rows[word] & rows) != rows)
-					elog(ERROR, "pg_batch source did not materialize aggregate column %d",
-						 agg->column + 1);
-				while (rows != 0)
-				{
-					int			bitno = pg_rightmost_one_pos64(rows);
-					uint64		bit = UINT64CONST(1) << bitno;
-					int			row = word * 64 + bitno;
-
-					if (!column.isnull[row])
-					{
-						if (agg->kind == PG_BATCH_AGG_COUNT_COLUMN)
-							add_int64_checked(&agg->value, 1);
-						else
-							add_int64_checked(&agg->value,
-											  DatumGetInt32(column.values[row]));
-						agg->has_value = true;
-					}
-					rows &= ~bit;
-				}
-			}
-		}
+		pg_batch_get_int4_vector(batch, input->column, batch->selection,
+								 PG_BATCH_PROJECT_PHASE, &column);
+		pg_batch_reduce_int4(&column, batch->nrows, batch->nwords,
+							 batch->selection, input->flags, &partial);
+		merge_reduction(input, &partial);
 	}
 }
 
@@ -237,15 +248,35 @@ agg_exec(CustomScanState *node)
 	for (int i = 0; i < state->naggs; i++)
 	{
 		AggSpec    *agg = &state->aggs[i];
+		PgBatchInt4Reduction *value =
+			agg->input < 0 ? NULL : &state->inputs[agg->input].value;
 
-		if (agg->kind == PG_BATCH_AGG_SUM_INT4 && !agg->has_value)
+		if (agg->kind != PG_BATCH_AGG_COUNT_STAR &&
+			agg->kind != PG_BATCH_AGG_COUNT_COLUMN && !value->has_value)
 		{
 			result->tts_values[i] = (Datum) 0;
 			result->tts_isnull[i] = true;
 		}
 		else
 		{
-			result->tts_values[i] = Int64GetDatum(agg->value);
+			switch (agg->kind)
+			{
+				case PG_BATCH_AGG_COUNT_STAR:
+					result->tts_values[i] = Int64GetDatum(state->count_star);
+					break;
+				case PG_BATCH_AGG_COUNT_COLUMN:
+					result->tts_values[i] = Int64GetDatum(value->count);
+					break;
+				case PG_BATCH_AGG_SUM_INT4:
+					result->tts_values[i] = Int64GetDatum(value->sum);
+					break;
+				case PG_BATCH_AGG_MIN_INT4:
+					result->tts_values[i] = Int32GetDatum(value->min);
+					break;
+				case PG_BATCH_AGG_MAX_INT4:
+					result->tts_values[i] = Int32GetDatum(value->max);
+					break;
+			}
 			result->tts_isnull[i] = false;
 		}
 	}
