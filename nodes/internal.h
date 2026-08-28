@@ -13,6 +13,8 @@
 
 #include "bridge.h"
 #include "arrow.h"
+#include "runtime.h"
+#include "kernels.h"
 
 #define PG_BATCH_SIZE 64
 #define PG_BATCH_ALL_ROWS UINT64_MAX
@@ -77,6 +79,7 @@ typedef enum PgBatchHeapScanMode
 
 extern bool pg_batch_enable;
 extern bool pg_batch_enable_hash_join;
+extern bool pg_batch_enable_simd;
 extern double pg_batch_bitmap_min_rows_per_page;
 extern const TupleTableSlotOps PgBatchSlotOps;
 extern const PgBatchBridgeAPI *pg_batch_bridge;
@@ -86,37 +89,6 @@ pg_batch_nrows_mask(int nrows)
 {
 	Assert(nrows > 0 && nrows <= PG_BATCH_SIZE);
 	return PG_BATCH_ALL_ROWS >> (PG_BATCH_SIZE - nrows);
-}
-
-static inline int
-pg_batch_row_count(const PgBatchBridgeBatch *batch)
-{
-	return pg_batch_bridge_selection_count(batch);
-}
-
-static inline bool
-pg_batch_has_rows(const PgBatchBridgeBatch *batch)
-{
-	if (likely(batch->nwords == 1))
-		return batch->selection[0] != 0;
-	for (int word = 0; word < batch->nwords; word++)
-	{
-		if (batch->selection[word] != 0)
-			return true;
-	}
-	return false;
-}
-
-static inline uint64
-pg_batch_selection_word(const PgBatchBridgeBatch *batch, int word)
-{
-	uint64		rows = batch->selection[word];
-	int			remaining = batch->nrows - word * 64;
-
-	Assert(word >= 0 && word < batch->nwords);
-	if (remaining < 64)
-		rows &= UINT64_MAX >> (64 - remaining);
-	return rows;
 }
 
 static inline Node *
@@ -170,26 +142,6 @@ extern void pg_batch_materialize_columns(PgBatchBridgeBatch *batch,
 extern bool pg_batch_get_arrow_column(PgBatchBridgeBatch *batch, int column,
 									  PgBatchArrowView *result);
 extern void pg_batch_select_row(TupleTableSlot *slot, int row);
-
-static inline void
-pg_batch_prepare_columns(PgBatchBridgeBatch *batch, const Bitmapset *columns,
-						 const uint64 *selected_rows,
-						 PgBatchMaterializePhase phase)
-{
-	if (columns != NULL && batch->ops->prepare_columns != NULL)
-		batch->ops->prepare_columns(batch, columns, selected_rows, phase);
-}
-
-static inline void
-pg_batch_get_datum_column(PgBatchBridgeBatch *batch, int column,
-						  const uint64 *selected_rows,
-						  PgBatchMaterializePhase phase,
-						  PgBatchBridgeDatumColumn *result)
-{
-	if (batch->ops->get_datum_column == NULL)
-		elog(ERROR, "pg_batch source cannot materialize Datum columns");
-	batch->ops->get_datum_column(batch, column, selected_rows, phase, result);
-}
 
 extern OpExpr *pg_batch_match_qual(Node *clause, uint8 *var_argno);
 extern Node *pg_batch_create_scan_state(CustomScan *cscan);

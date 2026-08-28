@@ -944,6 +944,50 @@ FDW API changed. One optional `next_batch` operation in the bridge lets an
 independent FDW bypass scalar `ForeignScan` only when a batch-aware custom path
 is selected. The normal FDW path remains usable by ordinary PostgreSQL nodes.
 
+## Reusable int4 filter kernels and SIMD
+
+This experiment moves common selection and column access into `runtime/` and
+the six built-in `int4` comparisons into `kernels/`. The scalar kernel calls a
+direct comparison instead of `FunctionCallInvoke()`. The optional SIMD kernel
+uses NEON on this ARM64 machine and is selected only for a dense selection
+word. Sparse words continue to visit only their selected rows.
+
+The first comparison repeated `run_heap_compare.sql` before and after the
+change. Each result is the median of 31 alternating samples, with ten query
+executions per sample. "Previous" is committed version `f3e2d7a`. "Scalar"
+uses the new direct kernel with `pg_batch.enable_simd = off`.
+
+| Heap query | Previous, ms | Scalar, ms | SIMD, ms | SIMD versus previous |
+|---|---:|---:|---:|---:|
+| Two dense conditions | 20.314 | 18.219 | 15.225 | -25.1% |
+| One condition rejects all rows | 11.749 | 10.993 | 9.468 | -19.4% |
+| Wide count without projection | 4.024 | 3.813 | 3.791 | -5.8% |
+| Early filter, late projection | 4.041 | 3.859 | 3.822 | -5.4% |
+| Late filter, early projection | 4.247 | 4.053 | 3.994 | -6.0% |
+
+The directory also contains `run_kernels.sql`, which alternates the ordinary
+executor, the direct scalar kernel, and SIMD in one backend. It tests both the
+heap Datum layout and packed `int32` values from the compressed source. Native
+source filtering is disabled, so these comparisons run in `PgBatchScan`.
+
+| Source and selection entering the kernels | Scalar, ms | SIMD, ms | Change |
+|---|---:|---:|---:|
+| Heap: one condition rejects all | 13.704 | 12.465 | -7.7% |
+| Heap: two dense conditions | 18.103 | 15.356 | -15.4% |
+| Heap: half survives the first condition | 16.769 | 14.592 | -13.3% |
+| Heap: sparse random second condition | 7.866 | 7.229 | -9.5% |
+| Packed `int32`: one condition rejects all | 4.841 | 3.299 | -27.5% |
+| Packed `int32`: two dense conditions | 6.948 | 4.431 | -35.8% |
+| Packed `int32`: sparse random second condition | 2.012 | 1.429 | -29.1% |
+
+In the sparse cases the first condition still receives a full selection and
+uses SIMD. The second condition receives scattered survivors and uses the
+scalar set-bit loop. The larger packed-`int32` gain comes from loading four
+values per vector without narrowing the 8-byte Datum representation. On the
+wide heap queries, tuple deformation and projection dominate, so SIMD adds
+only about 1% after the direct scalar comparison. No measured heap query was
+slower than the committed version.
+
 ## Limits of the measurements
 
 - The prototype prepares all requested filter columns before evaluating the

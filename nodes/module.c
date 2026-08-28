@@ -12,6 +12,7 @@ PGDLLEXPORT void _PG_fini(void);
 
 bool		pg_batch_enable = true;
 bool		pg_batch_enable_hash_join = true;
+bool		pg_batch_enable_simd = true;
 double		pg_batch_bitmap_min_rows_per_page = 8.0;
 const PgBatchBridgeAPI *pg_batch_bridge;
 
@@ -42,6 +43,10 @@ _PG_init(void)
 	DefineCustomBoolVariable("pg_batch.enable_hash_join",
 							 "Enable pg_batch hash join paths.", NULL,
 							 &pg_batch_enable_hash_join, true, PGC_USERSET, 0,
+							 NULL, NULL, NULL);
+	DefineCustomBoolVariable("pg_batch.enable_simd",
+							 "Use SIMD for dense supported batch filters.", NULL,
+							 &pg_batch_enable_simd, true, PGC_USERSET, 0,
 							 NULL, NULL, NULL);
 	DefineCustomRealVariable("pg_batch.bitmap_min_rows_per_page",
 							 "Minimum estimated rows per heap page for a "

@@ -39,6 +39,85 @@ FROM generate_series(1, 80) AS g;
 
 ANALYZE pg_batch_test;
 
+CREATE TEMP TABLE pg_batch_kernel_values AS
+SELECT CASE
+           WHEN g = 1 THEN '-2147483648'::integer
+           WHEN g = 2 THEN '2147483647'::integer
+           WHEN g % 17 = 0 THEN NULL
+           ELSE g - 66
+       END AS v
+FROM generate_series(1, 130) AS g;
+ANALYZE pg_batch_kernel_values;
+
+SET pg_batch.enable = on;
+SET pg_batch.enable_simd = on;
+CREATE TEMP TABLE pg_batch_kernel_simd AS
+SELECT (SELECT count(*) FROM pg_batch_kernel_values WHERE v = 0) AS eq,
+       (SELECT count(*) FROM pg_batch_kernel_values WHERE v <> 0) AS ne,
+       (SELECT count(*) FROM pg_batch_kernel_values WHERE v < 0) AS lt,
+       (SELECT count(*) FROM pg_batch_kernel_values WHERE v <= 0) AS le,
+       (SELECT count(*) FROM pg_batch_kernel_values WHERE v > 0) AS gt,
+       (SELECT count(*) FROM pg_batch_kernel_values WHERE 0 <= v) AS ge;
+
+SET pg_batch.enable_simd = off;
+CREATE TEMP TABLE pg_batch_kernel_scalar AS
+SELECT (SELECT count(*) FROM pg_batch_kernel_values WHERE v = 0) AS eq,
+       (SELECT count(*) FROM pg_batch_kernel_values WHERE v <> 0) AS ne,
+       (SELECT count(*) FROM pg_batch_kernel_values WHERE v < 0) AS lt,
+       (SELECT count(*) FROM pg_batch_kernel_values WHERE v <= 0) AS le,
+       (SELECT count(*) FROM pg_batch_kernel_values WHERE v > 0) AS gt,
+       (SELECT count(*) FROM pg_batch_kernel_values WHERE 0 <= v) AS ge;
+
+SET pg_batch.enable = off;
+CREATE TEMP TABLE pg_batch_kernel_plain AS
+SELECT (SELECT count(*) FROM pg_batch_kernel_values WHERE v = 0) AS eq,
+       (SELECT count(*) FROM pg_batch_kernel_values WHERE v <> 0) AS ne,
+       (SELECT count(*) FROM pg_batch_kernel_values WHERE v < 0) AS lt,
+       (SELECT count(*) FROM pg_batch_kernel_values WHERE v <= 0) AS le,
+       (SELECT count(*) FROM pg_batch_kernel_values WHERE v > 0) AS gt,
+       (SELECT count(*) FROM pg_batch_kernel_values WHERE 0 <= v) AS ge;
+
+SELECT NOT EXISTS (
+           (TABLE pg_batch_kernel_simd
+            EXCEPT ALL TABLE pg_batch_kernel_scalar)
+           UNION ALL
+           (TABLE pg_batch_kernel_scalar
+            EXCEPT ALL TABLE pg_batch_kernel_simd)
+       ) AS simd_matches,
+       NOT EXISTS (
+           (TABLE pg_batch_kernel_simd
+            EXCEPT ALL TABLE pg_batch_kernel_plain)
+           UNION ALL
+           (TABLE pg_batch_kernel_plain
+            EXCEPT ALL TABLE pg_batch_kernel_simd)
+       ) AS postgres_matches;
+
+SET pg_batch.enable = on;
+SET pg_batch.enable_simd = on;
+PREPARE pg_batch_kernel_parameter(integer) AS
+SELECT count(*) FROM pg_batch_kernel_values WHERE v < $1;
+EXECUTE pg_batch_kernel_parameter(0);
+EXECUTE pg_batch_kernel_parameter(NULL);
+DEALLOCATE pg_batch_kernel_parameter;
+
+CREATE FUNCTION pg_batch_test_eq(integer, integer)
+RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE STRICT LEAKPROOF
+AS 'BEGIN RETURN $1 = $2; END';
+CREATE OPERATOR === (
+    LEFTARG = integer,
+    RIGHTARG = integer,
+    FUNCTION = pg_batch_test_eq
+);
+SELECT count(*) AS fallback_count
+FROM pg_batch_kernel_values
+WHERE v === 0;
+DROP OPERATOR === (integer, integer);
+DROP FUNCTION pg_batch_test_eq(integer, integer);
+
+RESET pg_batch.enable_simd;
+
 EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
 SELECT c6 FROM pg_batch_test WHERE c2 < 10;
 

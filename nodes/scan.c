@@ -7,6 +7,7 @@
 #include "executor/executor.h"
 #include "executor/nodeCustom.h"
 #include "fmgr.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/tidbitmap.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
@@ -25,6 +26,8 @@ typedef struct BatchQualState
 	int			column;
 	uint8		var_argno;
 	bool		recheck_only;
+	bool		has_int4_kernel;
+	PgBatchInt4Op int4_op;
 } BatchQualState;
 
 typedef struct BatchScanState
@@ -73,6 +76,9 @@ init_qual(BatchQualState *qual, OpExpr *op, uint8 var_argno,
 	qual->column = var->varattno - 1;
 	qual->var_argno = var_argno;
 	qual->recheck_only = recheck_only;
+	qual->has_int4_kernel =
+		var->vartype == INT4OID && exprType(other) == INT4OID &&
+		pg_batch_int4_compare_op(op->opfuncid, var_argno, &qual->int4_op);
 	if (IsA(other, Const))
 	{
 		qual->constant.value = castNode(Const, other)->constvalue;
@@ -201,7 +207,8 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 		bool		recheck_only =
 			list_nth_int(batch_recheck_flags, i) != 0;
 
-		Assert(pg_batch_match_qual((Node *) op, &var_argno) != NULL);
+		if (pg_batch_match_qual((Node *) op, &var_argno) == NULL)
+			elog(ERROR, "pg_batch received an invalid batch condition");
 		init_qual(&state->quals[i++], op, var_argno, recheck_only,
 				  &node->ss.ps);
 	}
@@ -367,6 +374,39 @@ eval_qual(BatchQualState *qual, Datum value, bool track_function)
 	return !fcinfo->isnull && DatumGetBool(result);
 }
 
+static void
+get_int4_vector(PgBatchBridgeBatch *batch, int column_number,
+				PgBatchInt4Vector *result)
+{
+	PgBatchArrowView arrow;
+
+	if (unlikely(batch->ops->get_native_interface != NULL) &&
+		pg_batch_get_arrow_column(batch, column_number, &arrow))
+	{
+		const struct ArrowArray *array = arrow.array;
+
+		if (strcmp(arrow.schema->format, "i") != 0)
+			elog(ERROR, "pg_batch int4 kernel received a non-int4 Arrow column");
+		result->layout = PG_BATCH_INT4_PACKED;
+		result->data.packed.values = array->buffers[1];
+		result->data.packed.validity =
+			array->null_count == 0 ? NULL : array->buffers[0];
+		result->data.packed.offset = array->offset;
+	}
+	else
+	{
+		PgBatchBridgeDatumColumn datum;
+
+		pg_batch_get_datum_column(batch, column_number, batch->selection,
+								  PG_BATCH_FILTER_PHASE, &datum);
+		result->layout = PG_BATCH_INT4_DATUM;
+		result->data.datum.values = datum.values;
+		result->data.datum.isnull = datum.isnull;
+		result->data.datum.available = datum.valid_rows;
+		result->data.datum.nwords = datum.nwords;
+	}
+}
+
 static int
 filter_batch(BatchScanState *state, PgBatchSlot *bslot)
 {
@@ -387,8 +427,6 @@ filter_batch(BatchScanState *state, PgBatchSlot *bslot)
 	{
 		BatchQualState *qual = &state->quals[q];
 		NullableDatum *other = &qual->fcinfo->args[1 - qual->var_argno];
-		MemoryContext oldoperator;
-		bool		track_function;
 
 		if (qual->recheck_only && !state->page_recheck)
 		{
@@ -403,10 +441,22 @@ filter_batch(BatchScanState *state, PgBatchSlot *bslot)
 			*other = qual->constant;
 		if (other->isnull)
 			MemSet(batch->selection, 0, sizeof(uint64) * batch->nwords);
+		else if (qual->has_int4_kernel)
+		{
+			PgBatchInt4Vector column;
+
+			get_int4_vector(batch, qual->column, &column);
+			pg_batch_filter_int4(&column, batch->nrows, batch->nwords,
+								 batch->selection, qual->int4_op,
+								 DatumGetInt32(other->value),
+								 pg_batch_enable_simd);
+		}
 		else
 		{
-			track_function =
+			MemoryContext oldoperator;
+			bool		track_function =
 				pgstat_track_functions > qual->fcinfo->flinfo->fn_stats;
+
 			oldoperator = MemoryContextSwitchTo(state->operator_context);
 
 			/*
@@ -442,7 +492,7 @@ filter_batch(BatchScanState *state, PgBatchSlot *bslot)
 						}
 					}
 					MemoryContextSwitchTo(oldoperator);
-					goto qual_done;
+					goto generic_done;
 				}
 			}
 			{
@@ -474,7 +524,7 @@ filter_batch(BatchScanState *state, PgBatchSlot *bslot)
 			}
 			MemoryContextSwitchTo(oldoperator);
 		}
-qual_done:
+generic_done:
 		if (qual->other_expr != NULL)
 		{
 			other->value = (Datum) 0;

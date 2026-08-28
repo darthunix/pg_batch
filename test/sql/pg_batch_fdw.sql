@@ -84,6 +84,54 @@ SELECT count(*) AS gt_count FROM pg_batch_fdw_foreign WHERE c1 > 50;
 SELECT count(*) AS ge_count FROM pg_batch_fdw_foreign WHERE 50 <= c1;
 SELECT count(*) AS all_rows FROM pg_batch_fdw_foreign;
 
+-- Exercise the packed int32 kernel locally, including Arrow validity bits.
+SET pg_batch_fdw.pushdown = off;
+SET pg_batch.enable = on;
+SET pg_batch.enable_simd = on;
+CREATE TEMP TABLE pg_batch_fdw_kernel_simd AS
+SELECT (SELECT count(*) FROM pg_batch_fdw_foreign WHERE c2 = 50) AS eq,
+       (SELECT count(*) FROM pg_batch_fdw_foreign WHERE c2 <> 50) AS ne,
+       (SELECT count(*) FROM pg_batch_fdw_foreign WHERE c2 < 50) AS lt,
+       (SELECT count(*) FROM pg_batch_fdw_foreign WHERE c2 <= 50) AS le,
+       (SELECT count(*) FROM pg_batch_fdw_foreign WHERE c2 > 50) AS gt,
+       (SELECT count(*) FROM pg_batch_fdw_foreign WHERE 50 <= c2) AS ge;
+
+SET pg_batch.enable_simd = off;
+CREATE TEMP TABLE pg_batch_fdw_kernel_scalar AS
+SELECT (SELECT count(*) FROM pg_batch_fdw_foreign WHERE c2 = 50) AS eq,
+       (SELECT count(*) FROM pg_batch_fdw_foreign WHERE c2 <> 50) AS ne,
+       (SELECT count(*) FROM pg_batch_fdw_foreign WHERE c2 < 50) AS lt,
+       (SELECT count(*) FROM pg_batch_fdw_foreign WHERE c2 <= 50) AS le,
+       (SELECT count(*) FROM pg_batch_fdw_foreign WHERE c2 > 50) AS gt,
+       (SELECT count(*) FROM pg_batch_fdw_foreign WHERE 50 <= c2) AS ge;
+
+SET pg_batch.enable = off;
+CREATE TEMP TABLE pg_batch_fdw_kernel_plain AS
+SELECT (SELECT count(*) FROM pg_batch_fdw_foreign WHERE c2 = 50) AS eq,
+       (SELECT count(*) FROM pg_batch_fdw_foreign WHERE c2 <> 50) AS ne,
+       (SELECT count(*) FROM pg_batch_fdw_foreign WHERE c2 < 50) AS lt,
+       (SELECT count(*) FROM pg_batch_fdw_foreign WHERE c2 <= 50) AS le,
+       (SELECT count(*) FROM pg_batch_fdw_foreign WHERE c2 > 50) AS gt,
+       (SELECT count(*) FROM pg_batch_fdw_foreign WHERE 50 <= c2) AS ge;
+
+SELECT NOT EXISTS (
+           (TABLE pg_batch_fdw_kernel_simd
+            EXCEPT ALL TABLE pg_batch_fdw_kernel_scalar)
+           UNION ALL
+           (TABLE pg_batch_fdw_kernel_scalar
+            EXCEPT ALL TABLE pg_batch_fdw_kernel_simd)
+       ) AS simd_matches,
+       NOT EXISTS (
+           (TABLE pg_batch_fdw_kernel_simd
+            EXCEPT ALL TABLE pg_batch_fdw_kernel_plain)
+           UNION ALL
+           (TABLE pg_batch_fdw_kernel_plain
+            EXCEPT ALL TABLE pg_batch_fdw_kernel_simd)
+       ) AS postgres_matches;
+SET pg_batch.enable = on;
+RESET pg_batch.enable_simd;
+RESET pg_batch_fdw.pushdown;
+
 -- c2 is decoded for both record batches.  Projection columns are decoded
 -- only in the first record batch, which contains the surviving rows.
 EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
