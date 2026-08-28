@@ -5,7 +5,7 @@ whether independent extensions can exchange batches through ordinary tuple
 slots, keep source-native columns between plan nodes, and postpone conversion
 to PostgreSQL `Datum` values.
 
-The repository is split into four components:
+The repository is split into four extensions and two reusable C libraries:
 
 ```text
 nodes/  ----->  bridge/  <-----  tam/
@@ -27,6 +27,14 @@ nodes/  ----->  bridge/  <-----  tam/
 - `fdw/` is an independent Arrow IPC test source. It has both an ordinary
   row-at-a-time FDW path and a direct bridge callback that returns native
   Arrow batches to the same nodes.
+- `runtime/` provides common batch traversal, lazy Datum/native adapters, and
+  borrowed vector views. `kernels/` provides type-specific operations over
+  those views. Both are statically linked into consumers, so they add no
+  loaded module or cross-extension function-call ABI.
+
+`nodes`, `tam`, and `fdw` all consume the same runtime and kernel libraries.
+The bridge remains their only shared runtime service; the static libraries
+only remove duplicated C implementation from the extensions.
 
 The `.control` and extension SQL files retain their full extension names
 because PostgreSQL looks them up by those names. Public bridge headers are
@@ -165,6 +173,13 @@ ordinary `ForeignScan` path remains available when `pg_batch.enable` is off.
 
 ## Build and test
 
+Meson 0.61 or newer and `pkg-config` are required for the reusable libraries.
+On macOS they can be installed with:
+
+```sh
+brew install meson pkg-config
+```
+
 Apply the included PostgreSQL patch to a master checkout:
 
 ```sh
@@ -172,13 +187,25 @@ git -C ../postgres am \
     ../pg_batch/patches/postgres/0001-Expose-incremental-heap-tuple-deformation.patch
 ```
 
-Clone submodules, then build and install all four components:
+Clone submodules, then build and install all components. The top-level
+Makefile asks Meson to build the static libraries before invoking PGXS for the
+extensions:
 
 ```sh
 git submodule update --init
 make PG_CONFIG=/path/to/patched/postgres/bin/pg_config
 make PG_CONFIG=/path/to/patched/postgres/bin/pg_config install
 ```
+
+An independent PGXS extension can consume the installed libraries with:
+
+```sh
+export PKG_CONFIG_PATH="$(pg_config --pkglibdir)/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+pkg-config --cflags --libs --static pg_batch-kernels
+```
+
+`pg_batch-kernels` includes the public dependency on `pg_batch-runtime`.
+Consumers do not need paths into this source tree.
 
 Create and load them in dependency order:
 
@@ -213,7 +240,9 @@ PGPORT=5432 make \
     PG_CONFIG=/path/to/patched/postgres/bin/pg_config installcheck
 ```
 
-The suite checks heap, bitmap-index, table-AM, and FDW batches; native Arrow
+The suite also builds a separate C module through the installed `pkg-config`
+metadata, without private node headers. It checks heap, bitmap-index,
+table-AM, and FDW batches; native Arrow
 consumption; lazy `Datum` fallback; exact and pruning-only predicates;
 parameters; scalar and SIMD filter kernels; joins; rescans; early stop;
 disabled-source fallback; ABI rejection; and duplicate provider rejection.
@@ -223,10 +252,11 @@ disabled-source fallback; ABI rejection; and duplicate provider rejection.
 - `bridge/include/bridge.h` defines the common versioned ABI.
 - `bridge/include/arrow.h` defines the optional Arrow interface.
 - `bridge/bridge.c` owns the registry and slot attachments.
-- `runtime/include/` provides common selection, column access, and borrowed
-  vector views.
-- `kernels/` provides direct `int4` comparisons, reductions, and hashing,
-  with optional SIMD for dense comparisons.
+- `runtime/` builds `libpg_batch_runtime.a` and provides common selection,
+  column access, native/Datum adapters, and borrowed vector views.
+- `kernels/` builds `libpg_batch_kernels.a` and provides direct `int4`
+  comparisons, reductions, and hashing, with optional SIMD for dense
+  comparisons.
 - `nodes/planner.c` builds sequential and bitmap-backed custom plans.
 - `nodes/slot.c` implements the custom slot and heap batch source.
 - `nodes/scan.c`, `filter.c`, `hash_join.c`, and `aggregate.c` implement the

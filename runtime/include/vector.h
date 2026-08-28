@@ -46,6 +46,31 @@ typedef struct PgBatchInt4Vector
 	} data;
 } PgBatchInt4Vector;
 
+/* Initialize a borrowed view over PostgreSQL Datum arrays. */
+static inline void
+pg_batch_int4_vector_init_datum(PgBatchInt4Vector *column,
+								const Datum *values, const bool *isnull,
+								const uint64 *available, int nwords)
+{
+	column->layout = PG_BATCH_INT4_DATUM;
+	column->data.datum.values = values;
+	column->data.datum.isnull = isnull;
+	column->data.datum.available = available;
+	column->data.datum.nwords = nwords;
+}
+
+/* Initialize a borrowed view over packed int32 values and validity bits. */
+static inline void
+pg_batch_int4_vector_init_packed(PgBatchInt4Vector *column,
+								 const int32 *values, const uint8 *validity,
+								 int64 offset)
+{
+	column->layout = PG_BATCH_INT4_PACKED;
+	column->data.packed.values = values;
+	column->data.packed.validity = validity;
+	column->data.packed.offset = offset;
+}
+
 static inline bool
 pg_batch_int4_row_available(const PgBatchInt4Vector *column, int row)
 {

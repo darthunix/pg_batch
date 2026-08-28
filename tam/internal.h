@@ -7,6 +7,8 @@
 
 #include "bridge.h"
 #include "arrow.h"
+#include "kernels.h"
+#include "runtime.h"
 
 #define PG_BATCH_TAM_PROVIDER_NAME "pg_batch_compressed_tam"
 #define PG_BATCH_SIZE 64

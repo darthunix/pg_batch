@@ -396,23 +396,23 @@ prepare_quals(PgBatchFdwScan *scan)
 	scan->quals_ready = true;
 }
 
-static pg_always_inline bool
-value_matches(int32 value, PgBatchFdwOperator op, int32 scalar)
+static PgBatchInt4Op
+source_kernel_op(PgBatchFdwOperator op)
 {
 	switch (op)
 	{
 		case PG_BATCH_FDW_EQ:
-			return value == scalar;
+			return PG_BATCH_INT4_EQ;
 		case PG_BATCH_FDW_NE:
-			return value != scalar;
+			return PG_BATCH_INT4_NE;
 		case PG_BATCH_FDW_LT:
-			return value < scalar;
+			return PG_BATCH_INT4_LT;
 		case PG_BATCH_FDW_LE:
-			return value <= scalar;
+			return PG_BATCH_INT4_LE;
 		case PG_BATCH_FDW_GT:
-			return value > scalar;
+			return PG_BATCH_INT4_GT;
 		case PG_BATCH_FDW_GE:
-			return value >= scalar;
+			return PG_BATCH_INT4_GE;
 	}
 	pg_unreachable();
 }
@@ -428,8 +428,7 @@ apply_source_quals(ActiveBatch *active)
 	{
 		SourceQual *qual = &scan->quals[q];
 		ArrowArray *column;
-		const int32 *values;
-		uint64		rows = active->selection;
+		PgBatchInt4Vector vector;
 
 		if (qual->scalar.isnull)
 		{
@@ -438,19 +437,13 @@ apply_source_quals(ActiveBatch *active)
 		}
 		column = decode_column(scan, qual->attnum,
 						   PG_BATCH_BRIDGE_MATERIALIZE_FILTER);
-		values = column->buffers[1];
-		while (rows != 0)
-		{
-			int			row = pg_rightmost_one_pos64(rows);
-			uint64		bit = UINT64CONST(1) << row;
-			int64		position = column->offset + active->start + row;
-
-			if (!pg_batch_arrow_row_is_valid(column, active->start + row) ||
-				!value_matches(values[position], qual->op,
-							   DatumGetInt32(qual->scalar.value)))
-				active->selection &= ~bit;
-			rows &= ~bit;
-		}
+		pg_batch_int4_vector_init_packed(&vector, column->buffers[1],
+									 column->buffers[0],
+									 column->offset + active->start);
+		pg_batch_filter_int4(&vector, active->bridge_batch.nrows,
+							 active->bridge_batch.nwords, &active->selection,
+							 source_kernel_op(qual->op),
+							 DatumGetInt32(qual->scalar.value), true);
 	}
 	scan->stats.rows_removed += initial - pg_popcount64(active->selection);
 }

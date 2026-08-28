@@ -1,0 +1,6 @@
+Name: pg_batch-kernels
+Description: Type-specific kernels for PostgreSQL batch vectors
+Version: @PG_BATCH_VERSION@
+Requires: pg_batch-runtime
+Libs: -L@PG_PKGLIBDIR@ -lpg_batch_kernels
+Cflags: -I@PG_INCLUDEDIR_SERVER@/extension/pg_batch_kernels

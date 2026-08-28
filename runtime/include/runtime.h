@@ -11,6 +11,7 @@
 
 #include "nodes/bitmapset.h"
 
+#include "arrow.h"
 #include "bridge.h"
 #include "vector.h"
 
@@ -67,5 +68,24 @@ pg_batch_get_datum_column(PgBatchBridgeBatch *batch, int column,
 		elog(ERROR, "pg_batch source cannot materialize Datum columns");
 	batch->ops->get_datum_column(batch, column, selected_rows, phase, result);
 }
+
+/* Materialize the selected rows of every requested column as Datums. */
+extern void pg_batch_materialize_columns(PgBatchBridgeBatch *batch,
+										 const Bitmapset *columns,
+										 const uint64 *selected_rows,
+										 PgBatchBridgeMaterializePhase phase);
+
+/* Return a prepared Arrow column when the active batch publishes one. */
+extern bool pg_batch_get_arrow_column(PgBatchBridgeBatch *batch, int column,
+									  PgBatchBridgeArrowView *result);
+
+/*
+ * Return an int4 view without converting native packed values to Datums.
+ * The caller must first prepare the requested rows and column.
+ */
+extern void pg_batch_get_int4_vector(PgBatchBridgeBatch *batch, int column,
+									 const uint64 *selected_rows,
+									 PgBatchBridgeMaterializePhase phase,
+									 PgBatchInt4Vector *result);
 
 #endif							/* PG_BATCH_RUNTIME_H */

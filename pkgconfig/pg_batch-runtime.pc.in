@@ -1,0 +1,5 @@
+Name: pg_batch-runtime
+Description: Common batch views and adapters for PostgreSQL extensions
+Version: @PG_BATCH_VERSION@
+Libs: -L@PG_PKGLIBDIR@ -lpg_batch_runtime
+Cflags: -I@PG_INCLUDEDIR_SERVER@/extension/pg_batch_runtime -I@PG_INCLUDEDIR_SERVER@/extension/pg_batch_bridge

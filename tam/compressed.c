@@ -812,23 +812,23 @@ load_batch(CompressedScan *scan,
 	scan->active = active;
 }
 
-static bool
-compare_source(SourceOperator op, int32 value, int32 scalar)
+static PgBatchInt4Op
+source_kernel_op(SourceOperator op)
 {
 	switch (op)
 	{
 		case PG_BATCH_TAM_SOURCE_EQ:
-			return value == scalar;
+			return PG_BATCH_INT4_EQ;
 		case PG_BATCH_TAM_SOURCE_NE:
-			return value != scalar;
+			return PG_BATCH_INT4_NE;
 		case PG_BATCH_TAM_SOURCE_LT:
-			return value < scalar;
+			return PG_BATCH_INT4_LT;
 		case PG_BATCH_TAM_SOURCE_LE:
-			return value <= scalar;
+			return PG_BATCH_INT4_LE;
 		case PG_BATCH_TAM_SOURCE_GT:
-			return value > scalar;
+			return PG_BATCH_INT4_GT;
 		case PG_BATCH_TAM_SOURCE_GE:
-			return value >= scalar;
+			return PG_BATCH_INT4_GE;
 	}
 	pg_unreachable();
 }
@@ -845,7 +845,7 @@ filter_batch(CompressedScan *scan)
 		CompressedColumn *stored =
 			&active->batch->columns[qual->attnum - 1];
 		const int32 *values;
-		uint64		rows;
+		PgBatchInt4Vector column;
 
 		if (qual->scalar.isnull)
 		{
@@ -853,20 +853,12 @@ filter_batch(CompressedScan *scan)
 			break;
 		}
 		values = column_values(active, stored);
-		rows = active->selection;
-		while (rows != 0)
-		{
-			int			row = pg_rightmost_one_pos64(rows);
-			uint64		bit = UINT64CONST(1) << row;
-
-			if ((stored->validity[row / 8] &
-				 ((uint8) 1 << (row % 8))) == 0 ||
-				!compare_source(qual->op,
-								values[row],
-								DatumGetInt32(qual->scalar.value)))
-				active->selection &= ~bit;
-			rows &= ~bit;
-		}
+		pg_batch_int4_vector_init_packed(&column, values,
+			stored->null_count == 0 ? NULL : stored->validity, 0);
+		pg_batch_filter_int4(&column, active->bridge_batch.nrows,
+							 active->bridge_batch.nwords, &active->selection,
+							 source_kernel_op(qual->op),
+							 DatumGetInt32(qual->scalar.value), true);
 	}
 	scan->stats.rows_removed_by_source_filter +=
 		pg_popcount64(initial) - pg_popcount64(active->selection);

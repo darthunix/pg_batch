@@ -5,7 +5,9 @@ CREATE EXTENSION pg_batch;
 \getenv libdir PG_LIBDIR
 \getenv dlsuffix PG_DLSUFFIX
 \set bridge_test :libdir '/pg_batch_bridge_test' :dlsuffix
+\set kernels_test :libdir '/pg_batch_kernels_test' :dlsuffix
 LOAD :'bridge_test';
+LOAD :'kernels_test';
 LOAD 'pg_batch_tam';
 LOAD 'pg_batch';
 
@@ -17,9 +19,14 @@ CREATE FUNCTION pg_batch_bridge_test_duplicate_provider()
 RETURNS void
 AS :'bridge_test', 'pg_batch_bridge_test_duplicate_provider'
 LANGUAGE C;
+CREATE FUNCTION pg_batch_kernels_test()
+RETURNS boolean
+AS :'kernels_test', 'pg_batch_kernels_test'
+LANGUAGE C;
 
 SELECT pg_batch_bridge_test_bad_abi();
 SELECT pg_batch_bridge_test_duplicate_provider();
+SELECT pg_batch_kernels_test() AS installed_kernels_ok;
 
 SET max_parallel_workers_per_gather = 0;
 SET jit = off;

@@ -341,44 +341,6 @@ static const PgBatchBridgeBatchOps pg_batch_heap_batch_ops = {
 	.release = heap_release,
 };
 
-void
-pg_batch_materialize_columns(PgBatchBridgeBatch *batch,
-							 const Bitmapset *columns,
-							 const uint64 *selected_rows,
-							 PgBatchMaterializePhase phase)
-{
-	int			column = -1;
-
-	while (columns != NULL &&
-		   (column = bms_next_member(columns, column)) >= 0)
-	{
-		PgBatchBridgeDatumColumn ignored;
-
-		pg_batch_get_datum_column(batch, column, selected_rows, phase,
-								  &ignored);
-	}
-}
-
-bool
-pg_batch_get_arrow_column(PgBatchBridgeBatch *batch, int column,
-						  PgBatchArrowView * result)
-{
-	const		PgBatchBridgeArrowInterface *arrow;
-
-	if (batch->ops->get_native_interface == NULL)
-		return false;
-	arrow = batch->ops->get_native_interface(
-											 batch, PG_BATCH_BRIDGE_ARROW_INTERFACE_NAME,
-											 PG_BATCH_BRIDGE_ARROW_INTERFACE_VERSION);
-	if (arrow == NULL)
-		return false;
-	if (arrow->abi_version != PG_BATCH_BRIDGE_ARROW_INTERFACE_VERSION ||
-		arrow->struct_size < sizeof(PgBatchBridgeArrowInterface))
-		elog(ERROR, "pg_batch source returned an incompatible Arrow interface");
-	arrow->get_column(batch, column, result);
-	return true;
-}
-
 static void consumer_select_row(TupleTableSlot *slot,
 								PgBatchBridgeBatch *batch, int row);
 

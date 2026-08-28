@@ -9,10 +9,7 @@ OBJS = \
 	pack.o \
 	hash_join.o \
 	hash_join_spill.o \
-	aggregate.o \
-	../kernels/int4.o \
-	../kernels/int4_hash.o \
-	../kernels/int4_simd.o
+	aggregate.o
 
 EXTENSION = pg_batch
 DATA = pg_batch--0.1.sql
@@ -20,6 +17,9 @@ PG_CPPFLAGS = \
 	-I$(srcdir)/../bridge/include \
 	-I$(srcdir)/../runtime/include \
 	-I$(srcdir)/../kernels/include
+PG_BATCH_RUNTIME_LIB ?= $(abspath $(srcdir)/../build/meson-libs/runtime/libpg_batch_runtime.a)
+PG_BATCH_KERNELS_LIB ?= $(abspath $(srcdir)/../build/meson-libs/kernels/libpg_batch_kernels.a)
+SHLIB_LINK = $(PG_BATCH_KERNELS_LIB) $(PG_BATCH_RUNTIME_LIB)
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

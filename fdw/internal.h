@@ -17,6 +17,8 @@
 
 #include "bridge.h"
 #include "arrow.h"
+#include "kernels.h"
+#include "runtime.h"
 
 typedef struct ArrowArray ArrowArray;
 typedef struct ArrowArrayView ArrowArrayView;

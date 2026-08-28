@@ -137,16 +137,6 @@ extern void pg_batch_set_request(TupleTableSlot *slot,
 extern void pg_batch_load_batch(PgBatchSlot *bslot, Buffer buffer,
 								BlockNumber block, Oid table_oid,
 								const OffsetNumber *item_offsets, int nrows);
-extern void pg_batch_materialize_columns(PgBatchBridgeBatch *batch,
-										 const Bitmapset *columns,
-										 const uint64 *selected_rows,
-										 PgBatchMaterializePhase phase);
-extern bool pg_batch_get_arrow_column(PgBatchBridgeBatch *batch, int column,
-									  PgBatchArrowView *result);
-extern void pg_batch_get_int4_vector(PgBatchBridgeBatch *batch, int column,
-									 const uint64 *selected_rows,
-									 PgBatchMaterializePhase phase,
-									 PgBatchInt4Vector *result);
 extern void pg_batch_select_row(TupleTableSlot *slot, int row);
 
 extern OpExpr *pg_batch_match_qual(Node *clause, uint8 *var_argno);

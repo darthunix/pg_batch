@@ -1067,6 +1067,58 @@ one key load from the common two-key lookup while preserving exact equality.
 The regression test includes NULL keys, duplicate two-column build keys,
 packed inputs, spill, and an early scalar `LIMIT`.
 
+## Installable runtime and kernel libraries
+
+This step changes the reusable boundary rather than the executor model.
+`runtime/` and `kernels/` are now position-independent static libraries built
+and installed by Meson. `nodes/`, `tam/`, and `fdw/` link those libraries
+instead of compiling private copies. Installed headers and pkg-config files let
+an unrelated PGXS module use the same vector adapters and kernels. The
+regression test includes such a module; it is compiled only against the
+installed interface and checks Datum and packed `int32` vectors, validity
+bitmaps, non-zero vector offsets, filtering, reductions, and hashing.
+
+Moving the source adapters into the runtime also lets the compressed table AM
+and Arrow FDW use the same optional SIMD filter as `PgBatchScan`. The following
+medians compare committed version `f168bfa` with the installable-library build
+on the same release PostgreSQL server and warm data:
+
+| Exact source-filter query | `f168bfa`, ms | Libraries, ms | Change |
+|---|---:|---:|---:|
+| Compressed TAM: dense filter and sum | 5.629 | 3.766 | -33.1% |
+| Compressed TAM: 1000-row ordered range | 0.018 | 0.012 | -33.3% |
+| Compressed TAM: impossible range | 0.006 | 0.005 | -16.7% |
+| Compressed TAM: missing low-cardinality value | 0.006 | 0.006 | 0.0% |
+| Arrow FDW: two dense filters, count and sum | 8.723 | 5.664 | -35.1% |
+| Arrow FDW: filter rejects every row | 5.592 | 3.507 | -37.3% |
+| Arrow FDW: early filter, late sum | 2.535 | 2.184 | -13.8% |
+| Arrow FDW: late filter, early sum | 2.606 | 2.178 | -16.4% |
+
+The very short prune-only cases mostly measure fixed overhead. The dense cases
+show the useful change: source-side filtering now executes the shared dense
+kernel directly instead of maintaining a separate scalar loop.
+
+The hash join was compared again because its hot functions moved from objects
+linked directly into `pg_batch` to the installed archives. Both libraries were
+loaded by absolute path in separate backends, against the same tables, with
+three warm-ups and 31 samples:
+
+| Hash query | `f168bfa`, ms | Libraries, ms | Change |
+|---|---:|---:|---:|
+| One key, heap, memory | 17.013 | 15.228 | -10.5% |
+| One key, packed, memory | 10.919 | 10.303 | -5.6% |
+| Two keys, heap, memory | 24.090 | 20.410 | -15.3% |
+| Two keys, packed, memory | 13.487 | 12.496 | -7.3% |
+| One key, heap, sparse probe | 10.329 | 9.994 | -3.2% |
+| One key, heap, spill | 51.646 | 48.884 | -5.3% |
+| Two keys, packed, spill | 45.122 | 44.161 | -2.1% |
+| One key, heap, early limit | 0.841 | 0.851 | +1.2% |
+
+The only increase is 0.010 ms in the early-limit case and is within run-to-run
+noise. The full heap, packed, sparse, and spill paths did not regress. Separate
+heap-filter and reduction runs also remained within the earlier measurements;
+packed exact filters improved because they now share the SIMD kernel.
+
 ## Limits of the measurements
 
 - The prototype prepares all requested filter columns before evaluating the
