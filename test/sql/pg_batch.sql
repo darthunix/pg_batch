@@ -614,6 +614,7 @@ INSERT INTO pg_batch_join_inner
 SELECT CASE WHEN g % 31 = 0 THEN NULL ELSE g % 40 END,
        g % 7, g * 3
 FROM generate_series(1, 80) AS g;
+INSERT INTO pg_batch_join_inner VALUES (1, 1, 999), (1, 1, 1000);
 ANALYZE pg_batch_join_outer;
 ANALYZE pg_batch_join_inner;
 
@@ -667,6 +668,24 @@ SELECT NOT EXISTS (
            (TABLE plain_join_agg EXCEPT ALL TABLE batch_join_agg)
        ) AS join_aggregates_match;
 
+CREATE TEMP TABLE batch_join_three_keys AS
+SELECT count(*) AS n, sum(o.v) AS outer_total, sum(i.v) AS inner_total
+FROM pg_batch_join_outer o
+JOIN pg_batch_join_inner i
+  ON o.k1 = i.k1 AND o.k2 = i.k2 AND o.v = i.v;
+SET pg_batch.enable = off;
+CREATE TEMP TABLE plain_join_three_keys AS
+SELECT count(*) AS n, sum(o.v) AS outer_total, sum(i.v) AS inner_total
+FROM pg_batch_join_outer o
+JOIN pg_batch_join_inner i
+  ON o.k1 = i.k1 AND o.k2 = i.k2 AND o.v = i.v;
+SELECT NOT EXISTS (
+           (TABLE batch_join_three_keys EXCEPT ALL TABLE plain_join_three_keys)
+           UNION ALL
+           (TABLE plain_join_three_keys EXCEPT ALL TABLE batch_join_three_keys)
+       ) AS join_three_keys_match;
+SET pg_batch.enable = on;
+
 -- Pack a scalar child on either side of a batch hash join.
 EXPLAIN (COSTS OFF)
 SELECT count(*), sum(o.v), sum(x.payload)
@@ -693,6 +712,58 @@ SELECT count(*) AS rows, sum(g.k) AS packed_total,
 FROM generate_series(1, 130) g(k)
 JOIN pg_batch_join_inner i ON i.k1 = g.k
 WHERE i.v > 0;
+
+-- Exercise nullable multi-column hashing with packed inputs and spill.
+CREATE TABLE pg_batch_join_multi_outer(k1 int, k2 int, v int)
+USING pg_batch_compressed;
+CREATE TABLE pg_batch_join_multi_inner(k1 int, k2 int, v int)
+USING pg_batch_compressed;
+INSERT INTO pg_batch_join_multi_outer
+SELECT CASE WHEN g % 89 = 0 THEN NULL ELSE (g % 25000) + 1 END,
+       CASE WHEN g % 97 = 0 THEN NULL ELSE ((g % 25000) + 1) % 17 END,
+       g
+FROM generate_series(1, 40000) AS g;
+INSERT INTO pg_batch_join_multi_inner
+SELECT CASE WHEN g % 101 = 0 THEN NULL ELSE g END,
+       CASE WHEN g % 103 = 0 THEN NULL ELSE g % 17 END,
+       g * 3
+FROM generate_series(1, 20000) AS g;
+ANALYZE pg_batch_join_multi_outer;
+ANALYZE pg_batch_join_multi_inner;
+SELECT pg_batch_compress('pg_batch_join_multi_outer') > 0
+       AND pg_batch_compress('pg_batch_join_multi_inner') > 0
+       AS multi_join_compressed;
+
+SET work_mem = '64kB';
+SET pg_batch.enable = on;
+CREATE TEMP TABLE batch_join_multi_spill AS
+SELECT count(*) AS n, sum(o.v) AS outer_total, sum(i.v) AS inner_total
+FROM pg_batch_join_multi_outer o
+JOIN pg_batch_join_multi_inner i
+  ON o.k1 = i.k1 AND o.k2 = i.k2
+WHERE o.v % 5 <> 0;
+SELECT count(*) = 1 AS join_early_limit_ok
+FROM (
+    SELECT o.k1
+    FROM pg_batch_join_multi_outer o
+    JOIN pg_batch_join_multi_inner i
+      ON o.k1 = i.k1 AND o.k2 = i.k2
+    LIMIT 1
+) limited;
+SET pg_batch.enable = off;
+CREATE TEMP TABLE plain_join_multi_spill AS
+SELECT count(*) AS n, sum(o.v) AS outer_total, sum(i.v) AS inner_total
+FROM pg_batch_join_multi_outer o
+JOIN pg_batch_join_multi_inner i
+  ON o.k1 = i.k1 AND o.k2 = i.k2
+WHERE o.v % 5 <> 0;
+
+SELECT NOT EXISTS (
+           (TABLE batch_join_multi_spill EXCEPT ALL TABLE plain_join_multi_spill)
+           UNION ALL
+           (TABLE plain_join_multi_spill EXCEPT ALL TABLE batch_join_multi_spill)
+       ) AS join_multi_spill_match;
+RESET work_mem;
 
 -- Use the join's hash function to exercise fallback and repartitioning skew.
 CREATE TABLE pg_batch_join_spill_outer(k int, v int);
@@ -774,6 +845,8 @@ RESET enable_mergejoin;
 RESET enable_nestloop;
 DROP TABLE pg_batch_join_spill_inner;
 DROP TABLE pg_batch_join_spill_outer;
+DROP TABLE pg_batch_join_multi_inner;
+DROP TABLE pg_batch_join_multi_outer;
 DROP TABLE pg_batch_join_inner;
 DROP TABLE pg_batch_join_outer;
 

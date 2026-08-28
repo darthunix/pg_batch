@@ -1,7 +1,6 @@
 #ifndef PG_BATCH_HASH_JOIN_INTERNAL_H
 #define PG_BATCH_HASH_JOIN_INTERNAL_H
 
-#include "common/hashfn.h"
 #include "executor/nodeCustom.h"
 #include "storage/buffile.h"
 
@@ -15,9 +14,7 @@
 typedef struct InputColumn
 {
 	bool		prepared;
-	bool		arrow;
-	PgBatchArrowView arrow_view;
-	PgBatchBridgeDatumColumn datum;
+	PgBatchInt4Vector vector;
 } InputColumn;
 
 typedef struct StoredColumn
@@ -201,11 +198,13 @@ typedef struct BatchHashJoinState
 	/* Current probe batch and candidate build rows. */
 	PgBatchBridgeBatch *probe_batch;
 	InputColumn *probe_columns;
+	const PgBatchInt4Vector **hash_keys;
+	uint32		probe_hashes[PG_BATCH_SIZE];
+	uint64		probe_hash_rows;
 	int			next_probe_row;
 	int			probe_active;
 	int			probe_rows[PG_BATCH_SIZE];
 	uint32		probe_build_rows[PG_BATCH_SIZE];
-	int32	   *probe_key_values;
 	bool		probe_done_pending;
 
 	/* Lazily gathered output batch. */
@@ -232,38 +231,9 @@ typedef struct BatchHashJoinState
 static inline int32
 hash_join_input_value(const InputColumn *input, int row, bool *isnull)
 {
-	if (input->arrow)
-	{
-		const struct ArrowArray *array = input->arrow_view.array;
-		const int32 *values = array->buffers[1];
-
-		*isnull = !pg_batch_arrow_row_is_valid(array, row);
-		return *isnull ? 0 : values[array->offset + row];
-	}
-	*isnull = input->datum.isnull[row];
-	return *isnull ? 0 : DatumGetInt32(input->datum.values[row]);
-}
-
-static inline bool
-hash_join_input_row_hash(const InputColumn *columns, const int *keys,
-						 int nkeys, int row, uint32 *result)
-{
-	uint32		hash = 0;
-
-	for (int key = 0; key < nkeys; key++)
-	{
-		bool		isnull;
-		int32		value = hash_join_input_value(&columns[keys[key]], row,
-												  &isnull);
-		uint32		key_hash;
-
-		if (isnull)
-			return false;
-		key_hash = murmurhash32((uint32) value);
-		hash = key == 0 ? key_hash : hash_combine(hash, key_hash);
-	}
-	*result = hash;
-	return true;
+	Assert(input->prepared);
+	*isnull = pg_batch_int4_row_is_null(&input->vector, row);
+	return *isnull ? 0 : pg_batch_int4_row_value(&input->vector, row);
 }
 
 static inline int32
@@ -301,7 +271,8 @@ extern void hash_join_begin_spill(BatchHashJoinState *state,
 extern uint64 hash_join_spill_input_batch(BatchHashJoinState *state,
 										  PgBatchBridgeBatch *batch,
 										  InputColumn *columns, int ncolumns,
-										  const int *keys,
+										  const uint32 *hashes,
+										  uint64 hash_rows,
 										  const int *batch_columns,
 										  BufFile **files,
 										  uint64 *resident_rows);

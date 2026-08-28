@@ -1,8 +1,8 @@
 /*
  * Common operations for consumers of batches published through the bridge.
  *
- * Keep representation-specific work out of this module. It deals only with
- * the common batch envelope, its row selection, and Datum materialization.
+ * This header deals with the common batch envelope, its row selection, and
+ * Datum materialization. Borrowed physical column views live in vector.h.
  */
 #ifndef PG_BATCH_RUNTIME_H
 #define PG_BATCH_RUNTIME_H
@@ -12,6 +12,7 @@
 #include "nodes/bitmapset.h"
 
 #include "bridge.h"
+#include "vector.h"
 
 static inline int
 pg_batch_row_count(const PgBatchBridgeBatch *batch)

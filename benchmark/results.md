@@ -10,6 +10,7 @@ The hash-join measurements were added on 2026-08-26 with the same release
 build.
 The Arrow IPC FDW measurements were added on 2026-08-27 with the same build
 and database.
+The reusable hash-kernel comparison was added on 2026-08-28.
 The B-tree bitmap, BRIN, and heap sanity measurements were refreshed later that
 day after exact-page recheck elimination and the bitmap planner guard were
 added. The B-tree script temporarily removed the BRIN indexes in a transaction
@@ -1026,6 +1027,45 @@ The first generic implementation checked every requested operation for every
 value. A specialized scalar sum loop removed a small heap regression and also
 improved packed input. Since every existing aggregate case is now at least as
 fast as `da57e22`, this stage does not add separate SIMD reduction code.
+
+## Reusable int4 hash kernel
+
+This experiment compares commit `08cc120` with the reusable batch hash
+kernel. Both versions use the same PostgreSQL release build and logical test
+data. Each backend creates its own compressed snapshot before timing. Three
+warm-ups precede 31 samples, and the table reports medians. A negative change
+means that the hash-kernel version is faster.
+
+The probe side contains 1,000,000 rows and the build side contains 200,000
+unique keys. The two-key queries add `k2 = k1 % 17`, so every probe row still
+has one match. Heap cases read Datum vectors; packed cases read native `int32`
+vectors from the compressed source. The sparse query keeps only the first
+100,000 probe rows. Spill cases use 1 MB `work_mem`. The early-limit query
+builds only 1,024 keys and returns the first match.
+
+| Query | `08cc120`, ms | Hash kernel, ms | Change |
+|---|---:|---:|---:|
+| One key, heap, memory | 15.323 | 14.997 | -2.1% |
+| One key, packed, memory | 10.859 | 10.049 | -7.5% |
+| Two keys, heap, memory | 21.772 | 20.697 | -4.9% |
+| Two keys, packed, memory | 14.324 | 12.212 | -14.7% |
+| One key, heap, sparse probe | 9.777 | 9.630 | -1.5% |
+| One key, heap, spill | 55.510 | 50.271 | -9.4% |
+| Two keys, packed, spill | 52.596 | 44.954 | -14.5% |
+| One key, heap, early limit | 0.862 | 0.839 | -2.7% |
+
+The build, probe, and first spill partitioning pass now share one hash
+implementation. Build rows kept in memory no longer get hashed again after
+spill routing, and the spill writer no longer allocates a boolean validity
+array for every batch. For two keys, one dense row loop avoids writing and
+reading an intermediate hash between keys.
+
+The final key does not need a separate value comparison after combined hashes
+and all earlier keys match. `murmurhash32()` is reversible for `uint32`, and
+`hash_combine(a, b)` is reversible in `b` for a fixed `a`. This also removes
+one key load from the common two-key lookup while preserving exact equality.
+The regression test includes NULL keys, duplicate two-column build keys,
+packed inputs, spill, and an early scalar `LIMIT`.
 
 ## Limits of the measurements
 

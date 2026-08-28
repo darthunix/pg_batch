@@ -223,9 +223,10 @@ disabled-source fallback; ABI rejection; and duplicate provider rejection.
 - `bridge/include/bridge.h` defines the common versioned ABI.
 - `bridge/include/arrow.h` defines the optional Arrow interface.
 - `bridge/bridge.c` owns the registry and slot attachments.
-- `runtime/include/runtime.h` provides common selection and column access.
-- `kernels/` provides direct `int4` comparisons and scalar reductions, with
-  optional SIMD for dense comparisons.
+- `runtime/include/` provides common selection, column access, and borrowed
+  vector views.
+- `kernels/` provides direct `int4` comparisons, reductions, and hashing,
+  with optional SIMD for dense comparisons.
 - `nodes/planner.c` builds sequential and bitmap-backed custom plans.
 - `nodes/slot.c` implements the custom slot and heap batch source.
 - `nodes/scan.c`, `filter.c`, `hash_join.c`, and `aggregate.c` implement the
@@ -250,6 +251,7 @@ psql -f benchmark/run_heap_compare.sql
 psql -f benchmark/run_compressed.sql
 psql -f benchmark/run_kernels.sql
 psql -f benchmark/run_reductions.sql
+psql -f benchmark/run_hash_kernel.sql
 psql -f benchmark/run_groups.sql
 psql -f benchmark/run_brin.sql
 psql -f benchmark/run_bitmap_index.sql
@@ -268,6 +270,18 @@ and exact source filtering. Current measurements and query explanations are in
 kernels over Datum and packed int32 columns.
 `run_reductions.sql` compares scalar int4 reduction kernels over dense and
 sparse Datum and packed int32 columns.
+`run_hash_kernel.sql` compares the current hash join with another library
+over one or two heap and packed keys, including sparse, spill, and early-limit
+cases.
+
+```sh
+psql -v variant=before -v batch_library=/path/to/before/pg_batch \
+  -f benchmark/run_hash_kernel.sql
+psql -v variant=current -v setup=false \
+  -v batch_library=/path/to/current/pg_batch \
+  -f benchmark/run_hash_kernel.sql
+```
+
 `run_bitmap_index.sql` compares ordered `Index Scan`, ordinary
 `Bitmap Heap Scan`, and batch-over-bitmap execution for B-tree indexes at
 different selectivities and heap orders.

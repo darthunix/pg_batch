@@ -11,6 +11,7 @@ OBJS = \
 	hash_join_spill.o \
 	aggregate.o \
 	../kernels/int4.o \
+	../kernels/int4_hash.o \
 	../kernels/int4_simd.o
 
 EXTENSION = pg_batch

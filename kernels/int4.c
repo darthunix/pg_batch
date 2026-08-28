@@ -61,26 +61,6 @@ word_mask(int nrows, int word)
 	return UINT64_MAX >> (64 - remaining);
 }
 
-static inline bool
-row_is_null(const PgBatchInt4Vector *column, int row)
-{
-	if (column->layout == PG_BATCH_INT4_DATUM)
-		return column->data.datum.isnull[row];
-	if (column->data.packed.validity == NULL)
-		return false;
-	row += column->data.packed.offset;
-	return (column->data.packed.validity[row / 8] &
-			((uint8) 1 << (row % 8))) == 0;
-}
-
-static inline int32
-row_value(const PgBatchInt4Vector *column, int row)
-{
-	if (column->layout == PG_BATCH_INT4_DATUM)
-		return DatumGetInt32(column->data.datum.values[row]);
-	return column->data.packed.values[column->data.packed.offset + row];
-}
-
 static uint64
 scalar_compare(const PgBatchInt4Vector *column, int first_row, uint64 rows,
 			   PgBatchInt4Op op, int32 scalar)
@@ -96,9 +76,9 @@ scalar_compare(const PgBatchInt4Vector *column, int first_row, uint64 rows,
 			uint64 bit = UINT64CONST(1) << bitno; \
 			int row = first_row + bitno; \
 			int32 value; \
-			if (!row_is_null(column, row)) \
+			if (!pg_batch_int4_row_is_null(column, row)) \
 			{ \
-				value = row_value(column, row); \
+				value = pg_batch_int4_row_value(column, row); \
 				if (expression) \
 					result |= bit; \
 			} \
@@ -132,22 +112,28 @@ scalar_compare(const PgBatchInt4Vector *column, int first_row, uint64 rows,
 }
 
 static uint64
-not_null_mask(const PgBatchInt4Vector *column, int first_row, int nrows)
+not_null_mask(const PgBatchInt4Vector *column, int first_row, int nrows,
+			  uint64 rows)
 {
 	uint64		result;
 
 	if (column->layout == PG_BATCH_INT4_PACKED &&
 		column->data.packed.validity == NULL)
-		return word_mask(nrows, 0);
+		return rows;
 	if (column->layout == PG_BATCH_INT4_DATUM &&
+		rows == word_mask(nrows, 0) &&
 		memchr(column->data.datum.isnull + first_row, true, nrows) == NULL)
-		return word_mask(nrows, 0);
+		return rows;
 
 	result = 0;
-	for (int row = 0; row < nrows; row++)
+	while (rows != 0)
 	{
-		if (!row_is_null(column, first_row + row))
-			result |= UINT64CONST(1) << row;
+		int			bitno = pg_rightmost_one_pos64(rows);
+		uint64		bit = UINT64CONST(1) << bitno;
+
+		if (!pg_batch_int4_row_is_null(column, first_row + bitno))
+			result |= bit;
+		rows &= ~bit;
 	}
 	return result;
 }
@@ -183,7 +169,7 @@ pg_batch_filter_int4(const PgBatchInt4Vector *column, int nrows, int nwords,
 
 			passing = pg_batch_int4_simd_compare(column, first_row,
 											 word_nrows, op, scalar);
-			passing &= not_null_mask(column, first_row, word_nrows);
+			passing &= not_null_mask(column, first_row, word_nrows, rows);
 			selection[word] = rows & passing;
 		}
 		else
@@ -295,7 +281,7 @@ pg_batch_reduce_int4(const PgBatchInt4Vector *column, int nrows, int nwords,
 			 (column->data.datum.available[word] & rows) != rows))
 			elog(ERROR, "pg_batch int4 kernel received unavailable Datum rows");
 
-		rows &= not_null_mask(column, first_row, word_nrows);
+		rows &= not_null_mask(column, first_row, word_nrows, rows);
 		if (rows == 0)
 			continue;
 		if (flags & PG_BATCH_INT4_REDUCE_COUNT)
@@ -315,7 +301,8 @@ pg_batch_reduce_int4(const PgBatchInt4Vector *column, int nrows, int nwords,
 		if (rows == word_mask(nrows, word))
 		{
 			for (int row = first_row; row < first_row + word_nrows; row++)
-				reduce_value(result, value_flags, row_value(column, row));
+				reduce_value(result, value_flags,
+							 pg_batch_int4_row_value(column, row));
 		}
 		else
 		{
@@ -325,7 +312,8 @@ pg_batch_reduce_int4(const PgBatchInt4Vector *column, int nrows, int nwords,
 				uint64		bit = UINT64CONST(1) << bitno;
 				int			row = first_row + bitno;
 
-				reduce_value(result, value_flags, row_value(column, row));
+				reduce_value(result, value_flags,
+							 pg_batch_int4_row_value(column, row));
 				rows &= ~bit;
 			}
 		}

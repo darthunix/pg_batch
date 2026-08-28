@@ -9,6 +9,8 @@
 
 #include "postgres.h"
 
+#include "vector.h"
+
 typedef enum PgBatchInt4Op
 {
 	PG_BATCH_INT4_EQ,
@@ -18,43 +20,6 @@ typedef enum PgBatchInt4Op
 	PG_BATCH_INT4_GT,
 	PG_BATCH_INT4_GE
 } PgBatchInt4Op;
-
-typedef enum PgBatchInt4Layout
-{
-	/* PostgreSQL Datum values with one bool per NULL flag. */
-	PG_BATCH_INT4_DATUM,
-	/* Packed int32 values with an optional one-bit-per-row validity map. */
-	PG_BATCH_INT4_PACKED
-} PgBatchInt4Layout;
-
-/*
- * Borrowed view of one int4 column.
- *
- * Datum values are indexed from zero. available marks rows that the source
- * has materialized. Packed values and validity are indexed from offset;
- * validity uses one for a non-NULL row and may be NULL when all rows are
- * valid.
- */
-typedef struct PgBatchInt4Vector
-{
-	PgBatchInt4Layout layout;
-	union
-	{
-		struct
-		{
-			const Datum *values;
-			const bool *isnull;
-			const uint64 *available;
-			int			nwords;
-		} datum;
-		struct
-		{
-			const int32 *values;
-			const uint8 *validity;
-			int64		offset;
-		} packed;
-	} data;
-} PgBatchInt4Vector;
 
 /* Values that one int4 reduction pass should calculate. */
 typedef enum PgBatchInt4ReduceFlag
@@ -90,6 +55,12 @@ extern void pg_batch_reduce_int4(const PgBatchInt4Vector *column,
 								 int nrows, int nwords,
 								 const uint64 *selection, uint32 flags,
 								 PgBatchInt4Reduction *result);
+
+/* Hash selected rows and reject rows with a NULL in any key column. */
+extern void pg_batch_hash_int4(const PgBatchInt4Vector *const *keys,
+							   int nkeys, int nrows, int nwords,
+							   const uint64 *selection, uint32 *hashes,
+							   uint64 *valid_rows);
 
 extern bool pg_batch_int4_simd_available(void);
 

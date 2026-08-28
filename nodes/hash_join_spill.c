@@ -360,68 +360,54 @@ flush_spill_buffers(BatchHashJoinState *state, BufFile **files, int ncolumns)
 
 uint64
 hash_join_spill_input_batch(BatchHashJoinState *state, PgBatchBridgeBatch *batch,
-							InputColumn *columns, int ncolumns, const int *keys,
+							InputColumn *columns, int ncolumns,
+							const uint32 *hashes, uint64 hash_rows,
 							const int *batch_columns, BufFile **files,
 							uint64 *resident_rows)
 {
-	uint32	   *hashes;
-	bool	   *hash_valid;
 	int		   *next_rows;
 	int		   *used_partitions;
 	int			nused = 0;
-	uint64		accepted = 0;
+	uint64		routed_rows = hash_rows;
+	uint64		accepted = pg_popcount64(hash_rows);
 
-	hashes = MemoryContextAlloc(state->join_context,
-								sizeof(uint32) * batch->nrows);
-	hash_valid = MemoryContextAlloc(state->join_context,
-									sizeof(bool) * batch->nrows);
+	Assert(batch->nrows <= PG_BATCH_SIZE);
+	Assert(batch->nwords == 1);
 	next_rows = MemoryContextAlloc(state->join_context,
 								   sizeof(int) * batch->nrows);
 	used_partitions = MemoryContextAlloc(state->join_context,
-										 sizeof(int) * batch->nrows);
-	for (int row = 0; row < batch->nrows; row++)
-		hash_valid[row] = false;
+									 sizeof(int) * batch->nrows);
 	if (resident_rows != NULL)
 		*resident_rows = 0;
-	/* Hash each selected row once, independently of the partition count. */
-	for (int row = -1;
-		 (row = pg_batch_bridge_next_selected(batch, row)) >= 0;)
+	/* Apply routing filters to the rows already hashed by the caller. */
+	for (uint64 rows = hash_rows; rows != 0; rows &= rows - 1)
 	{
-		hash_valid[row] = hash_join_input_row_hash(columns, keys, state->nkeys,
-												   row, &hashes[row]);
-		if (hash_valid[row])
-		{
-			accepted++;
-			if (files == state->build_files && state->bloom_words != NULL)
-				bloom_add(state, hashes[row]);
-			else if (files == state->probe_files && state->bloom_usable &&
-					 !bloom_may_contain(state, hashes[row]))
-			{
-				hash_valid[row] = false;
-				state->bloom_rejected_rows++;
-			}
-			else if (files == state->probe_files)
-			{
-				int			partition = hashes[row] &
-					(state->npartitions - 1);
+		int			row = pg_rightmost_one_pos64(rows);
+		uint64		bit = UINT64CONST(1) << row;
 
-				if (!bms_is_member(partition, state->resident_partitions) &&
-					state->build_files[partition] == NULL)
-					hash_valid[row] = false;
-			}
+		if (files == state->build_files && state->bloom_words != NULL)
+			bloom_add(state, hashes[row]);
+		else if (files == state->probe_files && state->bloom_usable &&
+				 !bloom_may_contain(state, hashes[row]))
+		{
+			routed_rows &= ~bit;
+			state->bloom_rejected_rows++;
+		}
+		else if (files == state->probe_files)
+		{
+			int			partition = hashes[row] &
+				(state->npartitions - 1);
+
+			if (!bms_is_member(partition, state->resident_partitions) &&
+				state->build_files[partition] == NULL)
+				routed_rows &= ~bit;
 		}
 	}
 	if (files == state->probe_files)
 	{
-		uint64		survivors = 0;
+		uint64		survivors = routed_rows;
 
 		/* Do not materialize probe payload rejected by the complete key filter. */
-		for (int row = -1;
-			 (row = pg_batch_bridge_next_selected(batch, row)) >= 0;)
-		{
-			if (hash_valid[row])
-				survivors |= UINT64CONST(1) << row;
-		}
 		for (int column = 0; column < ncolumns && survivors != 0; column++)
 		{
 			if (!columns[column].prepared)
@@ -431,13 +417,12 @@ hash_join_spill_input_batch(BatchHashJoinState *state, PgBatchBridgeBatch *batch
 		}
 	}
 	/* Link rows by partition without rescanning the batch per partition. */
-	for (int row = -1;
-		 (row = pg_batch_bridge_next_selected(batch, row)) >= 0;)
+	while (routed_rows != 0)
 	{
+		int			row = pg_rightmost_one_pos64(routed_rows);
+		uint64		bit = UINT64CONST(1) << row;
 		int			partition;
 
-		if (!hash_valid[row])
-			continue;
 		partition = hashes[row] & (state->npartitions - 1);
 		if (bms_is_member(partition, state->resident_partitions))
 		{
@@ -445,6 +430,7 @@ hash_join_spill_input_batch(BatchHashJoinState *state, PgBatchBridgeBatch *batch
 				buffer_resident_probe_row(state, columns, row, hashes[row]);
 			else if (resident_rows != NULL)
 				*resident_rows |= UINT64CONST(1) << row;
+			routed_rows &= ~bit;
 			continue;
 		}
 		if (files == state->build_files)
@@ -454,7 +440,10 @@ hash_join_spill_input_batch(BatchHashJoinState *state, PgBatchBridgeBatch *batch
 		}
 		if (files == state->probe_files &&
 			state->build_files[partition] == NULL)
+		{
+			routed_rows &= ~bit;
 			continue;
+		}
 		if (files == state->probe_files)
 			state->spill_probe_rows++;
 		if (state->spill_partition_heads[partition] < 0)
@@ -466,6 +455,7 @@ hash_join_spill_input_batch(BatchHashJoinState *state, PgBatchBridgeBatch *batch
 			next_rows[state->spill_partition_tails[partition]] = row;
 		state->spill_partition_tails[partition] = row;
 		next_rows[row] = -1;
+		routed_rows &= ~bit;
 	}
 	for (int i = 0; i < nused; i++)
 	{
@@ -491,8 +481,6 @@ hash_join_spill_input_batch(BatchHashJoinState *state, PgBatchBridgeBatch *batch
 	}
 	pfree(used_partitions);
 	pfree(next_rows);
-	pfree(hash_valid);
-	pfree(hashes);
 	return accepted;
 }
 

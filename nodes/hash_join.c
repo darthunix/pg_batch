@@ -129,18 +129,7 @@ static void
 bind_input_column(PgBatchBridgeBatch *batch, int column, const uint64 *rows,
 				  PgBatchMaterializePhase phase, InputColumn *result)
 {
-	if (batch->ops->get_native_interface != NULL &&
-		pg_batch_get_arrow_column(batch, column, &result->arrow_view))
-	{
-		if (strcmp(result->arrow_view.schema->format, "i") != 0)
-			elog(ERROR, "pg_batch hash join expected an Arrow int32 column");
-		result->arrow = true;
-	}
-	else
-	{
-		pg_batch_get_datum_column(batch, column, rows, phase, &result->datum);
-		result->arrow = false;
-	}
+	pg_batch_get_int4_vector(batch, column, rows, phase, &result->vector);
 	result->prepared = true;
 }
 
@@ -173,10 +162,9 @@ ensure_input_row(PgBatchBridgeBatch *batch, int column, int row,
 
 	if (input->prepared)
 	{
-		if (input->arrow)
+		if (input->vector.layout == PG_BATCH_INT4_PACKED)
 			return;
-		if (row / 64 < input->datum.nwords &&
-			(input->datum.valid_rows[row / 64] & row_word) != 0)
+		if (pg_batch_int4_row_available(&input->vector, row))
 			return;
 	}
 	if (batch->nwords == 1)
@@ -192,6 +180,25 @@ ensure_input_row(PgBatchBridgeBatch *batch, int column, int row,
 								scratch_context);
 	if (allocated != NULL)
 		pfree(allocated);
+}
+
+static uint64
+hash_input_batch(BatchHashJoinState *state, PgBatchBridgeBatch *batch,
+				 InputColumn *columns, const int *keys, uint32 *hashes)
+{
+	uint64		hash_rows;
+
+	Assert(batch->nrows <= PG_BATCH_SIZE);
+	Assert(batch->nwords == 1);
+	for (int key = 0; key < state->nkeys; key++)
+	{
+		Assert(columns[keys[key]].prepared);
+		state->hash_keys[key] = &columns[keys[key]].vector;
+	}
+	pg_batch_hash_int4(state->hash_keys, state->nkeys,
+					   batch->nrows, batch->nwords, batch->selection,
+					   hashes, &hash_rows);
+	return hash_rows;
 }
 
 void
@@ -283,16 +290,6 @@ append_build_row_hash(BatchHashJoinState *state, InputColumn *columns, int row,
 }
 
 static void
-append_build_row(BatchHashJoinState *state, InputColumn *columns, int row)
-{
-	uint32		hash;
-
-	if (hash_join_input_row_hash(columns, state->inner_keys, state->nkeys,
-								 row, &hash))
-		append_build_row_hash(state, columns, row, hash);
-}
-
-static void
 limit_resident_build(BatchHashJoinState *state)
 {
 	while (!bms_is_empty(state->resident_partitions) &&
@@ -323,7 +320,8 @@ limit_resident_build(BatchHashJoinState *state)
 
 static uint64
 append_or_spill_build_batch(BatchHashJoinState *state,
-							PgBatchBridgeBatch *batch, InputColumn *columns)
+							PgBatchBridgeBatch *batch, InputColumn *columns,
+							const uint32 *hashes, uint64 hash_rows)
 {
 	uint64		resident_rows = 0;
 	uint64		accepted;
@@ -331,7 +329,7 @@ append_or_spill_build_batch(BatchHashJoinState *state,
 
 	accepted = hash_join_spill_input_batch(state, batch, columns,
 										state->build.ncolumns,
-										state->inner_keys,
+										hashes, hash_rows,
 										NULL,
 										state->build_files,
 										&resident_rows);
@@ -340,17 +338,10 @@ append_or_spill_build_batch(BatchHashJoinState *state,
 	{
 		int			row = pg_rightmost_one_pos64(rows);
 		uint64		bit = UINT64CONST(1) << row;
-		uint32		hash;
 		int			partition;
 
-		if (!hash_join_input_row_hash(columns, state->inner_keys,
-									  state->nkeys, row, &hash))
-		{
-			rows &= ~bit;
-			continue;
-		}
-		partition = hash & (state->npartitions - 1);
-		append_build_row_hash(state, columns, row, hash);
+		partition = hashes[row] & (state->npartitions - 1);
+		append_build_row_hash(state, columns, row, hashes[row]);
 		state->resident_partition_rows[partition]++;
 		state->resident_build_rows++;
 		rows &= ~bit;
@@ -375,10 +366,12 @@ build_keys_equal(BatchHashJoinState *state, uint32 left, uint32 right)
 {
 	BuildStore *store = &state->build;
 
-	/* murmurhash32() is a permutation of uint32 values. */
-	if (state->nkeys == 1)
-		return true;
-	for (int key = 0; key < state->nkeys; key++)
+	/*
+	 * murmurhash32() is a permutation of uint32 values, and hash_combine()
+	 * is reversible in its second argument. Equal combined hashes plus an
+	 * equal key prefix therefore prove that the final key is also equal.
+	 */
+	for (int key = 0; key < state->nkeys - 1; key++)
 	{
 		int			column = state->inner_keys[key];
 
@@ -453,7 +446,8 @@ build_hash_table(BatchHashJoinState *state)
 		TupleTableSlot *slot = ExecProcNode(state->inner_plan);
 		PgBatchBridgeBatch *batch;
 		InputColumn *columns;
-		int			row = -1;
+		uint32		hashes[PG_BATCH_SIZE];
+		uint64		hash_rows;
 
 		if (TupIsNull(slot))
 			break;
@@ -467,7 +461,9 @@ build_hash_table(BatchHashJoinState *state)
 			hash_join_load_input_column(batch,
 									state->inner_batch_columns[column],
 							  batch->selection, PG_BATCH_PROJECT_PHASE,
-							  &columns[column], state->join_context);
+								  &columns[column], state->join_context);
+		hash_rows = hash_input_batch(state, batch, columns,
+								 state->inner_keys, hashes);
 		if (!state->spilled &&
 			hash_join_estimated_build_memory(
 				store->nrows + pg_batch_row_count(batch),
@@ -485,10 +481,15 @@ build_hash_table(BatchHashJoinState *state)
 		}
 		if (state->spilled)
 			state->build_rows += append_or_spill_build_batch(state, batch,
-														 columns);
+													 columns, hashes, hash_rows);
 		else
-			while ((row = pg_batch_bridge_next_selected(batch, row)) >= 0)
-				append_build_row(state, columns, row);
+			while (hash_rows != 0)
+			{
+				int			row = pg_rightmost_one_pos64(hash_rows);
+
+				append_build_row_hash(state, columns, row, hashes[row]);
+				hash_rows &= hash_rows - 1;
+			}
 		pfree(columns);
 		pg_batch_bridge->finish_batch(state->inner_result_binding);
 	}
@@ -565,6 +566,8 @@ fetch_probe_batch(BatchHashJoinState *state)
 		while (!state->probe_input_done)
 		{
 			PgBatchBridgeBatch *batch;
+			uint32		hashes[PG_BATCH_SIZE];
+			uint64		hash_rows;
 
 			if (hash_join_publish_resident_probe(state, false))
 				return true;
@@ -590,9 +593,11 @@ fetch_probe_batch(BatchHashJoinState *state)
 					PG_BATCH_FILTER_PHASE, &state->probe_columns[column],
 					state->join_context);
 			}
+			hash_rows = hash_input_batch(state, batch, state->probe_columns,
+									 state->outer_keys, hashes);
 			(void) hash_join_spill_input_batch(state, batch,
 				state->probe_columns, state->nouter_columns,
-				state->outer_keys, state->outer_batch_columns,
+				hashes, hash_rows, state->outer_batch_columns,
 				state->probe_files, NULL);
 			pg_batch_bridge->finish_batch(state->outer_result_binding);
 		}
@@ -617,6 +622,10 @@ fetch_probe_batch(BatchHashJoinState *state)
 			   sizeof(InputColumn) * state->nouter_columns);
 		state->next_probe_row = -1;
 		hash_join_prepare_probe_keys(state);
+		state->probe_hash_rows = hash_input_batch(state, state->probe_batch,
+											 state->probe_columns,
+											 state->outer_keys,
+											 state->probe_hashes);
 		return true;
 	}
 }
@@ -634,7 +643,7 @@ finish_probe_batch(BatchHashJoinState *state)
 }
 
 static uint32
-find_build_head(BatchHashJoinState *state, uint32 hash, int lane)
+find_build_head(BatchHashJoinState *state, uint32 hash, int probe_row)
 {
 	BuildStore *store = &state->build;
 	uint32		bucket = (hash >> store->hash_shift) & (store->nbuckets - 1);
@@ -645,13 +654,16 @@ find_build_head(BatchHashJoinState *state, uint32 hash, int lane)
 		bool		matches = link != 0 &&
 			store->links[link - 1].hash == hash;
 
-		for (int key = state->nkeys == 1 ? 1 : 0;
-			 matches && key < state->nkeys; key++)
+		/* The combined hash proves equality of the final key; see above. */
+		for (int key = 0; matches && key < state->nkeys - 1; key++)
 		{
 			int			inner_column = state->inner_keys[key];
-			int32		probe_value =
-				state->probe_key_values[key * PG_BATCH_SIZE + lane];
+			int			outer_column = state->outer_keys[key];
+			bool		isnull;
+			int32		probe_value = hash_join_input_value(
+				&state->probe_columns[outer_column], probe_row, &isnull);
 
+			Assert(!isnull);
 			matches = store->columns[inner_column].values[link - 1] ==
 				probe_value;
 		}
@@ -662,35 +674,19 @@ find_build_head(BatchHashJoinState *state, uint32 hash, int lane)
 }
 
 static bool
-load_probe_key(BatchHashJoinState *state, int row, int lane, uint32 *hash)
+load_probe_hash(BatchHashJoinState *state, int row, uint32 *hash)
 {
-	bool		has_null = false;
-
-	*hash = state->probe_from_resident ?
-		state->resident_probe_block.hashes[row] :
-		state->probe_from_spill ?
-		state->probe_block.hashes[row] : 0;
-	for (int key = 0; key < state->nkeys; key++)
+	if (state->probe_from_resident)
+		*hash = state->resident_probe_block.hashes[row];
+	else if (state->probe_from_spill)
+		*hash = state->probe_block.hashes[row];
+	else
 	{
-		bool		isnull;
-		int			column = state->outer_keys[key];
-		int32		value = hash_join_input_value(&state->probe_columns[column], row,
-									&isnull);
-
-		if (isnull)
-		{
-			has_null = true;
-			break;
-		}
-		state->probe_key_values[key * PG_BATCH_SIZE + lane] = value;
-		if (!state->probe_from_spill)
-		{
-			uint32		key_hash = murmurhash32((uint32) value);
-
-			*hash = key == 0 ? key_hash : hash_combine(*hash, key_hash);
-		}
+		if ((state->probe_hash_rows & (UINT64CONST(1) << row)) == 0)
+			return false;
+		*hash = state->probe_hashes[row];
 	}
-	return !has_null;
+	return true;
 }
 
 static bool
@@ -706,9 +702,9 @@ load_probe_window(BatchHashJoinState *state)
 
 		state->next_probe_row = row;
 		state->probe_rows[count] = row;
-		if (load_probe_key(state, row, count, &hash))
+		if (load_probe_hash(state, row, &hash))
 		{
-			state->probe_build_rows[count] = find_build_head(state, hash, count);
+			state->probe_build_rows[count] = find_build_head(state, hash, row);
 			count++;
 		}
 	}
@@ -729,9 +725,9 @@ probe_unique_rows(BatchHashJoinState *state)
 		uint32		link;
 
 		state->next_probe_row = row;
-		if (!load_probe_key(state, row, 0, &hash))
+		if (!load_probe_hash(state, row, &hash))
 			continue;
-		link = find_build_head(state, hash, 0);
+		link = find_build_head(state, hash, row);
 		if (link != 0)
 		{
 			int			output = state->output_count++;
@@ -868,9 +864,6 @@ probe_round(BatchHashJoinState *state)
 					state->probe_rows[write] = state->probe_rows[lane];
 					state->probe_build_rows[write] =
 						state->probe_build_rows[lane];
-					for (int key = 0; key < state->nkeys; key++)
-						state->probe_key_values[key * PG_BATCH_SIZE + write] =
-							state->probe_key_values[key * PG_BATCH_SIZE + lane];
 				}
 				write++;
 			}
@@ -1132,11 +1125,9 @@ prepare_direct_output_column(BatchHashJoinState *state, OutputColumn *output,
 		{
 			int			probe_row = state->output_probe_rows[row];
 			InputColumn *input = &state->probe_columns[raw_column];
-			uint64		probe_bit = UINT64CONST(1) << probe_row;
 
 			if (!input->prepared ||
-				(!input->arrow &&
-				 (input->datum.valid_rows[probe_row / 64] & probe_bit) == 0))
+				!pg_batch_int4_row_available(&input->vector, probe_row))
 				ensure_probe_raw_column(state, raw_column, probe_row);
 			value = hash_join_input_value(input, probe_row, &isnull);
 		}
@@ -1613,8 +1604,7 @@ hash_join_begin(CustomScanState *node, EState *estate, int eflags)
 					 state->inner_batch_columns, state->ninner_columns,
 					 state->inner_keys, state->nkeys);
 	state->probe_columns = palloc0_array(InputColumn, state->nouter_columns);
-	state->probe_key_values = palloc_array(int32,
-									 state->nkeys * PG_BATCH_SIZE);
+	state->hash_keys = palloc_array(const PgBatchInt4Vector *, state->nkeys);
 	state->qual_raw_columns = bms_union(
 		expression_raw_columns((Node *) cscan->scan.plan.qual),
 		expression_raw_columns((Node *) cscan->custom_exprs));
