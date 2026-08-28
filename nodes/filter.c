@@ -11,6 +11,7 @@ typedef struct BatchFilterState
 {
 	CustomScanState css;
 	PlanState  *child;
+	PgBatchInput *input;
 	const PgBatchBridgeRequest *request;
 	TupleTableSlot *active_slot;
 	PgBatchBridgeBatch *active_batch;
@@ -86,14 +87,8 @@ filter_begin(CustomScanState *node, EState *estate, int eflags)
 
 	pg_batch_init_children(node, estate, eflags);
 	state->child = linitial(node->custom_ps);
-}
-
-static TupleTableSlot *
-filter_child_slot(BatchFilterState *state)
-{
-	CustomScanState *child = castNode(CustomScanState, state->child);
-
-	return child->ss.ss_ScanTupleSlot;
+	state->input = pg_batch_input_create(estate->es_query_cxt,
+		pg_batch_bridge, state->child, PG_BATCH_PRODUCER_NAME);
 }
 
 static int
@@ -123,13 +118,13 @@ apply_residual_quals(BatchFilterState *state,
 static void
 forward_request(BatchFilterState *state)
 {
-	TupleTableSlot *child_slot = filter_child_slot(state);
-
 	Assert(!state->request_forwarded);
 	/* The parent finalizes this request before its first ExecProcNode(). */
-	pg_batch_set_request(child_slot, state->request->filter_columns,
-						 state->request->survivor_columns,
-						 state->request->return_batch);
+	pg_batch_bridge->set_request(
+		pg_batch_input_request_binding(state->input),
+		state->request->filter_columns,
+		state->request->survivor_columns,
+		state->request->return_batch);
 	state->request_forwarded = true;
 }
 
@@ -138,23 +133,19 @@ fetch_batch(BatchFilterState *state)
 {
 	for (;;)
 	{
-		TupleTableSlot *slot;
+		PgBatchInputBatch input;
 		PgBatchBridgeBatch *batch;
 		int			rows;
 
-		slot = ExecProcNode(state->child);
-		if (TupIsNull(slot))
+		if (!pg_batch_input_advance(state->input, &input))
 			return 0;
-		batch = pg_batch_get_batch(slot);
+		batch = input.batch;
 		state->input_batches++;
 		rows = pg_batch_row_count(batch);
 		state->input_rows += rows;
-		rows = apply_residual_quals(state, slot, batch, rows);
+		rows = apply_residual_quals(state, input.slot, batch, rows);
 		if (rows == 0)
-		{
-			pg_batch_finish_batch(slot);
 			continue;
-		}
 		/* A batch-aware parent prepares survivor columns when it uses them. */
 		if (!state->request->return_batch)
 			pg_batch_materialize_columns(batch,
@@ -162,7 +153,7 @@ fetch_batch(BatchFilterState *state)
 										 batch->selection,
 										 PG_BATCH_PROJECT_PHASE);
 		state->output_rows += rows;
-		state->active_slot = slot;
+		state->active_slot = input.slot;
 		state->active_batch = batch;
 		state->next_row = pg_batch_bridge_next_selected(batch, -1);
 		return rows;
@@ -226,7 +217,6 @@ exec_row(BatchFilterState *state)
 
 		if (state->next_row < 0)
 		{
-			pg_batch_finish_batch(state->active_slot);
 			state->active_batch = NULL;
 			state->active_slot = NULL;
 			continue;
@@ -270,6 +260,7 @@ filter_rescan(CustomScanState *node)
 	state->active_slot = NULL;
 	state->next_row = 0;
 	pg_batch_rescan_children(node);
+	pg_batch_input_reset(state->input);
 }
 
 static void

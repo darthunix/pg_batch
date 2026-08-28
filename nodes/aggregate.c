@@ -27,6 +27,7 @@ typedef struct BatchAggState
 {
 	CustomScanState css;
 	PlanState  *child;
+	PgBatchInput *input;
 	AggSpec    *aggs;
 	AggInput   *inputs;
 	int			naggs;
@@ -100,23 +101,26 @@ agg_begin(CustomScanState *node, EState *estate, int eflags)
 {
 	BatchAggState *state = (BatchAggState *) node;
 	CustomScan *cscan = castNode(CustomScan, node->ss.ps.plan);
+	const char *producer_name = strVal(linitial(cscan->custom_private));
+	List	   *specs = lsecond_node(List, cscan->custom_private);
 	ListCell   *lc;
-	TupleTableSlot *child_slot;
+	PgBatchBridgeBinding *request_binding;
 	const		PgBatchBridgeRequest *request;
 	Bitmapset  *survivor_columns;
 	int			i = 0;
 
 	pg_batch_init_children(node, estate, eflags);
 	state->child = linitial(node->custom_ps);
-	child_slot = pg_batch_result_batch_slot(state->child);
-	request = pg_batch_bridge->get_request(
-										   pg_batch_slot_cast(child_slot)->binding);
+	state->input = pg_batch_input_create(estate->es_query_cxt,
+		pg_batch_bridge, state->child, producer_name);
+	request_binding = pg_batch_input_request_binding(state->input);
+	request = pg_batch_bridge->get_request(request_binding);
 	survivor_columns = bms_copy(request->survivor_columns);
 
-	state->naggs = list_length(cscan->custom_private);
+	state->naggs = list_length(specs);
 	state->aggs = palloc0_array(AggSpec, state->naggs);
 	state->inputs = palloc0_array(AggInput, state->naggs);
-	foreach(lc, cscan->custom_private)
+	foreach(lc, specs)
 	{
 		List	   *item = lfirst_node(List, lc);
 		AggSpec    *agg = &state->aggs[i++];
@@ -150,7 +154,7 @@ agg_begin(CustomScanState *node, EState *estate, int eflags)
 		}
 		state->inputs[agg->input].flags |= aggregate_flag(agg->kind);
 	}
-	pg_batch_set_request(child_slot, request->filter_columns,
+	pg_batch_bridge->set_request(request_binding, request->filter_columns,
 						 survivor_columns, true);
 	bms_free(survivor_columns);
 	reset_aggregate_values(state);
@@ -229,19 +233,17 @@ agg_exec(CustomScanState *node)
 		return ExecClearTuple(result);
 	for (;;)
 	{
-		TupleTableSlot *childslot;
+		PgBatchInputBatch input;
 		PgBatchBridgeBatch *batch;
 		int			selected;
 
-		childslot = ExecProcNode(state->child);
-		if (TupIsNull(childslot))
+		if (!pg_batch_input_advance(state->input, &input))
 			break;
-		batch = pg_batch_get_batch(childslot);
+		batch = input.batch;
 		selected = pg_batch_row_count(batch);
 		state->input_batches++;
 		state->input_rows += selected;
 		advance_aggregates(state, batch, selected);
-		pg_batch_finish_batch(childslot);
 	}
 
 	ExecClearTuple(result);
@@ -297,6 +299,7 @@ agg_rescan(CustomScanState *node)
 	BatchAggState *state = (BatchAggState *) node;
 
 	pg_batch_rescan_children(node);
+	pg_batch_input_reset(state->input);
 	reset_aggregate_values(state);
 }
 

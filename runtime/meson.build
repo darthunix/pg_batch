@@ -2,6 +2,7 @@ runtime_lib = static_library(
   'pg_batch_runtime',
   'adapter.c',
   'datum_buffer.c',
+  'input.c',
   dependencies: postgres_dep,
   include_directories: [bridge_inc, runtime_inc],
   gnu_symbol_visibility: 'hidden',

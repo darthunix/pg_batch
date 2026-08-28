@@ -27,6 +27,10 @@ CREATE FUNCTION pg_batch_datum_buffer_test()
 RETURNS boolean
 AS :'runtime_test', 'pg_batch_datum_buffer_test'
 LANGUAGE C;
+CREATE FUNCTION pg_batch_input_api_test()
+RETURNS boolean
+AS :'runtime_test', 'pg_batch_input_api_test'
+LANGUAGE C;
 SELECT pg_batch_bridge_test_bad_abi();
 ERROR:  incompatible provider ABI
 DETAIL:  Expected version 1 and at least 80 bytes, got version 2 and 80 bytes.
@@ -41,6 +45,12 @@ SELECT pg_batch_kernels_test() AS installed_kernels_ok;
 SELECT pg_batch_datum_buffer_test() AS installed_datum_buffer_ok;
  installed_datum_buffer_ok 
 ---------------------------
+ t
+(1 row)
+
+SELECT pg_batch_input_api_test() AS installed_input_api_ok;
+ installed_input_api_ok 
+------------------------
  t
 (1 row)
 

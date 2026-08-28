@@ -12,6 +12,27 @@
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(pg_batch_datum_buffer_test);
+PG_FUNCTION_INFO_V1(pg_batch_input_api_test);
+
+Datum
+pg_batch_input_api_test(PG_FUNCTION_ARGS)
+{
+	PgBatchInput *(*volatile create_fn) (MemoryContext,
+		const PgBatchBridgeAPI *, struct PlanState *, const char *) =
+		pg_batch_input_create;
+	PgBatchBridgeBinding *(*volatile binding_fn) (PgBatchInput *) =
+		pg_batch_input_request_binding;
+	bool		(*volatile next_fn) (PgBatchInput *, PgBatchInputBatch *) =
+		pg_batch_input_next;
+	bool		(*volatile advance_fn) (PgBatchInput *, PgBatchInputBatch *) =
+		pg_batch_input_advance;
+	void		(*volatile finish_fn) (PgBatchInput *) = pg_batch_input_finish;
+	void		(*volatile reset_fn) (PgBatchInput *) = pg_batch_input_reset;
+
+	PG_RETURN_BOOL(create_fn != NULL && binding_fn != NULL &&
+				   next_fn != NULL && advance_fn != NULL &&
+				   finish_fn != NULL && reset_fn != NULL);
+}
 
 static bool
 text_matches(Datum value, int row)

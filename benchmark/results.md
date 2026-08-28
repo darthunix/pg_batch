@@ -1149,6 +1149,67 @@ has a small per-row cost, while retaining the arrays removes per-batch array
 allocations. Dedicated by-value paths keep the common one- and two-column
 cases within the threshold without exposing the buffer representation.
 
+## Reusable batch child input
+
+The filter, aggregate, and hash join nodes previously implemented the same
+producer lookup and batch lifetime rules separately. In particular, a
+pass-through producer may receive its request through one slot but return a
+different slot owned by its child. Every consumer therefore had to remember
+both bindings and repeat the same error checks.
+
+The runtime now provides an opaque `PgBatchInput`. It resolves the named
+producer and request binding once, caches the binding of the actual returned
+slot, and owns the next, finish, advance, and rescan state. `advance` combines
+finishing the previous batch with fetching the next one for dense loops. The
+filter, aggregate, and both hash join inputs use this object. The aggregate
+planner also uses the producer's public output layout instead of recognizing
+specific `pg_batch` plan methods, so another registered producer can feed
+`PgBatchAgg` directly.
+
+An external PGXS test links against all installed input functions without any
+private node header. Release and assertion-enabled builds both pass the two
+regression suites.
+
+Performance was compared with committed version `ceeaa1f`. The node libraries
+were loaded by absolute path in separate backends over the same warm tables.
+The focused input test used five warm-ups and 31 samples, with 20 executions
+per sample. Baseline and current backends ran as a simultaneous pair; this
+inflates absolute times but keeps scheduler and thermal changes common to both
+libraries. The table is the second paired run; the first pair showed the same
+result within 0.3%, except for one unrelated system pause.
+
+| Input workload | `ceeaa1f`, ms | Input object, ms | Change |
+|---|---:|---:|---:|
+| Full batches, no columns | 4.771 | 4.869 | +2.1% |
+| Dense filter pass-through | 9.940 | 9.946 | +0.1% |
+| Early filter, late projection | 4.827 | 4.833 | +0.1% |
+| Count and sum on one column | 14.123 | 14.082 | -0.3% |
+
+The no-column query crosses the shared input boundary about 88,000 times and
+is the most sensitive fixed-overhead case. Its increase remains below the 3%
+threshold after the hot advance path marks the borrowed batch consumed
+directly. The other focused cases are unchanged.
+
+The existing hash benchmark used three warm-ups and 31 samples. A clean
+adjacent baseline/current pair covered memory, spill, sparse selection, early
+stop, packed columns, and a scalar input collected by `PgBatchPack`:
+
+| Hash workload | `ceeaa1f`, ms | Input object, ms | Change |
+|---|---:|---:|---:|
+| One key, heap, memory | 15.716 | 15.961 | +1.6% |
+| One key, packed, memory | 10.852 | 10.823 | -0.3% |
+| Two keys, heap, memory | 20.676 | 21.065 | +1.9% |
+| Two keys, packed, memory | 12.997 | 13.183 | +1.4% |
+| One key, heap, sparse probe | 10.127 | 10.127 | 0.0% |
+| One key, heap, spill | 50.950 | 51.648 | +1.4% |
+| Two keys, packed, spill | 46.388 | 45.954 | -0.9% |
+| One key, scalar probe, memory | 21.067 | 20.969 | -0.5% |
+| One key, heap, early limit | 0.873 | 0.884 | +1.3% |
+
+The mixed-width heap cases also stayed within the threshold: the four batch
+medians changed by +0.3% to +2.4%. No tested filter, aggregate, in-memory
+join, mixed input, spill, or early-stop case regressed by 3%.
+
 ## Limits of the measurements
 
 - The prototype prepares all requested filter columns before evaluating the

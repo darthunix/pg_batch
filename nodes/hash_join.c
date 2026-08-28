@@ -99,32 +99,6 @@ request_side_columns(PgBatchBridgeBinding *binding,
 	pfree(key_columns);
 }
 
-/*
- * The binding used to configure a child need not own its returned batch. A
- * pass-through node may return the original source slot after filtering its
- * batch in place. Cache the returned slot's binding so the bridge lookup is
- * repeated only when a child changes slots.
- */
-static PgBatchBridgeBatch *
-get_result_batch(TupleTableSlot *slot, TupleTableSlot **cached_slot,
-				 PgBatchBridgeBinding **cached_binding, const char *side)
-{
-	PgBatchBridgeBatch *batch;
-
-	if (slot != *cached_slot)
-	{
-		*cached_slot = slot;
-		*cached_binding = pg_batch_bridge->find_binding(slot);
-	}
-	if (*cached_binding == NULL)
-		elog(ERROR, "pg_batch %s producer returned a slot without a batch binding",
-			 side);
-	batch = pg_batch_bridge->get_batch(*cached_binding);
-	if (batch == NULL)
-		elog(ERROR, "pg_batch %s producer returned no batch", side);
-	return batch;
-}
-
 static void
 bind_input_column(PgBatchBridgeBatch *batch, int column, const uint64 *rows,
 				  PgBatchMaterializePhase phase, InputColumn *result)
@@ -443,16 +417,15 @@ build_hash_table(BatchHashJoinState *state)
 							 estimated_rows);
 	for (;;)
 	{
-		TupleTableSlot *slot = ExecProcNode(state->inner_plan);
+		PgBatchInputBatch input;
 		PgBatchBridgeBatch *batch;
 		InputColumn *columns;
 		uint32		hashes[PG_BATCH_SIZE];
 		uint64		hash_rows;
 
-		if (TupIsNull(slot))
+		if (!pg_batch_input_advance(state->inner_input, &input))
 			break;
-		batch = get_result_batch(slot, &state->inner_result_slot,
-							 &state->inner_result_binding, "build");
+		batch = input.batch;
 		state->build_batches++;
 		state->build_input_rows += pg_batch_row_count(batch);
 		columns = MemoryContextAllocZero(state->join_context,
@@ -491,7 +464,6 @@ build_hash_table(BatchHashJoinState *state)
 				hash_rows &= hash_rows - 1;
 			}
 		pfree(columns);
-		pg_batch_bridge->finish_batch(state->inner_result_binding);
 	}
 	if (state->spilled)
 	{
@@ -555,8 +527,6 @@ hash_join_prepare_probe_keys(BatchHashJoinState *state)
 static bool
 fetch_probe_batch(BatchHashJoinState *state)
 {
-	TupleTableSlot *slot;
-
 	if (state->spilled)
 	{
 		if (state->build_rows == 0)
@@ -565,21 +535,20 @@ fetch_probe_batch(BatchHashJoinState *state)
 			return hash_join_fetch_spilled_probe_batch(state);
 		while (!state->probe_input_done)
 		{
+			PgBatchInputBatch input;
 			PgBatchBridgeBatch *batch;
 			uint32		hashes[PG_BATCH_SIZE];
 			uint64		hash_rows;
 
 			if (hash_join_publish_resident_probe(state, false))
 				return true;
-			slot = ExecProcNode(state->outer_plan);
-			if (TupIsNull(slot))
+			if (!pg_batch_input_advance(state->outer_input, &input))
 			{
 				hash_join_finish_spilled_probe(state);
 				state->probe_input_done = true;
 				continue;
 			}
-			batch = get_result_batch(slot, &state->outer_result_slot,
-								 &state->outer_result_binding, "probe");
+			batch = input.batch;
 			state->probe_batches++;
 			state->probe_rows_seen += pg_batch_row_count(batch);
 			MemSet(state->probe_columns, 0,
@@ -599,7 +568,6 @@ fetch_probe_batch(BatchHashJoinState *state)
 				state->probe_columns, state->nouter_columns,
 				hashes, hash_rows, state->outer_batch_columns,
 				state->probe_files, NULL);
-			pg_batch_bridge->finish_batch(state->outer_result_binding);
 		}
 		if (hash_join_publish_resident_probe(state, true))
 			return true;
@@ -610,11 +578,11 @@ fetch_probe_batch(BatchHashJoinState *state)
 	}
 	for (;;)
 	{
-		slot = ExecProcNode(state->outer_plan);
-		if (TupIsNull(slot))
+		PgBatchInputBatch input;
+
+		if (!pg_batch_input_advance(state->outer_input, &input))
 			return false;
-		state->probe_batch = get_result_batch(slot, &state->outer_result_slot,
-									&state->outer_result_binding, "probe");
+		state->probe_batch = input.batch;
 		state->probe_from_spill = false;
 		state->probe_batches++;
 		state->probe_rows_seen += pg_batch_row_count(state->probe_batch);
@@ -637,8 +605,6 @@ finish_probe_batch(BatchHashJoinState *state)
 		return;
 	if (state->probe_from_resident)
 		hash_join_finish_resident_probe(state);
-	else if (!state->probe_from_spill)
-		pg_batch_bridge->finish_batch(state->outer_result_binding);
 	state->probe_batch = NULL;
 }
 
@@ -1576,19 +1542,10 @@ hash_join_begin(CustomScanState *node, EState *estate, int eflags)
 	pg_batch_init_children(node, estate, eflags);
 	state->outer_plan = linitial(node->custom_ps);
 	state->inner_plan = lsecond(node->custom_ps);
-	state->outer_producer =
-		pg_batch_bridge->get_producer(outer_producer_name);
-	state->inner_producer =
-		pg_batch_bridge->get_producer(inner_producer_name);
-	if (state->outer_producer == NULL || state->inner_producer == NULL)
-		elog(ERROR, "pg_batch hash join producer is not registered");
-	state->outer_request_binding =
-		state->outer_producer->get_request_binding(state->outer_plan);
-	state->inner_request_binding =
-		state->inner_producer->get_request_binding(state->inner_plan);
-	if (state->outer_request_binding == NULL ||
-		state->inner_request_binding == NULL)
-		elog(ERROR, "pg_batch hash join producer has no request binding");
+	state->outer_input = pg_batch_input_create(state->join_context,
+		pg_batch_bridge, state->outer_plan, outer_producer_name);
+	state->inner_input = pg_batch_input_create(state->join_context,
+		pg_batch_bridge, state->inner_plan, inner_producer_name);
 	for (int key = 0; key < state->nkeys; key++)
 	{
 		state->outer_key_columns = bms_add_member(state->outer_key_columns,
@@ -1597,10 +1554,10 @@ hash_join_begin(CustomScanState *node, EState *estate, int eflags)
 			bms_add_member(state->spill_outer_key_columns,
 						   state->outer_keys[key]);
 	}
-	request_side_columns(state->outer_request_binding,
+	request_side_columns(pg_batch_input_request_binding(state->outer_input),
 					 state->outer_batch_columns, state->nouter_columns,
 					 state->outer_keys, state->nkeys);
-	request_side_columns(state->inner_request_binding,
+	request_side_columns(pg_batch_input_request_binding(state->inner_input),
 					 state->inner_batch_columns, state->ninner_columns,
 					 state->inner_keys, state->nkeys);
 	state->probe_columns = palloc0_array(InputColumn, state->nouter_columns);
@@ -1706,6 +1663,8 @@ hash_join_rescan(CustomScanState *node)
 	state->spill_pages_read = 0;
 	state->peak_memory = 0;
 	pg_batch_rescan_children(node);
+	pg_batch_input_reset(state->outer_input);
+	pg_batch_input_reset(state->inner_input);
 }
 
 static void

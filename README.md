@@ -28,9 +28,10 @@ nodes/  ----->  bridge/  <-----  tam/
   row-at-a-time FDW path and a direct bridge callback that returns native
   Arrow batches to the same nodes.
 - `runtime/` provides common batch traversal, lazy Datum/native adapters,
-  borrowed vector views, and an owned Datum buffer for collecting scalar
-  slots. `kernels/` provides type-specific operations over those views. Both
-  are statically linked into consumers, so they add no loaded module or
+  borrowed vector views, an owned Datum buffer for collecting scalar slots,
+  and an opaque input object for consuming any registered batch producer.
+  `kernels/` provides type-specific operations over those views. Both are
+  statically linked into consumers, so they add no loaded module or
   cross-extension function-call ABI.
 
 `nodes`, `tam`, and `fdw` all consume the same runtime and kernel libraries.
@@ -71,6 +72,12 @@ opaque `PgBatchBridgeBinding *`. Batch-aware nodes retain that pointer and use
 it directly; the test table access method performs one lookup for each batch it
 returns.
 
+Batch consumers use `PgBatchInput` to keep the producer, request binding, and
+actual returned slot binding together. This matters for pass-through nodes:
+the slot that receives a request need not be the slot that later publishes a
+batch. The input object caches that returned binding and provides explicit
+next, finish, advance, and rescan transitions without exposing its state.
+
 The bridge does not contain table-access-method policy or expression logic. It
 only owns the common ABI, source registry, slot attachments, selection bitmap,
 and batch lifetime transitions.
@@ -96,8 +103,10 @@ page because BRIN publishes complete lossy pages.
 
 `PgBatchFilterProject` checks residual expressions, updates the selection
 bitmap, and requests projection columns only for survivors. `PgBatchAgg`
-consumes full batches for `count(*)`, `count(column)`, and `sum(int4)` without
-turning them into a row stream.
+consumes full batches for `count(*)`, `count(column)`, `sum(int4)`,
+`min(int4)`, and `max(int4)` without turning them into a row stream. Its
+planner asks the registered producer for the output-column layout, so it is
+not tied to a private node or slot type.
 
 `PgBatchHashJoin` is a deliberately narrow `int4` experiment. It supports a
 serial, unparameterized inner join with one or more direct `int4 = int4` hash
@@ -242,9 +251,10 @@ PGPORT=5432 make \
 ```
 
 The suite also builds separate C modules through the installed `pkg-config`
-metadata, without private node headers. They check the reusable kernels and a
-70-row owned Datum buffer containing by-value, copied by-reference, and NULL
-values. The SQL tests cover heap, bitmap-index, table-AM, and FDW batches;
+metadata, without private node headers. They check the reusable kernels, the
+public batch-input symbols, and a 70-row owned Datum buffer containing
+by-value, copied by-reference, and NULL values. The SQL tests cover heap,
+bitmap-index, table-AM, and FDW batches;
 native Arrow consumption; lazy `Datum` fallback; exact and pruning-only
 predicates; parameters; joins; rescans; early stop; disabled-source fallback;
 ABI rejection; and duplicate provider rejection.
@@ -256,7 +266,8 @@ ABI rejection; and duplicate provider rejection.
 - `bridge/bridge.c` owns the registry and slot attachments.
 - `runtime/` builds `libpg_batch_runtime.a` and provides common selection,
   column access, native/Datum adapters, borrowed vector views, and the
-  reusable scalar-to-Datum batch buffer used by `PgBatchPack`.
+  reusable scalar-to-Datum batch buffer used by `PgBatchPack`. Its opaque
+  `PgBatchInput` also implements the common child-producer lifecycle.
 - `kernels/` builds `libpg_batch_kernels.a` and provides direct `int4`
   comparisons, reductions, and hashing, with optional SIMD for dense
   comparisons.
@@ -286,6 +297,8 @@ psql -f benchmark/run_kernels.sql
 psql -f benchmark/run_reductions.sql
 psql -f benchmark/run_hash_kernel.sql
 psql -f benchmark/run_pack.sql
+psql -f benchmark/run_input.sql
+psql -f benchmark/run_mixed.sql
 psql -f benchmark/run_groups.sql
 psql -f benchmark/run_brin.sql
 psql -f benchmark/run_bitmap_index.sql
@@ -306,9 +319,12 @@ kernels over Datum and packed int32 columns.
 sparse Datum and packed int32 columns.
 `run_hash_kernel.sql` compares the current hash join with another library
 over one or two heap and packed keys, including sparse, spill, and early-limit
-cases.
+cases. It also covers a scalar `generate_series` input packed below the join.
 `run_pack.sql` compares two node libraries while `PgBatchPack` collects one or
 two `Datum` columns from a large scalar `generate_series` input.
+`run_input.sql` isolates the shared producer-input lifecycle with empty and
+dense filters, a late projection, and fused aggregates. It accepts the same
+`batch_library`, `variant`, and `repetitions` variables.
 
 ```sh
 psql -v variant=before -v batch_library=/path/to/before/pg_batch \

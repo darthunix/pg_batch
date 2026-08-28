@@ -1,6 +1,14 @@
 \set ON_ERROR_STOP on
 
+\if :{?batch_library}
+LOAD :'batch_library';
+\else
 LOAD 'pg_batch';
+\endif
+\if :{?variant}
+\else
+\set variant current
+\endif
 SET max_parallel_workers_per_gather = 0;
 SET jit = off;
 SET synchronize_seqscans = off;
@@ -96,7 +104,7 @@ SELECT pg_batch_measure_mixed('late filter, early projection',
                               'batch_late_early_sum',
                               'plain_late_early_sum');
 
-SELECT test, executor,
+SELECT :'variant' AS variant, test, executor,
        round(percentile_disc(0.5) WITHIN GROUP (ORDER BY milliseconds)::numeric,
              3) AS median_ms,
        round(avg(milliseconds)::numeric, 3) AS average_ms

@@ -119,6 +119,12 @@ SELECT pg_temp.pg_batch_measure_hash(
            WHERE p.v <= 100000$query$,
     '64MB', :repetitions);
 SELECT pg_temp.pg_batch_measure_hash(
+    'one key, scalar probe, memory',
+    $query$SELECT count(*)
+           FROM pg_batch_hash_probe p
+           JOIN generate_series(1, 200000) g(k) ON p.k1 = g.k$query$,
+    '64MB', :repetitions);
+SELECT pg_temp.pg_batch_measure_hash(
     'one key, heap, spill',
     $query$SELECT count(*), sum(p.v), sum(b.v)
            FROM pg_batch_hash_probe p

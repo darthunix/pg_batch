@@ -18,6 +18,16 @@
 /* A reusable owner of an eagerly materialized column-major Datum batch. */
 typedef struct PgBatchDatumBuffer PgBatchDatumBuffer;
 
+/* Cached execution state for consuming batches from one plan child. */
+typedef struct PgBatchInput PgBatchInput;
+
+/* Borrowed result of one successful input fetch. */
+typedef struct PgBatchInputBatch
+{
+	TupleTableSlot *slot;
+	PgBatchBridgeBatch *batch;
+} PgBatchInputBatch;
+
 static inline int
 pg_batch_row_count(const PgBatchBridgeBatch *batch)
 {
@@ -123,5 +133,39 @@ extern void pg_batch_datum_buffer_append_slot(PgBatchDatumBuffer *buffer,
  */
 extern PgBatchBridgeBatch *pg_batch_datum_buffer_finish(
 	PgBatchDatumBuffer *buffer, Oid table_oid);
+
+/*
+ * Wrap a child registered as producer_name. The input does not own child or
+ * initialize it. The producer and its request binding must remain registered
+ * for the lifetime of the input.
+ */
+extern PgBatchInput *pg_batch_input_create(
+	MemoryContext parent_context, const PgBatchBridgeAPI *bridge,
+	struct PlanState *child, const char *producer_name);
+
+/* Return the stable binding through which the child request is configured. */
+extern PgBatchBridgeBinding *pg_batch_input_request_binding(
+	PgBatchInput *input);
+
+/*
+ * Fetch the next child result and resolve its active batch. A pass-through
+ * producer may return a slot different from its request binding's slot.
+ * The returned pointers remain owned by the child and bridge.
+ */
+extern bool pg_batch_input_next(PgBatchInput *input,
+	PgBatchInputBatch *result);
+
+/* Finish the current batch, if any, then fetch the next one. */
+extern bool pg_batch_input_advance(PgBatchInput *input,
+	PgBatchInputBatch *result);
+
+/* Mark the current batch consumed before a later next() call. */
+extern void pg_batch_input_finish(PgBatchInput *input);
+
+/*
+ * Forget cached execution pointers after the caller has rescanned the child.
+ * The child is responsible for releasing any batch that was still active.
+ */
+extern void pg_batch_input_reset(PgBatchInput *input);
 
 #endif							/* PG_BATCH_RUNTIME_H */

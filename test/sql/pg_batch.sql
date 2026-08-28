@@ -29,11 +29,16 @@ CREATE FUNCTION pg_batch_datum_buffer_test()
 RETURNS boolean
 AS :'runtime_test', 'pg_batch_datum_buffer_test'
 LANGUAGE C;
+CREATE FUNCTION pg_batch_input_api_test()
+RETURNS boolean
+AS :'runtime_test', 'pg_batch_input_api_test'
+LANGUAGE C;
 
 SELECT pg_batch_bridge_test_bad_abi();
 SELECT pg_batch_bridge_test_duplicate_provider();
 SELECT pg_batch_kernels_test() AS installed_kernels_ok;
 SELECT pg_batch_datum_buffer_test() AS installed_datum_buffer_ok;
+SELECT pg_batch_input_api_test() AS installed_input_api_ok;
 
 SET max_parallel_workers_per_gather = 0;
 SET jit = off;

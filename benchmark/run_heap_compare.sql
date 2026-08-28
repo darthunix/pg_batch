@@ -1,6 +1,14 @@
 \set ON_ERROR_STOP on
 
+\if :{?batch_library}
+LOAD :'batch_library';
+\else
 LOAD 'pg_batch';
+\endif
+\if :{?variant}
+\else
+\set variant current
+\endif
 SET max_parallel_workers_per_gather = 0;
 SET jit = off;
 SET enable_bitmapscan = off;
@@ -101,7 +109,8 @@ SELECT pg_batch_measure_heap('wide late filter early projection',
 SELECT pg_batch_measure_heap('wide count without projection',
                              'plain_wide_count', 'batch_wide_count');
 
-SELECT heap.test,
+SELECT :'variant' AS variant,
+       heap.test,
        round(percentile_cont(0.5) WITHIN GROUP
                  (ORDER BY heap.milliseconds)::numeric, 3) AS heap_ms,
        round(percentile_cont(0.5) WITHIN GROUP

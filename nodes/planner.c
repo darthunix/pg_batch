@@ -960,22 +960,26 @@ query_aggregate_specs(PlannerInfo *root)
 }
 
 static Path *
-find_batch_path(RelOptInfo *input_rel)
+find_batch_path(RelOptInfo *input_rel, const char **producer_name)
 {
 	Path	   *best = NULL;
+	const PgBatchBridgeProducerOps *best_producer = NULL;
 	ListCell   *lc;
 
 	foreach(lc, input_rel->pathlist)
 	{
 		Path	   *path = lfirst(lc);
+		const PgBatchBridgeProducerOps *producer =
+			pg_batch_bridge->find_producer(path);
 
-		if (IsA(path, CustomPath) &&
-			(castNode(CustomPath, path)->methods == &pg_batch_base_path_methods ||
-			 castNode(CustomPath, path)->methods ==
-			 &pg_batch_hash_join_path_methods) &&
+		if (producer != NULL &&
 			(best == NULL || path->total_cost < best->total_cost))
+		{
 			best = path;
+			best_producer = producer;
+		}
 	}
+	*producer_name = best_producer == NULL ? NULL : best_producer->producer_name;
 	return best;
 }
 
@@ -987,6 +991,7 @@ create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	Path	   *child;
 	CustomPath *path;
 	List	   *agg_specs;
+	const char *producer_name;
 
 	if (previous_create_upper_paths_hook != NULL)
 		previous_create_upper_paths_hook(root, stage, input_rel, output_rel,
@@ -996,7 +1001,7 @@ create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	agg_specs = query_aggregate_specs(root);
 	if (agg_specs == NIL)
 		return;
-	child = find_batch_path(input_rel);
+	child = find_batch_path(input_rel, &producer_name);
 	if (child == NULL)
 		return;
 
@@ -1009,7 +1014,8 @@ create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	path->path.total_cost = child->total_cost + cpu_operator_cost * child->rows;
 	path->path.disabled_nodes = child->disabled_nodes;
 	path->custom_paths = list_make1(child);
-	path->custom_private = agg_specs;
+	path->custom_private =
+		list_make2(makeString(pstrdup(producer_name)), agg_specs);
 	path->methods = &pg_batch_agg_path_methods;
 	add_path(output_rel, &path->path);
 }
@@ -1429,12 +1435,27 @@ plan_aggregate(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 {
 	CustomScan *agg;
 	Plan	   *child;
+	const char *producer_name = strVal(linitial(best_path->custom_private));
+	List	   *agg_specs = lsecond_node(List, best_path->custom_private);
+	const PgBatchBridgeProducerOps *producer;
+	PgBatchBridgeOutputLayout layout;
 	List	   *runtime_specs = NIL;
 
 	Assert(list_length(custom_plans) == 1);
+	Assert(list_length(best_path->custom_private) == 2);
 	Assert(clauses == NIL);
 	child = linitial(custom_plans);
-	foreach_ptr(List, spec, best_path->custom_private)
+	producer = pg_batch_bridge->get_producer(producer_name);
+	if (producer == NULL)
+		elog(ERROR, "pg_batch producer \"%s\" is not registered",
+			 producer_name);
+	MemSet(&layout, 0, sizeof(layout));
+	producer->get_output_layout(child, &layout);
+	if (layout.ncolumns != list_length(child->targetlist) ||
+		(layout.ncolumns > 0 && layout.batch_columns == NULL))
+		elog(ERROR, "pg_batch producer \"%s\" returned an invalid output layout",
+			 producer_name);
+	foreach_ptr(List, spec, agg_specs)
 	{
 		PgBatchAggKind kind = intVal(linitial(spec));
 		Node	   *expr = lsecond(spec);
@@ -1442,31 +1463,11 @@ plan_aggregate(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 
 		if (expr != NULL)
 		{
-			if (IsA(child, CustomScan) &&
-				castNode(CustomScan, child)->methods ==
-				&pg_batch_filter_plan_methods)
-			{
-				Var		   *var = castNode(Var, pg_batch_strip_relabel(expr));
-				List	   *source_attnums = linitial(
-					castNode(CustomScan, child)->custom_private);
+			int			position = target_expression_position(child->targetlist,
+													 expr);
 
-				column = source_attnum_column(source_attnums, var->varattno);
-			}
-			else
-			{
-				int			position = 0;
-
-				foreach_ptr(TargetEntry, tle, child->targetlist)
-				{
-					if (equal(pg_batch_strip_relabel((Node *) tle->expr),
-							  pg_batch_strip_relabel(expr)))
-					{
-						column = position;
-						break;
-					}
-					position++;
-				}
-			}
+			if (position >= 0)
+				column = layout.batch_columns[position];
 			if (column < 0)
 				elog(ERROR, "pg_batch aggregate input is missing from child target");
 		}
@@ -1477,7 +1478,8 @@ plan_aggregate(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	agg = make_custom_scan(&pg_batch_agg_plan_methods);
 	agg->scan.plan.targetlist = copyObject(tlist);
 	agg->custom_plans = custom_plans;
-	agg->custom_private = runtime_specs;
+	agg->custom_private =
+		list_make2(makeString(pstrdup(producer_name)), runtime_specs);
 	agg->custom_scan_tlist = copyObject(tlist);
 	return &agg->scan.plan;
 }
