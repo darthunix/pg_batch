@@ -25,9 +25,9 @@ struct PgBatchExpr
 	PgBatchInt4Op comparison;
 	bool		is_filter;
 
-	PgBatchBridgeBatch *batch;
+	PgBatch *batch;
 	ExprContext *econtext;
-	PgBatchBridgeMaterializePhase phase;
+	PgBatchColumnPhase phase;
 	int			capacity;
 	int32	   *values[2];
 	uint8	   *validity[2];
@@ -324,9 +324,9 @@ pg_batch_expr_input_column(const PgBatchExpr *expr)
 }
 
 void
-pg_batch_expr_bind(PgBatchExpr *expr, PgBatchBridgeBatch *batch,
+pg_batch_expr_bind(PgBatchExpr *expr, PgBatch *batch,
 				   ExprContext *econtext,
-				   PgBatchBridgeMaterializePhase phase)
+				   PgBatchColumnPhase phase)
 {
 	expr->batch = batch;
 	expr->econtext = econtext;

@@ -1,5 +1,5 @@
 comment = 'Arrow IPC test FDW for the pg_batch bridge'
 default_version = '0.1'
 module_pathname = '$libdir/pg_batch_fdw'
-requires = 'pg_batch_bridge'
+requires = 'pg_batch_api'
 relocatable = true

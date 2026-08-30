@@ -20,6 +20,7 @@
 #include "parser/parsetree.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
+#include "utils/selfuncs.h"
 #include "utils/syscache.h"
 
 #include "internal.h"
@@ -32,7 +33,7 @@ typedef struct SourceLayout
 {
 	List	   *targetlist;
 	List	   *source_attnums;
-	List	   *survivor_columns;
+	List	   *project_columns;
 	List	   *exact_filter_columns;
 	int			nfilter_columns;
 } SourceLayout;
@@ -139,7 +140,7 @@ source_attnum_column(List *source_attnums, AttrNumber attnum)
 
 static void
 nodes_get_output_layout(const Plan *plan,
-						PgBatchBridgeOutputLayout *result)
+						PgBatchOutputLayout *result)
 {
 	const CustomScan *scan;
 	int		   *columns;
@@ -182,17 +183,20 @@ nodes_get_output_layout(const Plan *plan,
 	result->batch_columns = columns;
 }
 
-static PgBatchBridgeBinding *
+static PgBatchBinding *
 nodes_get_request_binding(PlanState *planstate)
 {
 	TupleTableSlot *slot = pg_batch_result_batch_slot(planstate);
+	PgBatchBinding *binding = pg_batch_api->find_binding(slot);
 
-	return pg_batch_slot_cast(slot)->binding;
+	if (binding == NULL)
+		elog(ERROR, "pg_batch producer has no request binding");
+	return binding;
 }
 
-const PgBatchBridgeProducerOps pg_batch_producer_ops = {
-	.abi_version = PG_BATCH_BRIDGE_ABI_VERSION,
-	.struct_size = sizeof(PgBatchBridgeProducerOps),
+const PgBatchProducerOps pg_batch_producer_ops = {
+	.abi_version = PG_BATCH_ABI_VERSION,
+	.struct_size = sizeof(PgBatchProducerOps),
 	.producer_name = PG_BATCH_PRODUCER_NAME,
 	.supports_path = nodes_supports_batch_path,
 	.get_output_layout = nodes_get_output_layout,
@@ -307,7 +311,7 @@ relation_supported(PlannerInfo *root, RelOptInfo *rel,
 				   RangeTblEntry *rte)
 {
 	Relation	relation;
-	const PgBatchBridgeProviderOps *provider;
+	const PgBatchProviderOps *provider;
 	bool		result = true;
 
 	if (!pg_batch_enable || root->parse->commandType != CMD_SELECT ||
@@ -316,7 +320,7 @@ relation_supported(PlannerInfo *root, RelOptInfo *rel,
 		rel->lateral_relids != NULL)
 		return false;
 	relation = table_open(rte->relid, NoLock);
-	provider = pg_batch_bridge->find_provider(relation);
+	provider = pg_batch_api->find_provider(relation);
 	if (relation->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
 		result = provider != NULL && provider->next_batch != NULL;
 	else if (relation->rd_rel->relkind != RELKIND_RELATION ||
@@ -406,8 +410,15 @@ base_path_is_useful(PlannerInfo *root, RelOptInfo *rel)
 	if (quals == NIL)
 	{
 		List	   *specs = query_aggregate_specs(root);
+		int			relations = 0;
 
-		result = list_length(root->parse->rtable) == 1 && specs != NIL;
+		foreach_ptr(RangeTblEntry, rte, root->parse->rtable)
+		{
+			if (rte->rtekind == RTE_RELATION)
+				relations++;
+		}
+		/* A grouped query also has a synthetic RTE_GROUP entry. */
+		result = relations == 1 && specs != NIL;
 	}
 	else
 	{
@@ -641,7 +652,7 @@ can_make_batch_input(PlannerInfo *root, Path *path)
 	RelOptInfo *rel = path->parent;
 	RangeTblEntry *rte;
 
-	if (pg_batch_bridge->find_producer(path) != NULL)
+	if (pg_batch_api->find_producer(path) != NULL)
 		return true;
 	if (rel->reloptkind != RELOPT_BASEREL || path->param_info != NULL ||
 		path->parallel_aware)
@@ -766,8 +777,8 @@ make_pack_input(Path *source)
 static Path *
 make_join_input(PlannerInfo *root, Path *source, const char **producer_name)
 {
-	const PgBatchBridgeProducerOps *producer =
-		pg_batch_bridge->find_producer(source);
+	const PgBatchProducerOps *producer =
+		pg_batch_api->find_producer(source);
 	CustomPath *path;
 
 	if (producer != NULL)
@@ -788,7 +799,7 @@ make_join_input(PlannerInfo *root, Path *source, const char **producer_name)
 	path->path.startup_cost = source->startup_cost;
 	path->path.total_cost = source->total_cost;
 	path->path.pathkeys = source->pathkeys;
-	producer = pg_batch_bridge->find_producer(&path->path);
+	producer = pg_batch_api->find_producer(&path->path);
 	if (producer == NULL)
 		elog(ERROR, "pg_batch batch input has no registered producer");
 	*producer_name = producer->producer_name;
@@ -913,25 +924,62 @@ build_aggregate_specs(List *tlist)
 static List *
 query_aggregate_specs(PlannerInfo *root)
 {
-	if (!root->parse->hasAggs || root->parse->groupClause != NIL ||
+	List	   *result = NIL;
+	Node	   *group_expr = NULL;
+	int			group_specs = 0;
+
+	if (!root->parse->hasAggs ||
 		root->parse->groupingSets != NIL || root->parse->havingQual != NULL ||
 		root->parse->hasWindowFuncs)
 		return NIL;
-	return build_aggregate_specs(root->processed_tlist);
+	if (root->parse->groupClause == NIL)
+		return build_aggregate_specs(root->processed_tlist);
+	if (list_length(root->parse->groupClause) != 1)
+		return NIL;
+	group_expr = pg_batch_strip_relabel((Node *)
+		get_sortgroupclause_tle(linitial_node(SortGroupClause,
+			root->parse->groupClause), root->processed_tlist)->expr);
+	if (!IsA(group_expr, Var) || exprType(group_expr) != INT4OID)
+		return NIL;
+
+	foreach_ptr(TargetEntry, tle, root->processed_tlist)
+	{
+		PgBatchAggKind kind;
+		Node	   *source_expr;
+		Node	   *expr;
+
+		expr = pg_batch_strip_relabel((Node *) tle->expr);
+		if (equal(expr, group_expr))
+		{
+			result = lappend(result,
+				list_make2(makeInteger(PG_BATCH_AGG_GROUP_KEY),
+						   copyObject(group_expr)));
+			group_specs++;
+		}
+		else if (IsA(expr, Aggref) &&
+				 parse_aggregate(castNode(Aggref, expr), &kind, &source_expr))
+			result = lappend(result,
+				list_make2(makeInteger(kind), copyObject(source_expr)));
+		else
+			return NIL;
+	}
+	if (group_specs < 1)
+		return NIL;
+	return result;
 }
 
 static Path *
 find_batch_path(RelOptInfo *input_rel, const char **producer_name)
 {
 	Path	   *best = NULL;
-	const PgBatchBridgeProducerOps *best_producer = NULL;
+	const PgBatchProducerOps *best_producer = NULL;
 	ListCell   *lc;
 
 	foreach(lc, input_rel->pathlist)
 	{
 		Path	   *path = lfirst(lc);
-		const PgBatchBridgeProducerOps *producer =
-			pg_batch_bridge->find_producer(path);
+		const PgBatchProducerOps *producer =
+			pg_batch_api->find_producer(path);
 
 		if (producer != NULL &&
 			(best == NULL || path->total_cost < best->total_cost))
@@ -1022,7 +1070,17 @@ create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	path->path.pathtype = T_CustomScan;
 	path->path.parent = output_rel;
 	path->path.pathtarget = output_rel->reltarget;
-	path->path.rows = 1;
+	if (root->parse->groupClause == NIL)
+		path->path.rows = 1;
+	else
+	{
+		List	   *group_exprs = get_sortgrouplist_exprs(
+			root->processed_groupClause, root->processed_tlist);
+
+		path->path.rows = estimate_num_groups(root, group_exprs,
+			child->rows, NULL, NULL);
+		list_free(group_exprs);
+	}
 	path->path.startup_cost = child->startup_cost;
 	path->path.total_cost = child->total_cost + cpu_operator_cost * child->rows;
 	path->path.disabled_nodes = child->disabled_nodes;
@@ -1123,8 +1181,8 @@ build_source_layout(PlannerInfo *root, RelOptInfo *rel, List *local_quals,
 	for (int attnum = 1; attnum <= desc->natts; attnum++)
 	{
 		if (survivor_attrs[attnum])
-			layout.survivor_columns =
-				lappend_int(layout.survivor_columns, positions[attnum] - 1);
+			layout.project_columns =
+				lappend_int(layout.project_columns, positions[attnum] - 1);
 	}
 
 	pfree(filter_attrs);
@@ -1150,7 +1208,7 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		  List *tlist, List *clauses, List *custom_plans)
 {
 	SourceLayout layout;
-	PgBatchBridgePlanResult source_result;
+	PgBatchSourcePlanResult source_result;
 	PgBatchHeapScanMode heap_scan_mode =
 		intVal(linitial(best_path->custom_private));
 	CustomScan *scan;
@@ -1191,12 +1249,12 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	{
 		RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
 		Relation	relation = table_open(rte->relid, NoLock);
-		const PgBatchBridgeProviderOps *provider =
-			pg_batch_bridge->find_provider(relation);
+		const PgBatchProviderOps *provider =
+			pg_batch_api->find_provider(relation);
 
 		if (provider != NULL)
 		{
-			PgBatchBridgePlanRequest request;
+			PgBatchSourcePlanRequest request;
 			List	   *restrictinfos =
 				restriction_infos_for_clauses(clauses, quals);
 			Bitmapset  *filter_attnums =
@@ -1231,7 +1289,7 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		bool		recheck_only = false;
 
 		if (source_result.qual_support != NULL &&
-			source_result.qual_support[qualno] == PG_BATCH_BRIDGE_QUAL_EXACT)
+			source_result.qual_support[qualno] == PG_BATCH_QUAL_EXACT)
 		{
 			qualno++;
 			continue;
@@ -1297,7 +1355,7 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	filter->custom_private =
 		list_make3(layout.source_attnums,
 				   makeInteger(layout.nfilter_columns),
-				   layout.survivor_columns);
+				   layout.project_columns);
 	filter->custom_scan_tlist = layout.targetlist;
 	filter->custom_relids = bms_copy(rel->relids);
 	list_free(local_quals);
@@ -1330,15 +1388,15 @@ plan_project(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	CustomScan *project;
 	Plan	   *child;
 	const char *producer_name = strVal(linitial(best_path->custom_private));
-	const PgBatchBridgeProducerOps *producer;
-	PgBatchBridgeOutputLayout layout;
+	const PgBatchProducerOps *producer;
+	PgBatchOutputLayout layout;
 	List	   *input_columns = NIL;
 	List	   *expressions = NIL;
 
 	Assert(list_length(custom_plans) == 1);
 	Assert(clauses == NIL);
 	child = linitial(custom_plans);
-	producer = pg_batch_bridge->get_producer(producer_name);
+	producer = pg_batch_api->get_producer(producer_name);
 	if (producer == NULL)
 		elog(ERROR, "pg_batch producer \"%s\" is not registered",
 			 producer_name);
@@ -1384,9 +1442,9 @@ target_expression_position(List *targetlist, Node *expr)
 static List *
 append_side_layout(Plan *child, const char *producer_name, List **raw_tlist)
 {
-	const PgBatchBridgeProducerOps *producer =
-		pg_batch_bridge->get_producer(producer_name);
-	PgBatchBridgeOutputLayout layout;
+	const PgBatchProducerOps *producer =
+		pg_batch_api->get_producer(producer_name);
+	PgBatchOutputLayout layout;
 	List	   *batch_columns = NIL;
 	int			position = 0;
 
@@ -1518,15 +1576,15 @@ plan_aggregate(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	Plan	   *child;
 	const char *producer_name = strVal(linitial(best_path->custom_private));
 	List	   *agg_specs = lsecond_node(List, best_path->custom_private);
-	const PgBatchBridgeProducerOps *producer;
-	PgBatchBridgeOutputLayout layout;
+	const PgBatchProducerOps *producer;
+	PgBatchOutputLayout layout;
 	List	   *runtime_specs = NIL;
 
 	Assert(list_length(custom_plans) == 1);
 	Assert(list_length(best_path->custom_private) == 2);
 	Assert(clauses == NIL);
 	child = linitial(custom_plans);
-	producer = pg_batch_bridge->get_producer(producer_name);
+	producer = pg_batch_api->get_producer(producer_name);
 	if (producer == NULL)
 		elog(ERROR, "pg_batch producer \"%s\" is not registered",
 			 producer_name);

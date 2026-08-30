@@ -2,9 +2,8 @@
 #define PG_BATCH_HASH_JOIN_INTERNAL_H
 
 #include "executor/nodeCustom.h"
-#include "storage/buffile.h"
-
 #include "internal.h"
+#include "spill.h"
 
 /*
  * Private interface shared by the hash join executor and its spill module.
@@ -50,7 +49,7 @@ typedef struct BuildStore
  */
 typedef struct SpillBlock
 {
-	PgBatchBridgeBatch batch;
+	PgBatch batch;
 	uint64		selection;
 	int			ncolumns;
 	int			nrows;
@@ -62,6 +61,13 @@ typedef struct SpillBlock
 	struct ArrowArray *arrays;
 	struct ArrowSchema *schemas;
 } SpillBlock;
+
+typedef struct HashSpillFile
+{
+	PgBatchSpillSet *set;
+	PgBatchSpillReader *reader;
+	int			partition;
+} HashSpillFile;
 
 typedef struct OutputColumn
 {
@@ -98,9 +104,10 @@ typedef struct BatchHashJoinState
 	PlanState  *inner_plan;
 	PgBatchInput *outer_input;
 	PgBatchInput *inner_input;
+	PgBatchOutput *output;
 	TupleTableSlot *output_slot;
 	TupleTableSlot *raw_slot;
-	const PgBatchBridgeRequest *output_request;
+	const PgBatchRequest *output_request;
 
 	int			nouter_columns;
 	int			ninner_columns;
@@ -150,26 +157,25 @@ typedef struct BatchHashJoinState
 	bool		probe_from_spill;
 	bool		spill_probe_started;
 	int			current_partition;
-	BufFile   **build_files;
-	BufFile   **probe_files;
+	PgBatchSpillSet *build_spill;
+	PgBatchSpillSet *probe_spill;
+	HashSpillFile **build_files;
+	HashSpillFile **probe_files;
 	uint64	   *build_partition_rows;
-	BufFile    *active_build_file;
-	BufFile    *active_probe_file;
+	HashSpillFile *active_build_file;
+	HashSpillFile *active_probe_file;
 	int			active_hash_shift;
-	BufFile   **repartition_build_files;
-	BufFile   **repartition_probe_files;
+	PgBatchSpillSet *repartition_build_spill;
+	PgBatchSpillSet *repartition_probe_spill;
+	HashSpillFile **repartition_build_files;
+	HashSpillFile **repartition_probe_files;
 	uint64	   *repartition_build_rows;
 	int			nrepartitions;
 	int			current_repartition;
 	int			repartition_hash_shift;
 	int		   *spill_partition_heads;
 	int		   *spill_partition_tails;
-	bool		spill_buffered;
-	int			spill_buffer_columns;
-	int		   *spill_buffer_counts;
-	uint32	   *spill_buffer_hashes;
-	int32	   *spill_buffer_values;
-	uint64	   *spill_buffer_validity;
+	PgBatchInt4Vector *spill_input_vectors;
 	SpillBlock	build_block;
 	SpillBlock	probe_block;
 	/* Two batches let resident rows be packed densely across input batches. */
@@ -190,7 +196,7 @@ typedef struct BatchHashJoinState
 	uint64		peak_memory;
 
 	/* Current probe batch and candidate build rows. */
-	PgBatchBridgeBatch *probe_batch;
+	PgBatch *probe_batch;
 	InputColumn *probe_columns;
 	const PgBatchInt4Vector **hash_keys;
 	uint32		probe_hashes[PG_BATCH_SIZE];
@@ -202,7 +208,7 @@ typedef struct BatchHashJoinState
 	bool		probe_done_pending;
 
 	/* Lazily gathered output batch. */
-	PgBatchBridgeBatch output_batch;
+	PgBatch output_batch;
 	uint64		output_selection;
 	int			output_probe_rows[PG_BATCH_SIZE];
 	uint32		output_build_rows[PG_BATCH_SIZE];
@@ -246,7 +252,7 @@ hash_join_spill_value_valid(const SpillBlock *block, int column, int row)
 }
 
 /* Services implemented by hash_join.c and used by the spill subsystem. */
-extern void hash_join_load_input_column(PgBatchBridgeBatch *batch, int column,
+extern void hash_join_load_input_column(PgBatch *batch, int column,
 										const uint64 *rows,
 										PgBatchMaterializePhase phase,
 										InputColumn *result,
@@ -263,12 +269,12 @@ extern void hash_join_begin_spill(BatchHashJoinState *state,
 								  uint64 estimated_bytes,
 								  uint64 estimated_rows);
 extern uint64 hash_join_spill_input_batch(BatchHashJoinState *state,
-										  PgBatchBridgeBatch *batch,
+										  PgBatch *batch,
 										  InputColumn *columns, int ncolumns,
 										  const uint32 *hashes,
 										  uint64 hash_rows,
 										  const int *batch_columns,
-										  BufFile **files,
+										  HashSpillFile **files,
 										  uint64 *resident_rows);
 extern void hash_join_spill_build_store(BatchHashJoinState *state);
 extern void hash_join_finish_spilled_build(BatchHashJoinState *state);

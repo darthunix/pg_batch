@@ -93,7 +93,7 @@ typedef struct DatumColumn
 
 struct ActiveBatch
 {
-	PgBatchBridgeBatch bridge_batch;
+	PgBatch bridge_batch;
 	CompressedScan *scan;
 	CompressedBatch *batch;
 	uint64		selection;
@@ -624,10 +624,10 @@ column_values(ActiveBatch *active, CompressedColumn *stored)
 
 static pg_always_inline void
 prepare_column(ActiveBatch *active, int column,
-			   PgBatchBridgeMaterializePhase phase)
+			   PgBatchColumnPhase phase)
 {
 	CompressedScan *scan = active->scan;
-	PgBatchBridgeBatch *bridge_batch = &active->bridge_batch;
+	PgBatch *bridge_batch = &active->bridge_batch;
 	AttrNumber	source_attnum;
 	CompressedColumn *stored;
 	ArrowColumn *arrow;
@@ -650,17 +650,17 @@ prepare_column(ActiveBatch *active, int column,
 	arrow->schema.format = "i";
 	arrow->schema.flags = ARROW_FLAG_NULLABLE;
 	arrow->schema.release = arrow_schema_release;
-	if (phase == PG_BATCH_BRIDGE_MATERIALIZE_FILTER)
+	if (phase == PG_BATCH_COLUMN_FILTER)
 		scan->stats.arrow_filter_columns++;
 	else
 		scan->stats.arrow_project_columns++;
 }
 
 static void
-prepare_columns(PgBatchBridgeBatch *bridge_batch,
+prepare_columns(PgBatch *bridge_batch,
 				const Bitmapset *columns,
 				const uint64 *rows,
-				PgBatchBridgeMaterializePhase phase)
+				PgBatchColumnPhase phase)
 {
 	ActiveBatch *active = bridge_batch->private_data;
 	int			column = -1;
@@ -673,9 +673,9 @@ prepare_columns(PgBatchBridgeBatch *bridge_batch,
 }
 
 static void
-get_arrow_column(PgBatchBridgeBatch *bridge_batch,
+get_arrow_column(PgBatch *bridge_batch,
 				 int column,
-				 PgBatchBridgeArrowView *view)
+				 PgBatchArrowView *view)
 {
 	ActiveBatch *active = bridge_batch->private_data;
 	CompressedScan *scan = active->scan;
@@ -691,7 +691,7 @@ get_arrow_column(PgBatchBridgeBatch *bridge_batch,
 }
 
 static void
-release_batch(PgBatchBridgeBatch *bridge_batch)
+release_batch(PgBatch *bridge_batch)
 {
 	ActiveBatch *active = bridge_batch->private_data;
 	CompressedScan *scan;
@@ -711,17 +711,17 @@ release_batch(PgBatchBridgeBatch *bridge_batch)
 	scan->active = NULL;
 }
 
-static const PgBatchBridgeArrowInterface pg_batch_compressed_arrow = {
-	.abi_version = PG_BATCH_BRIDGE_ARROW_INTERFACE_VERSION,
-	.struct_size = sizeof(PgBatchBridgeArrowInterface),
+static const PgBatchArrowInterface pg_batch_compressed_arrow = {
+	.abi_version = PG_BATCH_ARROW_INTERFACE_VERSION,
+	.struct_size = sizeof(PgBatchArrowInterface),
 	.get_column = get_arrow_column,
 };
 
 static bool
-get_int4_column(PgBatchBridgeBatch *bridge_batch, int column,
+get_int4_column(PgBatch *bridge_batch, int column,
 				PgBatchInt4Vector *result)
 {
-	PgBatchBridgeArrowView view;
+	PgBatchArrowView view;
 
 	get_arrow_column(bridge_batch, column, &view);
 	pg_batch_int4_vector_init_packed(result, view.array->buffers[1],
@@ -737,15 +737,15 @@ static const PgBatchInt4VectorInterface pg_batch_compressed_int4 = {
 };
 
 static void
-get_datum_column(PgBatchBridgeBatch *bridge_batch,
+get_datum_column(PgBatch *bridge_batch,
 				 int column, const uint64 *rows,
-				 PgBatchBridgeMaterializePhase phase,
-				 PgBatchBridgeDatumColumn *result)
+				 PgBatchColumnPhase phase,
+				 PgBatchDatumVector *result)
 {
 	ActiveBatch *active = bridge_batch->private_data;
 	CompressedScan *scan = active->scan;
 	DatumColumn *datum;
-	PgBatchBridgeArrowView view;
+	PgBatchArrowView view;
 	const int32 *values;
 	uint64		missing;
 
@@ -773,7 +773,7 @@ get_datum_column(PgBatchBridgeBatch *bridge_batch,
 			Int32GetDatum(values[view.array->offset + row]);
 		datum->isnull[row] = isnull;
 		datum->valid_rows |= bit;
-		if (phase == PG_BATCH_BRIDGE_MATERIALIZE_FILTER)
+		if (phase == PG_BATCH_COLUMN_FILTER)
 			scan->stats.filter_datums++;
 		else
 			scan->stats.project_datums++;
@@ -786,21 +786,21 @@ get_datum_column(PgBatchBridgeBatch *bridge_batch,
 }
 
 static const void *
-get_native_interface(PgBatchBridgeBatch *batch,
+get_native_interface(PgBatch *batch,
 					 const char *name, uint32 version)
 {
 	if (version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
 		strcmp(name, PG_BATCH_INT4_VECTOR_INTERFACE_NAME) == 0)
 		return &pg_batch_compressed_int4;
-	if (version == PG_BATCH_BRIDGE_ARROW_INTERFACE_VERSION &&
-		strcmp(name, PG_BATCH_BRIDGE_ARROW_INTERFACE_NAME) == 0)
+	if (version == PG_BATCH_ARROW_INTERFACE_VERSION &&
+		strcmp(name, PG_BATCH_ARROW_INTERFACE_NAME) == 0)
 		return &pg_batch_compressed_arrow;
 	return NULL;
 }
 
-static const PgBatchBridgeBatchOps pg_batch_compressed_batch_ops = {
-	.abi_version = PG_BATCH_BRIDGE_ABI_VERSION,
-	.struct_size = sizeof(PgBatchBridgeBatchOps),
+static const PgBatchOps pg_batch_compressed_batch_ops = {
+	.abi_version = PG_BATCH_ABI_VERSION,
+	.struct_size = sizeof(PgBatchOps),
 	.prepare_columns = prepare_columns,
 	.get_datum_column = get_datum_column,
 	.get_native_interface = get_native_interface,
@@ -825,8 +825,8 @@ load_batch(CompressedScan *scan,
 												   sizeof(DatumColumn) *
 												   scan->request->ncolumns);
 	active->selection = PG_BATCH_ALL_ROWS >> (PG_BATCH_SIZE - batch->nrows);
-	active->bridge_batch.abi_version = PG_BATCH_BRIDGE_ABI_VERSION;
-	active->bridge_batch.struct_size = sizeof(PgBatchBridgeBatch);
+	active->bridge_batch.abi_version = PG_BATCH_ABI_VERSION;
+	active->bridge_batch.struct_size = sizeof(PgBatch);
 	active->bridge_batch.nrows = batch->nrows;
 	active->bridge_batch.nwords = 1;
 	active->bridge_batch.selection = &active->selection;
@@ -849,9 +849,9 @@ filter_batch(CompressedScan *scan)
 		if (qual->expr == NULL)
 			continue;
 		prepare_columns(&active->bridge_batch, qual->column_mask,
-						&active->selection, PG_BATCH_BRIDGE_MATERIALIZE_FILTER);
+						&active->selection, PG_BATCH_COLUMN_FILTER);
 		pg_batch_expr_bind(qual->expr, &active->bridge_batch, scan->econtext,
-						   PG_BATCH_BRIDGE_MATERIALIZE_FILTER);
+						   PG_BATCH_COLUMN_FILTER);
 		pg_batch_expr_apply_filter(qual->expr, true);
 	}
 	scan->stats.rows_removed_by_source_filter +=
@@ -873,7 +873,7 @@ prepare_prune_quals(CompressedScan *scan)
 }
 
 bool
-pg_batch_compressed_scan_next(PgBatchBridgeBinding *binding,
+pg_batch_compressed_scan_next(PgBatchBinding *binding,
 							  CompressedScan *scan)
 {
 	CompressedRelation *compressed = scan->relation;
@@ -929,7 +929,7 @@ pg_batch_compressed_scan_next(PgBatchBridgeBinding *binding,
 							  &scan->active->bridge_batch);
 				continue;
 			}
-			pg_batch_tam_bridge->publish_batch(
+			pg_batch_tam_api->publish_batch(
 											   binding,
 											   &scan->active->bridge_batch);
 			return true;

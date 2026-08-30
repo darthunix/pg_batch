@@ -6,6 +6,7 @@
 #include "utils/rel.h"
 
 #include "bridge.h"
+#include "source.h"
 #include "arrow.h"
 #include "kernels.h"
 #include "runtime.h"
@@ -57,7 +58,7 @@ typedef struct CompressedScan
 	MemoryContext context;
 	MemoryContext batch_context;
 	CompressedRelation *relation;
-	const PgBatchBridgeRequest *request;
+	const PgBatchRequest *request;
 	ExprContext *econtext;
 	SourceQual *quals;
 	int			nquals;
@@ -73,14 +74,14 @@ typedef struct CompressedScan
 
 extern bool pg_batch_tam_enable;
 extern int	pg_batch_tam_scan_mode;
-extern const PgBatchBridgeAPI *pg_batch_tam_bridge;
-extern const PgBatchBridgeProviderOps pg_batch_tam_provider_ops;
+extern const PgBatchAPI *pg_batch_tam_api;
+extern const PgBatchProviderOps pg_batch_tam_provider_ops;
 
 extern bool pg_batch_relation_uses_tableam(Relation relation);
 extern bool pg_batch_compressed_available(Relation relation);
 extern CompressedRelation *pg_batch_compressed_acquire(Relation relation);
 extern void pg_batch_compressed_release(CompressedRelation *relation);
-extern bool pg_batch_compressed_scan_next(PgBatchBridgeBinding *binding,
+extern bool pg_batch_compressed_scan_next(PgBatchBinding *binding,
 										  CompressedScan *scan);
 extern void pg_batch_compressed_fini(void);
 

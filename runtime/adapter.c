@@ -3,17 +3,17 @@
 #include "runtime.h"
 
 void
-pg_batch_materialize_columns(PgBatchBridgeBatch *batch,
+pg_batch_materialize_columns(PgBatch *batch,
 							 const Bitmapset *columns,
 							 const uint64 *selected_rows,
-							 PgBatchBridgeMaterializePhase phase)
+							 PgBatchColumnPhase phase)
 {
 	int			column = -1;
 
 	while (columns != NULL &&
 		   (column = bms_next_member(columns, column)) >= 0)
 	{
-		PgBatchBridgeDatumColumn ignored;
+		PgBatchDatumVector ignored;
 
 		pg_batch_get_datum_column(batch, column, selected_rows, phase,
 							  &ignored);
@@ -21,33 +21,33 @@ pg_batch_materialize_columns(PgBatchBridgeBatch *batch,
 }
 
 bool
-pg_batch_get_arrow_column(PgBatchBridgeBatch *batch, int column,
-						  PgBatchBridgeArrowView *result)
+pg_batch_get_arrow_column(PgBatch *batch, int column,
+						  PgBatchArrowView *result)
 {
-	const PgBatchBridgeArrowInterface *arrow;
+	const PgBatchArrowInterface *arrow;
 
 	if (batch->ops->get_native_interface == NULL)
 		return false;
 	arrow = batch->ops->get_native_interface(
-		batch, PG_BATCH_BRIDGE_ARROW_INTERFACE_NAME,
-		PG_BATCH_BRIDGE_ARROW_INTERFACE_VERSION);
+		batch, PG_BATCH_ARROW_INTERFACE_NAME,
+		PG_BATCH_ARROW_INTERFACE_VERSION);
 	if (arrow == NULL)
 		return false;
-	if (arrow->abi_version != PG_BATCH_BRIDGE_ARROW_INTERFACE_VERSION ||
-		arrow->struct_size < sizeof(PgBatchBridgeArrowInterface))
+	if (arrow->abi_version != PG_BATCH_ARROW_INTERFACE_VERSION ||
+		arrow->struct_size < sizeof(PgBatchArrowInterface))
 		elog(ERROR, "pg_batch source returned an incompatible Arrow interface");
 	arrow->get_column(batch, column, result);
 	return true;
 }
 
 void
-pg_batch_get_int4_vector(PgBatchBridgeBatch *batch, int column,
+pg_batch_get_int4_vector(PgBatch *batch, int column,
 						 const uint64 *selected_rows,
-						 PgBatchBridgeMaterializePhase phase,
+						 PgBatchColumnPhase phase,
 						 PgBatchInt4Vector *result)
 {
 	const PgBatchInt4VectorInterface *native = NULL;
-	PgBatchBridgeArrowView arrow;
+	PgBatchArrowView arrow;
 
 	if (unlikely(batch->ops->get_native_interface != NULL))
 		native = batch->ops->get_native_interface(
@@ -74,7 +74,7 @@ pg_batch_get_int4_vector(PgBatchBridgeBatch *batch, int column,
 	}
 	else
 	{
-		PgBatchBridgeDatumColumn datum;
+		PgBatchDatumVector datum;
 
 		pg_batch_get_datum_column(batch, column, selected_rows, phase, &datum);
 		pg_batch_int4_vector_init_datum(result, datum.values, datum.isnull,

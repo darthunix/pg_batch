@@ -28,14 +28,21 @@ endforeach
 pg_compile_args += '-I' + pg_server_include
 
 postgres_dep = declare_dependency(compile_args: pg_compile_args)
-bridge_inc = include_directories('bridge/include')
-runtime_inc = include_directories('runtime/include')
-kernels_inc = include_directories('kernels/include')
-expr_inc = include_directories('expr/include')
+public_inc = include_directories('include/pg_batch')
 
 subdir('runtime')
 subdir('kernels')
 subdir('expr')
+subdir('spill')
+
+install_headers(
+	'include/pg_batch/batch.h',
+  'include/pg_batch/bridge.h',
+  'include/pg_batch/node.h',
+  'include/pg_batch/source.h',
+  'include/pg_batch/arrow.h',
+  install_dir: pg_server_include / 'extension' / 'pg_batch',
+)
 
 pc_data = configuration_data()
 pc_data.set('PG_BATCH_VERSION', meson.project_version())
@@ -59,6 +66,13 @@ configure_file(
 configure_file(
   input: 'pkgconfig/pg_batch-expr.pc.in',
   output: 'pg_batch-expr.pc',
+  configuration: pc_data,
+  install: true,
+  install_dir: pg_pkglibdir / 'pkgconfig',
+)
+configure_file(
+  input: 'pkgconfig/pg_batch-spill.pc.in',
+  output: 'pg_batch-spill.pc',
   configuration: pc_data,
   install: true,
   install_dir: pg_pkglibdir / 'pkgconfig',

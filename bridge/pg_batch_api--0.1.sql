@@ -1,0 +1,1 @@
+-- pg_batch_api exposes only a C ABI through a rendezvous variable.

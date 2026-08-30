@@ -1,0 +1,6 @@
+Name: pg_batch-spill
+Description: Buffered int4 spill storage for PostgreSQL batch operators
+Version: @PG_BATCH_VERSION@
+Libs: -L@PG_PKGLIBDIR@ -lpg_batch_spill
+Requires.private: pg_batch-runtime
+Cflags: -I@PG_INCLUDEDIR_SERVER@/extension/pg_batch

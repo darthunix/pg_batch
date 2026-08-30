@@ -10,7 +10,7 @@ pg_batch_result_batch_slot(PlanState *planstate)
 {
 	TupleTableSlot *slot = planstate->ps_ResultTupleSlot;
 
-	if (slot != NULL && slot->tts_ops == &PgBatchSlotOps)
+	if (slot != NULL && pg_batch_api->find_binding(slot) != NULL)
 		return slot;
 	if (IsA(planstate, CustomScanState))
 	{
@@ -20,7 +20,7 @@ pg_batch_result_batch_slot(PlanState *planstate)
 		if (batch_slot != NULL)
 			return batch_slot;
 		slot = custom->ss.ss_ScanTupleSlot;
-		if (slot != NULL && slot->tts_ops == &PgBatchSlotOps)
+		if (slot != NULL && pg_batch_api->find_binding(slot) != NULL)
 			return slot;
 	}
 	elog(ERROR, "pg_batch child does not publish batches");

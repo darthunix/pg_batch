@@ -15,7 +15,7 @@
 
 static void
 classify_quals(RelOptInfo *rel, List *clauses, List *restrictinfos,
-			   PgBatchBridgeQualSupport *support,
+			   PgBatchQualSupport *support,
 			   List **source_exprs, List **specs)
 {
 	ListCell   *clause_cell;
@@ -33,7 +33,7 @@ classify_quals(RelOptInfo *rel, List *clauses, List *restrictinfos,
 			restriction_is_securely_promotable(rinfo, rel) &&
 			pg_batch_expr_supports_filter(clause, rel->relid))
 		{
-			support[qualno] = PG_BATCH_BRIDGE_QUAL_EXACT;
+			support[qualno] = PG_BATCH_QUAL_EXACT;
 			*source_exprs = lappend(*source_exprs, copyObject(clause));
 			*specs = lappend_int(*specs, exprno++);
 		}
@@ -57,8 +57,8 @@ supports_relation(Relation relation)
 }
 
 static void
-provider_plan_scan(const PgBatchBridgePlanRequest *request,
-				   PgBatchBridgePlanResult *result)
+provider_plan_scan(const PgBatchSourcePlanRequest *request,
+				   PgBatchSourcePlanResult *result)
 {
 	List	   *source_exprs = NIL;
 	List	   *specs = NIL;
@@ -66,7 +66,7 @@ provider_plan_scan(const PgBatchBridgePlanRequest *request,
 
 	MemSet(result, 0, sizeof(*result));
 	result->nquals = nquals;
-	result->qual_support = palloc0_array(PgBatchBridgeQualSupport, nquals);
+	result->qual_support = palloc0_array(PgBatchQualSupport, nquals);
 	classify_quals(request->rel, request->clauses, request->restrictinfos,
 				   result->qual_support, &source_exprs, &specs);
 	result->source_exprs = source_exprs;
@@ -74,7 +74,7 @@ provider_plan_scan(const PgBatchBridgePlanRequest *request,
 }
 
 static void *
-provider_begin_scan(const PgBatchBridgeExecRequest *request)
+provider_begin_scan(const PgBatchSourceExecRequest *request)
 {
 	return pg_batch_fdw_scan_begin(request->relation, request->parent,
 								   request->source_private,
@@ -83,7 +83,7 @@ provider_begin_scan(const PgBatchBridgeExecRequest *request)
 								   request->query_context);
 }
 
-static PgBatchBridgeBatch *
+static PgBatch *
 provider_next_batch(void *provider_state)
 {
 	return pg_batch_fdw_scan_next(provider_state);
@@ -107,9 +107,9 @@ provider_explain(void *provider_state, ExplainState *es)
 	pg_batch_fdw_scan_explain(provider_state, es);
 }
 
-const PgBatchBridgeProviderOps pg_batch_fdw_provider_ops = {
-	.abi_version = PG_BATCH_BRIDGE_ABI_VERSION,
-	.struct_size = sizeof(PgBatchBridgeProviderOps),
+const PgBatchProviderOps pg_batch_fdw_provider_ops = {
+	.abi_version = PG_BATCH_ABI_VERSION,
+	.struct_size = sizeof(PgBatchProviderOps),
 	.provider_name = PG_BATCH_FDW_PROVIDER_NAME,
 	.supports_relation = supports_relation,
 	.plan_scan = provider_plan_scan,
@@ -151,7 +151,7 @@ get_foreign_plan(PlannerInfo *root, RelOptInfo *baserel,
 	List	   *specs = NIL;
 	List	   *local_exprs = NIL;
 	List	   *remote_exprs = NIL;
-	PgBatchBridgeQualSupport *support;
+	PgBatchQualSupport *support;
 	int			qualno = 0;
 
 	foreach_ptr(RestrictInfo, rinfo, scan_clauses)
@@ -161,12 +161,12 @@ get_foreign_plan(PlannerInfo *root, RelOptInfo *baserel,
 		clauses = lappend(clauses, rinfo->clause);
 		restrictinfos = lappend(restrictinfos, rinfo);
 	}
-	support = palloc0_array(PgBatchBridgeQualSupport, list_length(clauses));
+	support = palloc0_array(PgBatchQualSupport, list_length(clauses));
 	classify_quals(baserel, clauses, restrictinfos, support,
 				   &source_exprs, &specs);
 	foreach_ptr(Node, clause, clauses)
 	{
-		if (support[qualno++] == PG_BATCH_BRIDGE_QUAL_EXACT)
+		if (support[qualno++] == PG_BATCH_QUAL_EXACT)
 			remote_exprs = lappend(remote_exprs, clause);
 		else
 			local_exprs = lappend(local_exprs, clause);

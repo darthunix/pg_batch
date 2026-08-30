@@ -12,9 +12,9 @@ typedef struct BatchFilterState
 	CustomScanState css;
 	PlanState  *child;
 	PgBatchInput *input;
-	const PgBatchBridgeRequest *request;
+	const PgBatchRequest *request;
 	TupleTableSlot *active_slot;
-	PgBatchBridgeBatch *active_batch;
+	PgBatch *active_batch;
 	int			next_row;
 	bool		request_forwarded;
 	uint64		input_batches;
@@ -73,28 +73,28 @@ filter_begin(CustomScanState *node, EState *estate, int eflags)
 	int			nfilter = intVal(lsecond(cscan->custom_private));
 	List	   *survivor_items = lthird(cscan->custom_private);
 	Bitmapset  *filter_columns = NULL;
-	Bitmapset  *survivor_columns = intlist_to_bitmap(survivor_items);
+	Bitmapset  *project_columns = intlist_to_bitmap(survivor_items);
 
 	/* This slot advertises the compact layout and the parent's request. */
 	pg_batch_configure_slot(request_slot, NULL, source_attnums, nfilter);
-	state->request = pg_batch_bridge->get_request(request_slot->binding);
+	state->request = pg_batch_api->get_request(request_slot->binding);
 	if (nfilter > 0)
 		filter_columns = bms_add_range(filter_columns, 0, nfilter - 1);
-	pg_batch_set_request(&request_slot->base, filter_columns, survivor_columns,
+	pg_batch_set_request(&request_slot->base, filter_columns, project_columns,
 						 false);
 	bms_free(filter_columns);
-	bms_free(survivor_columns);
+	bms_free(project_columns);
 
 	pg_batch_init_children(node, estate, eflags);
 	state->child = linitial(node->custom_ps);
 	state->input = pg_batch_input_create(estate->es_query_cxt,
-		pg_batch_bridge, state->child, PG_BATCH_PRODUCER_NAME);
+		pg_batch_api, state->child, PG_BATCH_PRODUCER_NAME);
 }
 
 static int
 apply_residual_quals(BatchFilterState *state,
 					 TupleTableSlot *slot,
-					 PgBatchBridgeBatch *batch, int initial)
+					 PgBatch *batch, int initial)
 {
 	ExprContext *econtext = state->css.ss.ps.ps_ExprContext;
 	int			row = -1;
@@ -102,13 +102,13 @@ apply_residual_quals(BatchFilterState *state,
 
 	if (state->css.ss.ps.qual == NULL)
 		return initial;
-	while ((row = pg_batch_bridge_next_selected(batch, row)) >= 0)
+	while ((row = pg_batch_next_selected(batch, row)) >= 0)
 	{
 		ResetExprContext(econtext);
 		pg_batch_select_row(slot, row);
 		econtext->ecxt_scantuple = slot;
 		if (!ExecQual(state->css.ss.ps.qual, econtext))
-			pg_batch_bridge_clear_row(batch, row);
+			pg_batch_clear_row(batch, row);
 	}
 	remaining = pg_batch_row_count(batch);
 	InstrCountFiltered1(&state->css.ss, initial - remaining);
@@ -120,10 +120,10 @@ forward_request(BatchFilterState *state)
 {
 	Assert(!state->request_forwarded);
 	/* The parent finalizes this request before its first ExecProcNode(). */
-	pg_batch_bridge->set_request(
+	pg_batch_api->set_request(
 		pg_batch_input_request_binding(state->input),
 		state->request->filter_columns,
-		state->request->survivor_columns,
+		state->request->project_columns,
 		state->request->return_batch);
 	state->request_forwarded = true;
 }
@@ -134,10 +134,10 @@ fetch_batch(BatchFilterState *state)
 	for (;;)
 	{
 		PgBatchInputBatch input;
-		PgBatchBridgeBatch *batch;
+		PgBatch *batch;
 		int			rows;
 
-		if (!pg_batch_input_advance(state->input, &input))
+		if (!pg_batch_input_next(state->input, &input))
 			return 0;
 		batch = input.batch;
 		state->input_batches++;
@@ -145,17 +145,20 @@ fetch_batch(BatchFilterState *state)
 		state->input_rows += rows;
 		rows = apply_residual_quals(state, input.slot, batch, rows);
 		if (rows == 0)
+		{
+			pg_batch_input_finish(state->input);
 			continue;
+		}
 		/* A batch-aware parent prepares survivor columns when it uses them. */
 		if (!state->request->return_batch)
 			pg_batch_materialize_columns(batch,
-									 state->request->survivor_columns,
+									 state->request->project_columns,
 										 batch->selection,
 										 PG_BATCH_PROJECT_PHASE);
 		state->output_rows += rows;
 		state->active_slot = input.slot;
 		state->active_batch = batch;
-		state->next_row = pg_batch_bridge_next_selected(batch, -1);
+		state->next_row = pg_batch_next_selected(batch, -1);
 		return rows;
 	}
 }
@@ -173,7 +176,7 @@ empty_result(BatchFilterState *state)
 static TupleTableSlot *
 exec_batch(BatchFilterState *state)
 {
-	PgBatchBridgeBatch *batch = state->active_batch;
+	PgBatch *batch = state->active_batch;
 	PlanState  *planstate = &state->css.ss.ps;
 	int			rows;
 
@@ -183,8 +186,6 @@ exec_batch(BatchFilterState *state)
 	 */
 	if (batch != NULL)
 	{
-		if (!batch->consumed)
-			elog(ERROR, "pg_batch parent requested a new batch too early");
 		state->active_batch = NULL;
 		state->active_slot = NULL;
 	}
@@ -206,7 +207,7 @@ exec_row(BatchFilterState *state)
 
 	for (;;)
 	{
-		PgBatchBridgeBatch *batch = state->active_batch;
+		PgBatch *batch = state->active_batch;
 
 		if (batch == NULL)
 		{
@@ -217,6 +218,7 @@ exec_row(BatchFilterState *state)
 
 		if (state->next_row < 0)
 		{
+			pg_batch_input_finish(state->input);
 			state->active_batch = NULL;
 			state->active_slot = NULL;
 			continue;
@@ -224,7 +226,7 @@ exec_row(BatchFilterState *state)
 
 		pg_batch_select_row(state->active_slot, state->next_row);
 		state->next_row =
-			pg_batch_bridge_next_selected(batch, state->next_row);
+			pg_batch_next_selected(batch, state->next_row);
 		if (planstate->ps_ProjInfo == NULL)
 			return state->active_slot;
 		ResetExprContext(econtext);
@@ -260,7 +262,7 @@ filter_rescan(CustomScanState *node)
 	state->active_slot = NULL;
 	state->next_row = 0;
 	pg_batch_rescan_children(node);
-	pg_batch_input_reset(state->input);
+	pg_batch_input_rescan(state->input);
 }
 
 static void

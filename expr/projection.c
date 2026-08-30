@@ -20,8 +20,8 @@ typedef struct ProjectionColumn
 struct PgBatchExprProjection
 {
 	MemoryContext context;
-	PgBatchBridgeBatch batch;
-	PgBatchBridgeBatch *input;
+	PgBatch batch;
+	PgBatch *input;
 	ProjectionColumn *columns;
 	Bitmapset  *input_columns;
 	int			ncolumns;
@@ -36,7 +36,7 @@ check_column(PgBatchExprProjection *projection, int column)
 
 static void
 prepare_one(PgBatchExprProjection *projection, int column,
-			const uint64 *rows, PgBatchBridgeMaterializePhase phase)
+			const uint64 *rows, PgBatchColumnPhase phase)
 {
 	ProjectionColumn *output;
 
@@ -51,9 +51,9 @@ prepare_one(PgBatchExprProjection *projection, int column,
 }
 
 static void
-projection_prepare_columns(PgBatchBridgeBatch *batch,
+projection_prepare_columns(PgBatch *batch,
 						   const Bitmapset *columns, const uint64 *rows,
-						   PgBatchBridgeMaterializePhase phase)
+						   PgBatchColumnPhase phase)
 {
 	PgBatchExprProjection *projection = batch->private_data;
 	int			column = -1;
@@ -64,14 +64,14 @@ projection_prepare_columns(PgBatchBridgeBatch *batch,
 }
 
 static bool
-projection_get_int4(PgBatchBridgeBatch *batch, int column,
+projection_get_int4(PgBatch *batch, int column,
 					PgBatchInt4Vector *result)
 {
 	PgBatchExprProjection *projection = batch->private_data;
 	ProjectionColumn *output;
 
 	prepare_one(projection, column, batch->selection,
-				PG_BATCH_BRIDGE_MATERIALIZE_PROJECT);
+				PG_BATCH_COLUMN_PROJECT);
 	output = &projection->columns[column];
 	*result = output->vector;
 	return true;
@@ -84,7 +84,7 @@ static const PgBatchInt4VectorInterface projection_int4_interface = {
 };
 
 static const void *
-projection_get_native_interface(PgBatchBridgeBatch *batch,
+projection_get_native_interface(PgBatch *batch,
 								const char *name, uint32 version)
 {
 	if (version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
@@ -126,10 +126,10 @@ ensure_datum_capacity(PgBatchExprProjection *projection,
 }
 
 static void
-projection_get_datum_column(PgBatchBridgeBatch *batch, int column,
+projection_get_datum_column(PgBatch *batch, int column,
 							const uint64 *rows,
-							PgBatchBridgeMaterializePhase phase,
-							PgBatchBridgeDatumColumn *result)
+							PgBatchColumnPhase phase,
+							PgBatchDatumVector *result)
 {
 	PgBatchExprProjection *projection = batch->private_data;
 	ProjectionColumn *output;
@@ -161,9 +161,9 @@ projection_get_datum_column(PgBatchBridgeBatch *batch, int column,
 	result->nwords = batch->nwords;
 }
 
-static const PgBatchBridgeBatchOps projection_batch_ops = {
-	.abi_version = PG_BATCH_BRIDGE_ABI_VERSION,
-	.struct_size = sizeof(PgBatchBridgeBatchOps),
+static const PgBatchOps projection_batch_ops = {
+	.abi_version = PG_BATCH_ABI_VERSION,
+	.struct_size = sizeof(PgBatchOps),
 	.prepare_columns = projection_prepare_columns,
 	.get_datum_column = projection_get_datum_column,
 	.get_native_interface = projection_get_native_interface,
@@ -199,17 +199,17 @@ pg_batch_expr_projection_create(MemoryContext parent_context,
 				bms_add_member(projection->input_columns, input_column);
 		}
 	}
-	projection->batch.abi_version = PG_BATCH_BRIDGE_ABI_VERSION;
-	projection->batch.struct_size = sizeof(PgBatchBridgeBatch);
+	projection->batch.abi_version = PG_BATCH_ABI_VERSION;
+	projection->batch.struct_size = sizeof(PgBatch);
 	projection->batch.ops = &projection_batch_ops;
 	projection->batch.private_data = projection;
 	MemoryContextSwitchTo(oldcontext);
 	return projection;
 }
 
-PgBatchBridgeBatch *
+PgBatch *
 pg_batch_expr_projection_bind(PgBatchExprProjection *projection,
-							  PgBatchBridgeBatch *input,
+							  PgBatch *input,
 							  ExprContext *econtext)
 {
 	projection->input = input;
@@ -222,13 +222,12 @@ pg_batch_expr_projection_bind(PgBatchExprProjection *projection,
 			MemSet(output->datum_rows, 0,
 				   sizeof(uint64) * output->datum_nword_capacity);
 		pg_batch_expr_bind(output->expr, input, econtext,
-						   PG_BATCH_BRIDGE_MATERIALIZE_PROJECT);
+						   PG_BATCH_COLUMN_PROJECT);
 	}
 	projection->batch.nrows = input->nrows;
 	projection->batch.nwords = input->nwords;
 	projection->batch.selection = input->selection;
 	projection->batch.table_oid = input->table_oid;
-	projection->batch.consumed = false;
 	return &projection->batch;
 }
 

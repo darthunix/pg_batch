@@ -1,9 +1,11 @@
-SUBDIRS = bridge nodes tam fdw
+EXAMPLE_DIRS = examples/compressed_tam examples/arrow_fdw
+SUBDIRS = bridge nodes $(EXAMPLE_DIRS)
 PG_CONFIG ?= pg_config
 MESON_BUILD_DIR = $(CURDIR)/build/meson-libs
 PG_BATCH_RUNTIME_LIB = $(MESON_BUILD_DIR)/runtime/libpg_batch_runtime.a
 PG_BATCH_KERNELS_LIB = $(MESON_BUILD_DIR)/kernels/libpg_batch_kernels.a
 PG_BATCH_EXPR_LIB = $(MESON_BUILD_DIR)/expr/libpg_batch_expr.a
+PG_BATCH_SPILL_LIB = $(MESON_BUILD_DIR)/spill/libpg_batch_spill.a
 PG_PKGLIBDIR = $(shell $(PG_CONFIG) --pkglibdir)
 PG_INCLUDEDIR_SERVER = $(shell $(PG_CONFIG) --includedir-server)
 NANOARROW_SOURCE = $(CURDIR)/third_party/nanoarrow
@@ -49,14 +51,15 @@ $(NANOARROW_STAMP): $(NANOARROW_SOURCE)/CMakeLists.txt
 	cmake --install "$(NANOARROW_BUILD)"
 	@touch "$@"
 
-nodes tam fdw: libraries
-fdw: nanoarrow
+nodes $(EXAMPLE_DIRS): libraries
+examples/arrow_fdw: nanoarrow
 
 $(SUBDIRS):
 	$(MAKE) -C $@ PG_CONFIG="$(PG_CONFIG)" \
 		PG_BATCH_RUNTIME_LIB="$(PG_BATCH_RUNTIME_LIB)" \
 		PG_BATCH_KERNELS_LIB="$(PG_BATCH_KERNELS_LIB)" \
-		PG_BATCH_EXPR_LIB="$(PG_BATCH_EXPR_LIB)"
+		PG_BATCH_EXPR_LIB="$(PG_BATCH_EXPR_LIB)" \
+		PG_BATCH_SPILL_LIB="$(PG_BATCH_SPILL_LIB)"
 
 clean:
 	@for dir in $(SUBDIRS) test; do \
@@ -69,26 +72,33 @@ clean:
 install: nanoarrow libraries
 	$(MAKE) -C bridge PG_CONFIG="$(PG_CONFIG)" install
 	DESTDIR="$(DESTDIR)" meson install -C "$(MESON_BUILD_DIR)"
-	@for dir in nodes tam fdw; do \
+	@for dir in nodes $(EXAMPLE_DIRS); do \
 		$(MAKE) -C $$dir PG_CONFIG="$(PG_CONFIG)" install || exit; \
 	done
 
 uninstall:
-	@for dir in fdw tam nodes bridge; do \
+	@for dir in examples/arrow_fdw examples/compressed_tam nodes bridge; do \
 		$(MAKE) -C $$dir PG_CONFIG="$(PG_CONFIG)" uninstall || exit; \
 	done
 	rm -f \
 		"$(DESTDIR)$(PG_PKGLIBDIR)/libpg_batch_runtime.a" \
 		"$(DESTDIR)$(PG_PKGLIBDIR)/libpg_batch_kernels.a" \
 		"$(DESTDIR)$(PG_PKGLIBDIR)/libpg_batch_expr.a" \
+		"$(DESTDIR)$(PG_PKGLIBDIR)/libpg_batch_spill.a" \
 		"$(DESTDIR)$(PG_PKGLIBDIR)/pkgconfig/pg_batch-runtime.pc" \
 		"$(DESTDIR)$(PG_PKGLIBDIR)/pkgconfig/pg_batch-kernels.pc" \
 		"$(DESTDIR)$(PG_PKGLIBDIR)/pkgconfig/pg_batch-expr.pc" \
-		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch_runtime/runtime.h" \
-		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch_runtime/vector.h" \
-		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch_kernels/kernels.h"
-	rm -f \
-		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch_expr/expr.h"
+		"$(DESTDIR)$(PG_PKGLIBDIR)/pkgconfig/pg_batch-spill.pc" \
+		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/runtime.h" \
+		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/vector.h" \
+		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/kernels.h" \
+		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/expr.h" \
+		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/spill.h" \
+		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/batch.h" \
+		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/bridge.h" \
+		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/node.h" \
+		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/source.h" \
+		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/arrow.h"
 
 installcheck:
 	$(MAKE) -C test PG_CONFIG="$(PG_CONFIG)" all

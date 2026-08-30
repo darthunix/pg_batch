@@ -9,7 +9,7 @@
 
 #include "postgres.h"
 
-struct PgBatchBridgeBatch;
+struct PgBatch;
 
 typedef enum PgBatchInt4Layout
 {
@@ -51,7 +51,7 @@ typedef struct PgBatchInt4Vector
 /*
  * Optional native batch interface for sources that already store int4
  * columns in one of the layouts above. Consumers discover it through
- * PgBatchBridgeBatchOps.get_native_interface(). Returning false for a column
+ * PgBatchOps.get_native_interface(). Returning false for a column
  * asks the runtime to fall back to another native interface or to Datums.
  */
 #define PG_BATCH_INT4_VECTOR_INTERFACE_NAME "pg_batch.int4_vector.v1"
@@ -61,7 +61,7 @@ typedef struct PgBatchInt4VectorInterface
 {
 	uint32		abi_version;
 	Size		struct_size;
-	bool		(*get_column) (struct PgBatchBridgeBatch *batch, int column,
+	bool		(*get_column) (struct PgBatch *batch, int column,
 							 PgBatchInt4Vector *result);
 } PgBatchInt4VectorInterface;
 

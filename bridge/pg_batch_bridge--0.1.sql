@@ -1,1 +1,0 @@
--- pg_batch_bridge exposes only a C ABI through a rendezvous variable.

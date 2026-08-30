@@ -1,4 +1,4 @@
-CREATE EXTENSION pg_batch_bridge;
+CREATE EXTENSION pg_batch_api;
 CREATE EXTENSION pg_batch_fdw;
 CREATE EXTENSION pg_batch;
 
@@ -227,4 +227,4 @@ DROP SERVER pg_batch_fdw_server;
 DROP TABLE pg_batch_fdw_source;
 DROP EXTENSION pg_batch;
 DROP EXTENSION pg_batch_fdw;
-DROP EXTENSION pg_batch_bridge;
+DROP EXTENSION pg_batch_api;

@@ -5,13 +5,13 @@ whether independent extensions can exchange batches through ordinary tuple
 slots, keep source-native columns between plan nodes, and postpone conversion
 to PostgreSQL `Datum` values.
 
-The repository is split into four extensions and three reusable C libraries:
+The repository is split into four extensions and four reusable C libraries:
 
 ```text
-nodes/  ----->  bridge/  <-----  tam/
-                    ^
-                    |
-                   fdw/
+examples/compressed_tam/ -----> bridge/ <----- nodes/
+examples/arrow_fdw/ -----------/                 |
+                                                  v
+                         runtime/ kernels/ expr/ spill/
 ```
 
 - `bridge/` is the only shared dependency. It provides a versioned rendezvous
@@ -21,28 +21,34 @@ nodes/  ----->  bridge/  <-----  tam/
 - `nodes/` provides `PgBatchScan`, `PgBatchFilterProject`, `PgBatchHashJoin`,
   `PgBatchAgg`, and the custom batch slot. It knows nothing about the test
   table access method.
-- `tam/` provides a heap-compatible test table access method and a
+- `examples/compressed_tam/` provides a heap-compatible test table access
+  method and a
   backend-local compressed columnar snapshot. It knows nothing about the
   custom nodes or their private slot structure.
-- `fdw/` is an independent Arrow IPC test source. It has both an ordinary
+- `examples/arrow_fdw/` is an independent Arrow IPC test source. It has both
+  an ordinary
   row-at-a-time FDW path and a direct bridge callback that returns native
   Arrow batches to the same nodes.
 - `runtime/` provides common batch traversal, lazy Datum/native adapters,
   borrowed vector views, an owned Datum buffer for collecting scalar slots,
-  and an opaque input object for consuming any registered batch producer.
+  and opaque input/output objects for connecting batch producers and
+  consumers.
   `kernels/` provides type-specific operations over those views. `expr/`
   compiles a deliberately small class of PostgreSQL expressions into reusable
-  vector operations and provides lazy projected batches. All three are
+  vector operations and provides lazy projected batches. `spill/` provides
+  bounded buffered partitions and dense 64-row blocks shared by stateful
+  nodes. All four are
   statically linked into consumers, so they add no loaded module or
   cross-extension function-call ABI.
 
-`nodes`, `tam`, and `fdw` consume the same runtime, kernel, and expression
-libraries. The bridge remains their only shared runtime service; the static
-libraries only remove duplicated C implementation from the extensions.
+`nodes` and both examples consume the same runtime, kernel, and expression
+libraries. The node extension also uses the spill library. The bridge remains
+their only shared runtime service; the static libraries only remove duplicated
+C implementation from the extensions.
 
 The `.control` and extension SQL files retain their full extension names
-because PostgreSQL looks them up by those names. Public bridge headers are
-installed under `extension/pg_batch_bridge/`; internal source files use short
+because PostgreSQL looks them up by those names. Public headers are installed
+under `extension/pg_batch/`; internal source files use short
 names such as `planner.c`, `slot.c`, `provider.c`, and `compressed.c`.
 
 ## Batch contract
@@ -72,7 +78,7 @@ values directly without depending on one source format.
 
 The attachment lookup is only for boundaries that receive an ordinary
 `TupleTableSlot *`, such as a table access method callback. It returns an
-opaque `PgBatchBridgeBinding *`. Batch-aware nodes retain that pointer and use
+opaque `PgBatchBinding *`. Batch-aware nodes retain that pointer and use
 it directly; the test table access method performs one lookup for each batch it
 returns.
 
@@ -80,7 +86,9 @@ Batch consumers use `PgBatchInput` to keep the producer, request binding, and
 actual returned slot binding together. This matters for pass-through nodes:
 the slot that receives a request need not be the slot that later publishes a
 batch. The input object caches that returned binding and provides explicit
-next, finish, advance, and rescan transitions without exposing its state.
+next, finish, and rescan transitions without exposing its state.
+`PgBatchOutput` publishes batches to another batch-aware node or exposes the
+selected rows through the same slot to an ordinary row-at-a-time parent.
 
 The bridge does not contain table-access-method policy or expression logic. It
 only owns the common ABI, source registry, slot attachments, selection bitmap,
@@ -118,7 +126,11 @@ Datum stays lazy. `PgBatchAgg` consumes full batches for `count(*)`,
 `count(expression)`, `sum(expression)`, `min(expression)`, and
 `max(expression)` without turning them into a row stream. Its planner asks the
 registered producer for the output-column layout, so it is not tied to a
-private node or slot type.
+private node or slot type. It also supports one direct `int4` grouping key.
+Groups that fit stay in a PostgreSQL hash table; new groups beyond the hash
+memory limit are divided into spill partitions and processed later. A
+partition that still has too many distinct groups is divided again with the
+next hash bits.
 
 `PgBatchHashJoin` is a deliberately narrow `int4` experiment. It supports a
 serial, unparameterized inner join with one or more direct `int4 = int4` hash
@@ -133,17 +145,18 @@ Direct safe `int4` conditions between the two inputs are evaluated over the
 candidate batch; other join conditions retain the normal scalar expression
 fallback.
 
-The join uses PostgreSQL's hash memory limit and `BufFile` temporary files.
+The join uses PostgreSQL's hash memory limit and the reusable `spill/` library.
 When the build side does not fit, the join keeps the partitions that fit in
-memory and writes the others as private 64-row column blocks. Probe rows for
+memory and writes the others as dense 64-row column blocks. Probe rows for
 resident partitions are joined immediately. A complete compact key filter
 rejects probe rows that cannot match before their projection columns are
 materialized or written. Input rows are grouped by partition in one pass, and
-small writes are buffered until a full block is available. If a partition
+small writes are buffered within a caller-provided memory limit. If a partition
 would need at least six build chunks, it is partitioned once more with the next
 hash bits. Data that remains skewed is read in bounded build chunks, with its
-probe file rescanned for every chunk. The spill format is private to this node
-and does not extend the bridge ABI.
+probe partition rescanned for every chunk. The spill library owns only block
+storage and readers; partition choice, recursion, and join policy remain in the
+node and do not extend the bridge ABI.
 Set `pg_batch.enable_hash_join = off` to keep the other batch nodes enabled
 while comparing against PostgreSQL's Hash Join.
 Set `pg_batch.enable_simd = off` to use the direct scalar `int4` filter kernel
@@ -239,10 +252,16 @@ pkg-config --cflags --libs --static pg_batch-expr
 
 `pg_batch-expr` includes the kernel and runtime dependencies.
 
+Stateful nodes can use the bounded partitioned spill blocks with:
+
+```sh
+pkg-config --cflags --libs --static pg_batch-spill
+```
+
 Create and load them in dependency order:
 
 ```sql
-CREATE EXTENSION pg_batch_bridge;
+CREATE EXTENSION pg_batch_api;
 CREATE EXTENSION pg_batch_tam;
 CREATE EXTENSION pg_batch_fdw;
 CREATE EXTENSION pg_batch;
@@ -274,18 +293,24 @@ PGPORT=5432 make \
 
 The suite also builds separate C modules through the installed `pkg-config`
 metadata, without private node headers. They check the reusable expression
-analyzer, kernels, public batch-input symbols, and a 70-row owned Datum buffer
-containing by-value, copied by-reference, and NULL values. The SQL tests cover
+analyzer, kernels, public batch input/output symbols, a bounded spill set, and
+a 70-row owned Datum buffer containing by-value, copied by-reference, and NULL
+values. The SQL tests cover
 heap, bitmap-index, table-AM, and FDW batches;
 native Arrow consumption; lazy `Datum` fallback; exact and pruning-only
 predicates; arithmetic filters and projections; parameters; NULL and error
-semantics; joins; rescans; early stop; disabled-source fallback; ABI rejection;
-and duplicate provider rejection.
+semantics; grouped and global aggregates; in-memory and spilled joins; rescans;
+early stop; disabled-source fallback; ABI rejection; and duplicate provider
+rejection.
 
 ## Source layout
 
-- `bridge/include/bridge.h` defines the common versioned ABI.
-- `bridge/include/arrow.h` defines the optional Arrow interface.
+- `include/pg_batch/batch.h` defines the batch value and lazy column contract.
+- `include/pg_batch/bridge.h` defines bindings, requests, and the versioned
+  registry ABI.
+- `include/pg_batch/source.h` defines the planner and executor contract for a
+  batch source; `node.h` defines the producer-side plan-node contract.
+- `include/pg_batch/arrow.h` defines the optional Arrow interface.
 - `bridge/bridge.c` owns the registry and slot attachments.
 - `runtime/` builds `libpg_batch_runtime.a` and provides common selection,
   column access, native/Datum adapters, borrowed vector views, and the
@@ -296,19 +321,27 @@ and duplicate provider rejection.
   for dense comparisons.
 - `expr/` builds `libpg_batch_expr.a`, analyzes and executes restricted `int4`
   expressions, and exposes a reusable lazy projection batch.
+- `spill/` builds `libpg_batch_spill.a` and provides bounded buffered logical
+  tape partitions with rewindable or destructive readers.
 - `nodes/planner.c` builds sequential and bitmap-backed custom plans.
 - `nodes/slot.c` implements the custom slot and heap batch source.
 - `nodes/scan.c`, `filter.c`, `project.c`, `hash_join.c`, and `aggregate.c`
   implement the executor nodes.
-- `tam/provider.c` classifies source predicates and manages scans.
-- `tam/compressed.c` owns snapshots, native columns, group pruning, and source
+- `examples/compressed_tam/provider.c` classifies source predicates and
+  manages scans.
+- `examples/compressed_tam/compressed.c` owns snapshots, native columns, group
+  pruning, and source
   filtering.
-- `tam/tableam.c` is the heap-compatible test table access method boundary.
-- `fdw/planner.c` implements both the PostgreSQL FDW callbacks and bridge
+- `examples/compressed_tam/tableam.c` is the heap-compatible test table access
+  method boundary.
+- `examples/arrow_fdw/planner.c` implements both the PostgreSQL FDW callbacks
+  and bridge
   predicate classification.
-- `fdw/scan.c` reads Arrow IPC record batches, applies source filters, and
+- `examples/arrow_fdw/scan.c` reads Arrow IPC record batches, applies source
+  filters, and
   exposes lazy native or Datum columns.
-- `fdw/export.c` writes ordinary `int4` tables as test Arrow IPC streams.
+- `examples/arrow_fdw/export.c` writes ordinary `int4` tables as test Arrow IPC
+  streams.
 
 ## Benchmark
 
@@ -330,6 +363,7 @@ psql -f benchmark/run_brin.sql
 psql -f benchmark/run_bitmap_index.sql
 psql -f benchmark/run_hash_join.sql
 psql -f benchmark/run_hash_join_large.sql
+psql -f benchmark/run_group_aggregate.sql
 psql -f benchmark/run_fdw.sql
 ```
 
@@ -353,6 +387,8 @@ dense filters, a late projection, and fused aggregates. It accepts the same
 `batch_library`, `variant`, and `repetitions` variables.
 `run_expr.sql` alternates ordinary and batch execution for arithmetic filters,
 computed aggregate inputs, and a late column in a wide heap tuple.
+`run_group_aggregate.sql` compares grouped `count`, `sum`, `min`, and `max`
+over 1,000 and 200,000 groups, including a low-`work_mem` spill case.
 
 ```sh
 psql -v variant=before -v batch_library=/path/to/before/pg_batch \

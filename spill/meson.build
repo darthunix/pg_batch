@@ -1,10 +1,6 @@
-runtime_lib = static_library(
-  'pg_batch_runtime',
-  'api.c',
-  'adapter.c',
-  'datum_buffer.c',
-  'input.c',
-  'output.c',
+spill_lib = static_library(
+  'pg_batch_spill',
+  'spill.c',
   dependencies: postgres_dep,
   include_directories: public_inc,
   gnu_symbol_visibility: 'hidden',
@@ -13,14 +9,13 @@ runtime_lib = static_library(
   pic: true,
 )
 
-runtime_dep = declare_dependency(
-  link_with: runtime_lib,
+spill_dep = declare_dependency(
+  link_with: spill_lib,
   dependencies: postgres_dep,
   include_directories: public_inc,
 )
 
 install_headers(
-  '../include/pg_batch/runtime.h',
-  '../include/pg_batch/vector.h',
+  '../include/pg_batch/spill.h',
   install_dir: pg_server_include / 'extension' / 'pg_batch',
 )

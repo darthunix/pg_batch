@@ -4,7 +4,7 @@ kernels_lib = static_library(
   'int4_hash.c',
   'int4_simd.c',
   dependencies: runtime_dep,
-  include_directories: kernels_inc,
+  include_directories: public_inc,
   gnu_symbol_visibility: 'hidden',
   install: true,
   install_dir: pg_pkglibdir,
@@ -14,10 +14,10 @@ kernels_lib = static_library(
 kernels_dep = declare_dependency(
   link_with: kernels_lib,
   dependencies: runtime_dep,
-  include_directories: kernels_inc,
+  include_directories: public_inc,
 )
 
 install_headers(
-  'include/kernels.h',
-  install_dir: pg_server_include / 'extension' / 'pg_batch_kernels',
+  '../include/pg_batch/kernels.h',
+  install_dir: pg_server_include / 'extension' / 'pg_batch',
 )

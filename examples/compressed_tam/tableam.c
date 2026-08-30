@@ -16,7 +16,7 @@ static bool pg_batch_tableam_initialized;
  * This is deliberately a heap-compatible test AM, not a second storage
  * implementation. Ordinary callers use every heap callback unchanged. A
  * batch-aware scan attaches its request to an otherwise ordinary slot
- * through pg_batch_bridge. The TAM publishes a batch through the same bridge;
+ * through pg_batch_api. The TAM publishes a batch through the same bridge;
  * neither side needs the other extension's private slot definition.
  */
 
@@ -24,9 +24,9 @@ static bool
 compressed_getnextslot(TableScanDesc scan, ScanDirection direction,
 					   TupleTableSlot *slot)
 {
-	PgBatchBridgeBinding *binding = pg_batch_tam_bridge->find_binding(slot);
-	const PgBatchBridgeRequest *request =
-		pg_batch_tam_bridge->get_request(binding);
+	PgBatchBinding *binding = pg_batch_tam_api->find_binding(slot);
+	const PgBatchRequest *request =
+		pg_batch_tam_api->get_request(binding);
 
 	if (request == NULL || request->provider_name == NULL ||
 		strcmp(request->provider_name, PG_BATCH_TAM_PROVIDER_NAME) != 0)

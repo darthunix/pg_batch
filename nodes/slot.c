@@ -35,7 +35,7 @@ slot_release(TupleTableSlot *slot)
 {
 	PgBatchSlot *bslot = (PgBatchSlot *) slot;
 
-	pg_batch_bridge->detach_binding(bslot->binding);
+	pg_batch_api->detach_binding(bslot->binding);
 	bslot->binding = NULL;
 	bslot->active_batch = NULL;
 	release_materialized(bslot);
@@ -50,7 +50,7 @@ slot_clear(TupleTableSlot *slot)
 {
 	PgBatchSlot *bslot = (PgBatchSlot *) slot;
 
-	pg_batch_bridge->clear_batch(bslot->binding);
+	pg_batch_api->clear_batch(bslot->binding);
 	bslot->active_batch = NULL;
 	release_materialized(bslot);
 	if (BufferIsValid(bslot->buffer))
@@ -248,7 +248,7 @@ sort_columns_by_attnum(PgBatchSlot *bslot, int *columns, int ncolumns)
 }
 
 static void
-heap_prepare_columns(PgBatchBridgeBatch *batch,
+heap_prepare_columns(PgBatch *batch,
 					 const Bitmapset *columns,
 					 const uint64 *selected_rows,
 					 PgBatchMaterializePhase phase)
@@ -295,10 +295,10 @@ heap_prepare_columns(PgBatchBridgeBatch *batch,
 }
 
 static void
-heap_get_datum_column(PgBatchBridgeBatch *batch, int column,
+heap_get_datum_column(PgBatch *batch, int column,
 					  const uint64 *selected_rows,
 					  PgBatchMaterializePhase phase,
-					  PgBatchBridgeDatumColumn *result)
+					  PgBatchDatumVector *result)
 {
 	PgBatchSlot *bslot = batch->private_data;
 	PgBatchColumn *bcolumn;
@@ -322,7 +322,7 @@ heap_get_datum_column(PgBatchBridgeBatch *batch, int column,
 }
 
 static void
-heap_release(PgBatchBridgeBatch *batch)
+heap_release(PgBatch *batch)
 {
 	PgBatchSlot *bslot = batch->private_data;
 
@@ -332,9 +332,9 @@ heap_release(PgBatchBridgeBatch *batch)
 	bslot->block = InvalidBlockNumber;
 }
 
-static const PgBatchBridgeBatchOps pg_batch_heap_batch_ops = {
-	.abi_version = PG_BATCH_BRIDGE_ABI_VERSION,
-	.struct_size = sizeof(PgBatchBridgeBatchOps),
+static const PgBatchOps pg_batch_heap_batch_ops = {
+	.abi_version = PG_BATCH_ABI_VERSION,
+	.struct_size = sizeof(PgBatchOps),
 	.prepare_columns = heap_prepare_columns,
 	.get_datum_column = heap_get_datum_column,
 	.get_native_interface = NULL,
@@ -342,13 +342,13 @@ static const PgBatchBridgeBatchOps pg_batch_heap_batch_ops = {
 };
 
 static void consumer_select_row(TupleTableSlot *slot,
-								PgBatchBridgeBatch *batch, int row);
+								PgBatch *batch, int row);
 
 static void
-accept_batch(TupleTableSlot *slot, PgBatchBridgeBatch *batch)
+accept_batch(TupleTableSlot *slot, PgBatch *batch)
 {
 	PgBatchSlot *bslot = pg_batch_slot_cast(slot);
-	int			row = pg_batch_bridge_next_selected(batch, -1);
+	int			row = pg_batch_next_selected(batch, -1);
 
 	if (row < 0)
 		elog(ERROR, "pg_batch source published an empty selection");
@@ -360,12 +360,12 @@ accept_batch(TupleTableSlot *slot, PgBatchBridgeBatch *batch)
 
 static void
 consumer_select_row(TupleTableSlot *slot,
-					PgBatchBridgeBatch *batch, int row)
+					PgBatch *batch, int row)
 {
 	PgBatchSlot *bslot = pg_batch_slot_cast(slot);
 
 	Assert(row >= 0 && row < batch->nrows);
-	Assert(pg_batch_bridge_row_selected(batch, row));
+	Assert(pg_batch_row_selected(batch, row));
 	release_materialized(bslot);
 	bslot->current_row = row;
 	slot->tts_nvalid = 0;
@@ -377,9 +377,9 @@ consumer_select_row(TupleTableSlot *slot,
 	slot->tts_tableOid = batch->table_oid;
 }
 
-static const PgBatchBridgeConsumerOps pg_batch_slot_consumer_ops = {
-	.abi_version = PG_BATCH_BRIDGE_ABI_VERSION,
-	.struct_size = sizeof(PgBatchBridgeConsumerOps),
+static const PgBatchConsumerOps pg_batch_slot_consumer_ops = {
+	.abi_version = PG_BATCH_ABI_VERSION,
+	.struct_size = sizeof(PgBatchConsumerOps),
 	.accept_batch = accept_batch,
 	.select_row = consumer_select_row,
 };
@@ -387,9 +387,9 @@ static const PgBatchBridgeConsumerOps pg_batch_slot_consumer_ops = {
 void
 pg_batch_select_row(TupleTableSlot *slot, int row)
 {
-	PgBatchBridgeBatch *batch = pg_batch_get_batch(slot);
+	PgBatch *batch = pg_batch_get_batch(slot);
 
-	if (!pg_batch_bridge_row_selected(batch, row))
+	if (!pg_batch_row_selected(batch, row))
 		elog(ERROR, "pg_batch cannot select row %d", row);
 	consumer_select_row(slot, batch, row);
 }
@@ -398,7 +398,7 @@ static void
 batch_slot_getsomeattrs(TupleTableSlot *slot, int natts)
 {
 	PgBatchSlot *bslot = (PgBatchSlot *) slot;
-	PgBatchBridgeBatch *batch = pg_batch_get_batch(slot);
+	PgBatch *batch = pg_batch_get_batch(slot);
 	Bitmapset  *needed = NULL;
 	PgBatchMaterializePhase phase;
 	uint64		local_rowbits;
@@ -431,7 +431,7 @@ batch_slot_getsomeattrs(TupleTableSlot *slot, int natts)
 
 	for (int column = slot->tts_nvalid; column < natts; column++)
 	{
-		PgBatchBridgeDatumColumn bcolumn;
+		PgBatchDatumVector bcolumn;
 		int			word = bslot->current_row / 64;
 		uint64		bit = UINT64CONST(1) << (bslot->current_row % 64);
 
@@ -556,7 +556,7 @@ pg_batch_configure_slot(PgBatchSlot *bslot, TupleDesc source_desc,
 	foreach(lc, source_attnums)
 		bslot->source_attnums[column++] = lfirst_int(lc);
 	Assert(column == bslot->ncolumns);
-	bslot->binding = pg_batch_bridge->attach_slot(&bslot->base,
+	bslot->binding = pg_batch_api->attach_slot(&bslot->base,
 												  bslot->source_attnums,
 												  bslot->ncolumns,
 												  &pg_batch_slot_consumer_ops);
@@ -564,12 +564,12 @@ pg_batch_configure_slot(PgBatchSlot *bslot, TupleDesc source_desc,
 
 void
 pg_batch_set_request(TupleTableSlot *slot, const Bitmapset *filter_columns,
-					 const Bitmapset *survivor_columns, bool return_batch)
+					 const Bitmapset *project_columns, bool return_batch)
 {
 	PgBatchSlot *bslot = pg_batch_slot_cast(slot);
 
-	pg_batch_bridge->set_request(bslot->binding, filter_columns,
-								 survivor_columns, return_batch);
+	pg_batch_api->set_request(bslot->binding, filter_columns,
+								 project_columns, return_batch);
 }
 
 void
@@ -592,13 +592,13 @@ pg_batch_load_batch(PgBatchSlot *bslot, Buffer buffer, BlockNumber block,
 											sizeof(PgBatchColumn) * bslot->ncolumns);
 
 	bslot->heap_selection = pg_batch_nrows_mask(nrows);
-	bslot->heap_batch.abi_version = PG_BATCH_BRIDGE_ABI_VERSION;
-	bslot->heap_batch.struct_size = sizeof(PgBatchBridgeBatch);
+	bslot->heap_batch.abi_version = PG_BATCH_ABI_VERSION;
+	bslot->heap_batch.struct_size = sizeof(PgBatch);
 	bslot->heap_batch.nrows = nrows;
 	bslot->heap_batch.nwords = 1;
 	bslot->heap_batch.selection = &bslot->heap_selection;
 	bslot->heap_batch.table_oid = table_oid;
 	bslot->heap_batch.ops = &pg_batch_heap_batch_ops;
 	bslot->heap_batch.private_data = bslot;
-	pg_batch_bridge->publish_batch(bslot->binding, &bslot->heap_batch);
+	pg_batch_api->publish_batch(bslot->binding, &bslot->heap_batch);
 }

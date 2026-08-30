@@ -41,8 +41,8 @@ typedef struct BatchScanState
 	bool		page_recheck;
 	bool		first_batch_on_page;
 	bool		bitmap_initialized;
-	const		PgBatchBridgeRequest *request;
-	const		PgBatchBridgeProviderOps *provider;
+	const		PgBatchRequest *request;
+	const		PgBatchProviderOps *provider;
 	void	   *provider_state;
 	bool		done;
 	uint64		batches;
@@ -109,7 +109,7 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 											  nsource_exprs);
 	List	   *local_quals = list_copy_tail(cscan->custom_exprs,
 											 nsource_exprs);
-	PgBatchBridgeBinding *binding;
+	PgBatchBinding *binding;
 	int			i = 0;
 
 	if (eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK))
@@ -120,13 +120,13 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 							RelationGetDescr(node->ss.ss_currentRelation),
 							attnums, nfilter);
 	binding = bslot->binding;
-	state->request = pg_batch_bridge->get_request(binding);
+	state->request = pg_batch_api->get_request(binding);
 	state->heap_scan_mode = heap_scan_mode;
 	if (provider_name[0] != '\0')
 	{
-		PgBatchBridgeExecRequest request;
+		PgBatchSourceExecRequest request;
 
-		state->provider = pg_batch_bridge->get_provider(provider_name);
+		state->provider = pg_batch_api->get_provider(provider_name);
 		if (state->provider == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -146,7 +146,7 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 		request.query_context = estate->es_query_cxt;
 		request.slot_request = state->request;
 		state->provider_state = state->provider->begin_scan(&request);
-		pg_batch_bridge->set_provider(binding, provider_name,
+		pg_batch_api->set_provider(binding, provider_name,
 									  state->provider_state);
 	}
 	if (heap_scan_mode == PG_BATCH_HEAP_BITMAP)
@@ -288,12 +288,12 @@ next_batch(BatchScanState *state, PgBatchSlot *bslot)
 
 		if (state->provider->next_batch != NULL)
 		{
-			PgBatchBridgeBatch *batch =
+			PgBatch *batch =
 				state->provider->next_batch(state->provider_state);
 
 			found = batch != NULL;
 			if (found)
-				pg_batch_bridge->publish_batch(bslot->binding, batch);
+				pg_batch_api->publish_batch(bslot->binding, batch);
 		}
 		else
 			found = table_scan_getnextslot(state->scan,
@@ -360,7 +360,7 @@ static int
 filter_batch(BatchScanState *state, PgBatchSlot *bslot)
 {
 	ExprContext *econtext = state->css.ss.ps.ps_ExprContext;
-	PgBatchBridgeBatch *batch = pg_batch_get_batch(&bslot->base);
+	PgBatch *batch = pg_batch_get_batch(&bslot->base);
 	MemoryContext oldcontext;
 	int			initial = pg_batch_row_count(batch);
 	ResetExprContext(econtext);
@@ -403,7 +403,7 @@ scan_exec(CustomScanState *node)
 {
 	BatchScanState *state = (BatchScanState *) node;
 	PgBatchSlot *bslot = pg_batch_slot_cast(node->ss.ss_ScanTupleSlot);
-	PgBatchBridgeBatch *batch;
+	PgBatch *batch;
 
 	if (!ScanDirectionIsForward(node->ss.ps.state->es_direction))
 		ereport(ERROR,
@@ -414,7 +414,7 @@ scan_exec(CustomScanState *node)
 	batch = bslot->active_batch;
 	if (batch != NULL)
 	{
-		if (!batch->consumed)
+		if (!pg_batch_api->batch_finished(bslot->binding))
 			elog(ERROR, "pg_batch consumer requested a new batch too early");
 		ExecClearTuple(&bslot->base);
 	}
@@ -432,7 +432,7 @@ scan_exec(CustomScanState *node)
 			continue;
 		}
 		pg_batch_select_row(&bslot->base,
-							pg_batch_bridge_next_selected(batch, -1));
+							pg_batch_next_selected(batch, -1));
 		if (node->ss.ps.instrument != NULL)
 			node->ss.ps.instrument->tuplecount += rows - 1;
 		return &bslot->base;

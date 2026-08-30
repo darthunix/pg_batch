@@ -1,27 +1,16 @@
 #include "postgres.h"
 
+#include "catalog/pg_type_d.h"
 #include "executor/executor.h"
-#include "storage/buffile.h"
 #include "utils/memutils.h"
 
 #include "hash_join_internal.h"
 
 /*
- * Private disk path for PgBatchHashJoin. Files contain 64-row column blocks
- * with a hash per row, one validity word per column, and dense int32 values.
- * Initial partitioning groups a source batch in one pass and buffers small
- * writes. Large partitions can use more hash bits for one extra partitioning
- * level; data that remains skewed is processed by rescanning the probe file.
+ * PgBatchHashJoin policy over the reusable spill module. Initial partitioning
+ * keeps selected partitions resident. Large disk partitions can use more hash
+ * bits; data that remains skewed is processed by rescanning frozen probe tape.
  */
-
-typedef struct SpillHeader
-{
-	uint32		magic;
-	uint16		nrows;
-	uint16		ncolumns;
-} SpillHeader;
-
-#define PG_BATCH_SPILL_MAGIC 0x50474248U
 
 /*
  * Repartitioning writes both sides once more. For a few cached probe passes,
@@ -29,7 +18,43 @@ typedef struct SpillHeader
  */
 #define PG_BATCH_REPARTITION_MIN_PASSES 6
 
-static void rewind_spill_file(BufFile *file);
+static void rewind_spill_file(HashSpillFile *file);
+static inline uint64 spill_validity_word(const uint8 *validity);
+
+static TupleDesc
+spill_tuple_desc(int ncolumns)
+{
+	TupleDesc	desc = CreateTemplateTupleDesc(ncolumns);
+
+	for (int column = 0; column < ncolumns; column++)
+		TupleDescInitEntry(desc, column + 1, NULL, INT4OID, -1, 0);
+	TupleDescFinalize(desc);
+	return desc;
+}
+
+static PgBatchSpillSet *
+spill_set_for_files(BatchHashJoinState *state, HashSpillFile **files)
+{
+	if (files == state->build_files)
+		return state->build_spill;
+	if (files == state->probe_files)
+		return state->probe_spill;
+	if (files == state->repartition_build_files)
+		return state->repartition_build_spill;
+	if (files == state->repartition_probe_files)
+		return state->repartition_probe_spill;
+	elog(ERROR, "unknown pg_batch hash join spill file set");
+	pg_unreachable();
+}
+
+static void
+record_spill_writes(BatchHashJoinState *state, PgBatchSpillSet *set)
+{
+	const PgBatchSpillStats *stats = pg_batch_spill_stats(set);
+
+	state->spill_bytes += stats->bytes_written;
+	state->spill_pages_written += stats->blocks_written;
+}
 
 static inline void
 bloom_add(BatchHashJoinState *state, uint32 hash)
@@ -52,15 +77,15 @@ bloom_may_contain(const BatchHashJoinState *state, uint32 hash)
 }
 
 static void
-spill_prepare_columns(PgBatchBridgeBatch *batch, const Bitmapset *columns,
+spill_prepare_columns(PgBatch *batch, const Bitmapset *columns,
 					  const uint64 *rows,
-					  PgBatchBridgeMaterializePhase phase)
+					  PgBatchColumnPhase phase)
 {
 	/* Spill blocks are already stored as dense native int32 columns. */
 }
 
 static void
-spill_get_arrow_column(PgBatchBridgeBatch *batch, int column,
+spill_get_arrow_column(PgBatch *batch, int column,
 					   PgBatchArrowView *view)
 {
 	SpillBlock *block = batch->private_data;
@@ -71,25 +96,25 @@ spill_get_arrow_column(PgBatchBridgeBatch *batch, int column,
 	view->schema = &block->schemas[column];
 }
 
-static const PgBatchBridgeArrowInterface spill_arrow_interface = {
-	.abi_version = PG_BATCH_BRIDGE_ARROW_INTERFACE_VERSION,
-	.struct_size = sizeof(PgBatchBridgeArrowInterface),
+static const PgBatchArrowInterface spill_arrow_interface = {
+	.abi_version = PG_BATCH_ARROW_INTERFACE_VERSION,
+	.struct_size = sizeof(PgBatchArrowInterface),
 	.get_column = spill_get_arrow_column,
 };
 
 static const void *
-spill_get_native_interface(PgBatchBridgeBatch *batch, const char *name,
+spill_get_native_interface(PgBatch *batch, const char *name,
 						   uint32 version)
 {
-	if (version == PG_BATCH_BRIDGE_ARROW_INTERFACE_VERSION &&
-		strcmp(name, PG_BATCH_BRIDGE_ARROW_INTERFACE_NAME) == 0)
+	if (version == PG_BATCH_ARROW_INTERFACE_VERSION &&
+		strcmp(name, PG_BATCH_ARROW_INTERFACE_NAME) == 0)
 		return &spill_arrow_interface;
 	return NULL;
 }
 
-static const PgBatchBridgeBatchOps spill_batch_ops = {
-	.abi_version = PG_BATCH_BRIDGE_ABI_VERSION,
-	.struct_size = sizeof(PgBatchBridgeBatchOps),
+static const PgBatchOps spill_batch_ops = {
+	.abi_version = PG_BATCH_ABI_VERSION,
+	.struct_size = sizeof(PgBatchOps),
 	.prepare_columns = spill_prepare_columns,
 	.get_datum_column = NULL,
 	.get_native_interface = spill_get_native_interface,
@@ -98,19 +123,22 @@ static const PgBatchBridgeBatchOps spill_batch_ops = {
 
 static void
 init_spill_block(SpillBlock *block, int ncolumns, int capacity,
-				 MemoryContext context)
+				 MemoryContext context, bool allocate_data)
 {
 	int			validity_bytes = (capacity + 7) / 8;
 
 	block->ncolumns = ncolumns;
 	block->capacity = capacity;
-	block->hashes = MemoryContextAlloc(context,
-									 sizeof(uint32) * capacity);
-	block->values = MemoryContextAlloc(context,
+	if (allocate_data)
+	{
+		block->hashes = MemoryContextAlloc(context,
+										 sizeof(uint32) * capacity);
+		block->values = MemoryContextAlloc(context,
 									   sizeof(int32) * ncolumns * capacity);
-	block->validity = MemoryContextAlloc(context,
+		block->validity = MemoryContextAlloc(context,
 										 sizeof(uint8) * ncolumns *
 										 validity_bytes);
+	}
 	block->buffers = MemoryContextAlloc(context,
 										sizeof(void *) * ncolumns * 2);
 	block->arrays = MemoryContextAllocZero(context,
@@ -119,17 +147,20 @@ init_spill_block(SpillBlock *block, int ncolumns, int capacity,
 											sizeof(struct ArrowSchema) * ncolumns);
 	for (int column = 0; column < ncolumns; column++)
 	{
-		block->buffers[column * 2] =
-			&block->validity[column * validity_bytes];
-		block->buffers[column * 2 + 1] =
-			&block->values[column * capacity];
+		if (allocate_data)
+		{
+			block->buffers[column * 2] =
+				&block->validity[column * validity_bytes];
+			block->buffers[column * 2 + 1] =
+				&block->values[column * capacity];
+		}
 		block->arrays[column].n_buffers = 2;
 		block->arrays[column].buffers = &block->buffers[column * 2];
 		block->schemas[column].format = "i";
 		block->schemas[column].flags = ARROW_FLAG_NULLABLE;
 	}
-	block->batch.abi_version = PG_BATCH_BRIDGE_ABI_VERSION;
-	block->batch.struct_size = sizeof(PgBatchBridgeBatch);
+	block->batch.abi_version = PG_BATCH_ABI_VERSION;
+	block->batch.struct_size = sizeof(PgBatch);
 	block->batch.nwords = 1;
 	block->batch.selection = &block->selection;
 	block->batch.table_oid = InvalidOid;
@@ -138,191 +169,81 @@ init_spill_block(SpillBlock *block, int ncolumns, int capacity,
 }
 
 static bool
-read_spill_block(BatchHashJoinState *state, BufFile *file, SpillBlock *block)
+read_spill_block(BatchHashJoinState *state, HashSpillFile *file,
+				 SpillBlock *block)
 {
-	int			total_rows = 0;
-	int			validity_bytes = (block->capacity + 7) / 8;
+	PgBatchSpillBlock input;
+	uint64		row_mask;
 
-	MemSet(block->validity, 0,
-		   sizeof(uint8) * block->ncolumns * validity_bytes);
-	while (total_rows < PG_BATCH_SIZE)
-	{
-		SpillHeader header;
-		int			fileno;
-		pgoff_t		offset;
-		size_t		read;
-
-		BufFileTell(file, &fileno, &offset);
-		read = BufFileReadMaybeEOF(file, &header, sizeof(header), true);
-		if (read == 0)
-			break;
-		if (read != sizeof(header) || header.magic != PG_BATCH_SPILL_MAGIC ||
-			header.nrows == 0 || header.nrows > PG_BATCH_SIZE ||
-			header.ncolumns != block->ncolumns)
-			elog(ERROR, "invalid pg_batch hash join spill block");
-		if (total_rows > 0 && total_rows + header.nrows > block->capacity)
-		{
-			if (BufFileSeek(file, fileno, offset, SEEK_SET) != 0)
-				elog(ERROR, "could not seek pg_batch hash join spill file");
-			break;
-		}
-		BufFileReadExact(file, &block->hashes[total_rows],
-						 sizeof(uint32) * header.nrows);
-		state->spill_pages_read++;
-		for (int column = 0; column < block->ncolumns; column++)
-		{
-			uint64		validity;
-
-			BufFileReadExact(file, &validity, sizeof(validity));
-			BufFileReadExact(file,
-							 &block->values[column * block->capacity + total_rows],
-							 sizeof(int32) * header.nrows);
-			for (int row = 0; row < header.nrows; row++)
-			{
-				int			output_row = total_rows + row;
-
-				if ((validity & (UINT64CONST(1) << row)) != 0)
-					block->validity[column * validity_bytes +
-									output_row / 8] |=
-						(uint8) 1 << (output_row % 8);
-			}
-		}
-		total_rows += header.nrows;
-	}
-	if (total_rows == 0)
+	if (file->reader == NULL)
+		file->reader = pg_batch_spill_reader_open(file->set, file->partition);
+	if (!pg_batch_spill_reader_next(file->reader, &input))
 		return false;
-	block->nrows = total_rows;
+	if (input.ncolumns != block->ncolumns ||
+		block->capacity < PG_BATCH_SPILL_BLOCK_ROWS)
+		elog(ERROR, "invalid pg_batch hash join spill block");
+	/* Borrow the reader's dense block until its next read or rewind. */
+	block->hashes = (uint32 *) input.hashes;
+	block->values = (int32 *) input.values;
+	block->validity = (uint8 *) input.validity;
+	block->nrows = input.nrows;
+	row_mask = pg_batch_nrows_mask(block->nrows);
+	state->spill_pages_read++;
 	for (int column = 0; column < block->ncolumns; column++)
 	{
 		struct ArrowArray *array = &block->arrays[column];
 
+		block->buffers[column * 2] = &input.validity[column * 8];
+		block->buffers[column * 2 + 1] =
+			&input.values[column * PG_BATCH_SPILL_BLOCK_ROWS];
 		array->length = block->nrows;
 		array->offset = 0;
-		array->null_count = 0;
-		for (int row = 0; row < block->nrows; row++)
-		{
-			if ((block->validity[column * validity_bytes + row / 8] &
-				 ((uint8) 1 << (row % 8))) == 0)
-				array->null_count++;
-		}
+		array->null_count = block->nrows -
+			pg_popcount64(spill_validity_word(&input.validity[column * 8]) &
+				row_mask);
 	}
-	block->selection = pg_batch_nrows_mask(block->nrows);
+	block->selection = row_mask;
 	block->batch.nrows = block->nrows;
-	block->batch.consumed = false;
 	return true;
 }
 
-static uint64
-spill_block_bytes(int ncolumns, int nrows)
-{
-	return sizeof(SpillHeader) + sizeof(uint32) * nrows +
-		ncolumns * (sizeof(uint64) + sizeof(int32) * nrows);
-}
-
-static BufFile *
-spill_file(BufFile **file)
+static HashSpillFile *
+spill_file(PgBatchSpillSet *set, HashSpillFile **file, int partition)
 {
 	if (*file == NULL)
-		*file = BufFileCreateTemp(false);
+	{
+		*file = palloc0_object(HashSpillFile);
+		(*file)->set = set;
+		(*file)->partition = partition;
+	}
 	return *file;
 }
 
-static void
-write_input_block(BatchHashJoinState *state, BufFile *file,
-				  InputColumn *columns, int ncolumns, const int *rows,
-				  const uint32 *hashes, int nrows)
+static inline uint64
+spill_validity_word(const uint8 *validity)
 {
-	SpillHeader header = {PG_BATCH_SPILL_MAGIC, nrows, ncolumns};
-	uint32		block_hashes[PG_BATCH_SIZE];
-	int32		values[PG_BATCH_SIZE];
+	uint64		result = 0;
 
-	BufFileWrite(file, &header, sizeof(header));
-	for (int i = 0; i < nrows; i++)
-		block_hashes[i] = hashes[rows[i]];
-	BufFileWrite(file, block_hashes, sizeof(uint32) * nrows);
-	for (int column = 0; column < ncolumns; column++)
-	{
-		uint64		validity = 0;
-
-		for (int i = 0; i < nrows; i++)
-		{
-			bool		isnull;
-
-			values[i] = hash_join_input_value(&columns[column], rows[i], &isnull);
-			if (!isnull)
-				validity |= UINT64CONST(1) << i;
-		}
-		BufFileWrite(file, &validity, sizeof(validity));
-		BufFileWrite(file, values, sizeof(int32) * nrows);
-	}
-	state->spill_bytes += spill_block_bytes(ncolumns, nrows);
-	state->spill_pages_written++;
+	for (int byte = 0; byte < 8; byte++)
+		result |= (uint64) validity[byte] << (byte * 8);
+	return result;
 }
 
 static void
-flush_spill_buffer(BatchHashJoinState *state, BufFile **files,
-				   int partition, int ncolumns)
-{
-	int			nrows = state->spill_buffer_counts[partition];
-	SpillHeader header = {PG_BATCH_SPILL_MAGIC, nrows, ncolumns};
-	uint32	   *hashes = &state->spill_buffer_hashes[
-												 partition * PG_BATCH_SIZE];
-
-	if (nrows == 0)
-		return;
-	BufFileWrite(spill_file(&files[partition]), &header, sizeof(header));
-	BufFileWrite(files[partition], hashes, sizeof(uint32) * nrows);
-	for (int column = 0; column < ncolumns; column++)
-	{
-		uint64	   *validity = &state->spill_buffer_validity[
-			partition * state->spill_buffer_columns + column];
-		int32	   *values = &state->spill_buffer_values[
-			(partition * state->spill_buffer_columns + column) * PG_BATCH_SIZE];
-
-		BufFileWrite(files[partition], validity, sizeof(uint64));
-		BufFileWrite(files[partition], values, sizeof(int32) * nrows);
-		*validity = 0;
-	}
-	state->spill_bytes += spill_block_bytes(ncolumns, nrows);
-	state->spill_pages_written++;
-	state->spill_buffer_counts[partition] = 0;
-}
-
-static void
-write_partition_rows(BatchHashJoinState *state, BufFile **files,
+write_partition_rows(BatchHashJoinState *state, HashSpillFile **files,
 					 int partition, InputColumn *columns, int ncolumns,
 					 const int *rows, const uint32 *hashes, int nrows)
 {
-	if (!state->spill_buffered)
-	{
-		write_input_block(state, spill_file(&files[partition]), columns,
-						  ncolumns, rows, hashes, nrows);
-		return;
-	}
+	PgBatchSpillSet *set = spill_set_for_files(state, files);
+	uint64		selection = 0;
+
+	for (int column = 0; column < ncolumns; column++)
+		state->spill_input_vectors[column] = columns[column].vector;
 	for (int i = 0; i < nrows; i++)
-	{
-		int			output = state->spill_buffer_counts[partition]++;
-
-		state->spill_buffer_hashes[
-			partition * PG_BATCH_SIZE + output] =
-			hashes[rows[i]];
-		for (int column = 0; column < ncolumns; column++)
-		{
-			bool		isnull;
-			int32		value = hash_join_input_value(&columns[column], rows[i], &isnull);
-			int			buffer_column =
-				partition * state->spill_buffer_columns + column;
-
-			state->spill_buffer_values[
-				buffer_column * PG_BATCH_SIZE + output] =
-				value;
-			if (!isnull)
-				state->spill_buffer_validity[
-					buffer_column] |= UINT64CONST(1) << output;
-		}
-		if (state->spill_buffer_counts[partition] == PG_BATCH_SIZE)
-			flush_spill_buffer(state, files, partition, ncolumns);
-	}
+		selection |= UINT64CONST(1) << rows[i];
+	pg_batch_spill_write(set, partition, state->spill_input_vectors,
+		PG_BATCH_SIZE, &selection, hashes);
+	spill_file(set, &files[partition], partition);
 }
 
 static void
@@ -349,20 +270,11 @@ buffer_resident_probe_row(BatchHashJoinState *state, InputColumn *columns,
 	state->resident_probe_rows++;
 }
 
-static void
-flush_spill_buffers(BatchHashJoinState *state, BufFile **files, int ncolumns)
-{
-	if (!state->spill_buffered)
-		return;
-	for (int partition = 0; partition < state->npartitions; partition++)
-		flush_spill_buffer(state, files, partition, ncolumns);
-}
-
 uint64
-hash_join_spill_input_batch(BatchHashJoinState *state, PgBatchBridgeBatch *batch,
+hash_join_spill_input_batch(BatchHashJoinState *state, PgBatch *batch,
 							InputColumn *columns, int ncolumns,
 							const uint32 *hashes, uint64 hash_rows,
-							const int *batch_columns, BufFile **files,
+							const int *batch_columns, HashSpillFile **files,
 							uint64 *resident_rows)
 {
 	int		   *next_rows;
@@ -485,36 +397,32 @@ hash_join_spill_input_batch(BatchHashJoinState *state, PgBatchBridgeBatch *batch
 }
 
 static void
-write_store_block(BatchHashJoinState *state, BufFile *file,
+write_store_block(BatchHashJoinState *state, HashSpillFile *file,
 				  const int *rows, int nrows)
 {
 	BuildStore *store = &state->build;
-	SpillHeader header = {PG_BATCH_SPILL_MAGIC, nrows, store->ncolumns};
 	uint32		hashes[PG_BATCH_SIZE];
-	int32		values[PG_BATCH_SIZE];
+	int32	   *values = palloc_array(int32, store->ncolumns * nrows);
+	uint64	   *validity = palloc0_array(uint64, store->ncolumns);
 
-	BufFileWrite(file, &header, sizeof(header));
 	for (int i = 0; i < nrows; i++)
 		hashes[i] = store->links[rows[i]].hash;
-	BufFileWrite(file, hashes, sizeof(uint32) * nrows);
 	for (int column = 0; column < store->ncolumns; column++)
 	{
-		uint64		validity = 0;
-
 		for (int i = 0; i < nrows; i++)
 		{
 			uint32		row = rows[i];
 
-			values[i] = store->columns[column].values[row];
+			values[column * nrows + i] = store->columns[column].values[row];
 			if ((store->columns[column].validity[row / 64] &
 				 (UINT64CONST(1) << (row % 64))) != 0)
-				validity |= UINT64CONST(1) << i;
+				validity[column] |= UINT64CONST(1) << i;
 		}
-		BufFileWrite(file, &validity, sizeof(validity));
-		BufFileWrite(file, values, sizeof(int32) * nrows);
 	}
-	state->spill_bytes += spill_block_bytes(store->ncolumns, nrows);
-	state->spill_pages_written++;
+	pg_batch_spill_write_dense(file->set, file->partition, nrows,
+		hashes, values, nrows, validity);
+	pfree(validity);
+	pfree(values);
 }
 
 void
@@ -544,14 +452,16 @@ hash_join_spill_build_store(BatchHashJoinState *state)
 			if (count == PG_BATCH_SIZE)
 			{
 				write_store_block(state,
-								  spill_file(&state->build_files[partition]),
+					spill_file(state->build_spill,
+						&state->build_files[partition], partition),
 								  rows, count);
 				count = 0;
 			}
 		}
 		if (count > 0)
 			write_store_block(state,
-							  spill_file(&state->build_files[partition]),
+				spill_file(state->build_spill,
+					&state->build_files[partition], partition),
 							  rows, count);
 	}
 
@@ -589,40 +499,40 @@ hash_join_spill_build_store(BatchHashJoinState *state)
 }
 
 static void
-write_spill_rows(BatchHashJoinState *state, BufFile **files, int partition,
+write_spill_rows(BatchHashJoinState *state, HashSpillFile **files,
+				 int partition,
 				 SpillBlock *block, int ncolumns, const int *rows, int nrows)
 {
-	SpillHeader header = {PG_BATCH_SPILL_MAGIC, nrows, ncolumns};
 	uint32		hashes[PG_BATCH_SIZE];
-	int32		values[PG_BATCH_SIZE];
+	int32	   *values = palloc_array(int32, ncolumns * nrows);
+	uint64	   *validity = palloc0_array(uint64, ncolumns);
+	PgBatchSpillSet *set = spill_set_for_files(state, files);
 
-	BufFileWrite(spill_file(&files[partition]), &header, sizeof(header));
 	for (int i = 0; i < nrows; i++)
 		hashes[i] = block->hashes[rows[i]];
-	BufFileWrite(files[partition], hashes, sizeof(uint32) * nrows);
 	for (int column = 0; column < ncolumns; column++)
 	{
-		uint64		validity = 0;
-
 		for (int i = 0; i < nrows; i++)
 		{
 			int			row = rows[i];
 
-			values[i] = hash_join_spill_value(block, column, row);
+			values[column * nrows + i] =
+				hash_join_spill_value(block, column, row);
 			if (hash_join_spill_value_valid(block, column, row))
-				validity |= UINT64CONST(1) << i;
+				validity[column] |= UINT64CONST(1) << i;
 		}
-		BufFileWrite(files[partition], &validity, sizeof(validity));
-		BufFileWrite(files[partition], values, sizeof(int32) * nrows);
 	}
-	state->spill_bytes += spill_block_bytes(ncolumns, nrows);
-	state->spill_pages_written++;
+	pg_batch_spill_write_dense(set, partition, nrows, hashes, values, nrows,
+		validity);
+	spill_file(set, &files[partition], partition);
+	pfree(validity);
+	pfree(values);
 }
 
 static void
-repartition_file(BatchHashJoinState *state, BufFile *source,
-				 SpillBlock *block, int ncolumns, BufFile **files,
-				 BufFile **matching_build_files, uint64 *build_rows,
+repartition_file(BatchHashJoinState *state, HashSpillFile *source,
+				 SpillBlock *block, int ncolumns, HashSpillFile **files,
+				 HashSpillFile **matching_build_files, uint64 *build_rows,
 				 int hash_shift, int npartitions)
 {
 	int		   *heads = palloc_array(int, npartitions);
@@ -703,12 +613,9 @@ hash_join_begin_spill(BatchHashJoinState *state, uint64 estimated_bytes,
 {
 	uint64		required = (estimated_bytes + state->memory_limit - 1) /
 		state->memory_limit;
+	TupleDesc	build_desc;
+	TupleDesc	probe_desc;
 
-	state->spill_buffered = false;
-	state->spill_buffer_counts = NULL;
-	state->spill_buffer_hashes = NULL;
-	state->spill_buffer_values = NULL;
-	state->spill_buffer_validity = NULL;
 	state->bloom_words = NULL;
 	state->bloom_nbits = 0;
 	state->bloom_bytes = 0;
@@ -719,9 +626,19 @@ hash_join_begin_spill(BatchHashJoinState *state, uint64 estimated_bytes,
 	for (int partitions = state->npartitions; partitions > 1; partitions >>= 1)
 		state->partition_shift++;
 	state->build_files = MemoryContextAllocZero(state->spill_context,
-												sizeof(BufFile *) * state->npartitions);
+											sizeof(HashSpillFile *) * state->npartitions);
 	state->probe_files = MemoryContextAllocZero(state->spill_context,
-												sizeof(BufFile *) * state->npartitions);
+											sizeof(HashSpillFile *) * state->npartitions);
+	build_desc = spill_tuple_desc(state->ninner_columns);
+	probe_desc = spill_tuple_desc(state->nouter_columns);
+	state->build_spill = pg_batch_spill_create(state->spill_context,
+		build_desc, state->ninner_columns, state->npartitions,
+		state->memory_limit / 4);
+	state->probe_spill = pg_batch_spill_create(state->spill_context,
+		probe_desc, state->nouter_columns, state->npartitions,
+		state->memory_limit / 4);
+	FreeTupleDesc(build_desc);
+	FreeTupleDesc(probe_desc);
 	state->build_partition_rows = MemoryContextAllocZero(state->spill_context,
 													 sizeof(uint64) * state->npartitions);
 	state->resident_partition_rows = MemoryContextAllocZero(
@@ -730,6 +647,9 @@ hash_join_begin_spill(BatchHashJoinState *state, uint64 estimated_bytes,
 													  sizeof(int) * state->npartitions);
 	state->spill_partition_tails = MemoryContextAlloc(state->spill_context,
 													  sizeof(int) * state->npartitions);
+	state->spill_input_vectors = MemoryContextAlloc(state->spill_context,
+		sizeof(PgBatchInt4Vector) * Max(state->ninner_columns,
+			state->nouter_columns));
 	for (int partition = 0; partition < state->npartitions; partition++)
 		state->spill_partition_heads[partition] = -1;
 	{
@@ -761,22 +681,6 @@ hash_join_begin_spill(BatchHashJoinState *state, uint64 estimated_bytes,
 			state->npartitions * columns;
 
 		/* Leave most of the hash memory limit for the active build chunk. */
-		if (bytes <= state->memory_limit / 4)
-		{
-			state->spill_buffered = true;
-			state->spill_buffer_columns = columns;
-			state->spill_buffer_counts = MemoryContextAllocZero(
-																state->spill_context, sizeof(int) * state->npartitions);
-			state->spill_buffer_hashes = MemoryContextAlloc(
-														state->spill_context,
-														sizeof(uint32) * state->npartitions * PG_BATCH_SIZE);
-			state->spill_buffer_values = MemoryContextAlloc(
-														state->spill_context,
-														sizeof(int32) * state->npartitions * columns * PG_BATCH_SIZE);
-			state->spill_buffer_validity = MemoryContextAllocZero(
-															  state->spill_context,
-															  sizeof(uint64) * state->npartitions * columns);
-		}
 		state->resident_memory_limit = state->memory_limit -
 			Min(state->memory_limit, Min(bytes, state->memory_limit / 4) +
 				state->bloom_bytes);
@@ -796,12 +700,12 @@ hash_join_begin_spill(BatchHashJoinState *state, uint64 estimated_bytes,
 	}
 	init_spill_block(&state->build_block, state->ninner_columns,
 					 PG_BATCH_SIZE,
-					 state->spill_context);
+					 state->spill_context, false);
 	init_spill_block(&state->probe_block, state->nouter_columns,
 					 PG_BATCH_SIZE,
-					 state->spill_context);
+					 state->spill_context, false);
 	init_spill_block(&state->resident_probe_block, state->nouter_columns,
-					 PG_BATCH_SIZE * 2, state->spill_context);
+					 PG_BATCH_SIZE * 2, state->spill_context, true);
 	MemSet(state->resident_probe_block.validity, 0,
 		   sizeof(uint8) * state->nouter_columns *
 		   ((state->resident_probe_block.capacity + 7) / 8));
@@ -838,7 +742,7 @@ append_spill_build_row(BatchHashJoinState *state, SpillBlock *block, int row)
 static bool
 load_build_chunk(BatchHashJoinState *state)
 {
-	BufFile    *file = state->active_build_file;
+	HashSpillFile *file = state->active_build_file;
 
 	hash_join_reset_build_store(&state->build);
 	state->build.hash_shift = state->active_hash_shift;
@@ -871,10 +775,28 @@ load_build_chunk(BatchHashJoinState *state)
 }
 
 static void
-rewind_spill_file(BufFile *file)
+rewind_spill_file(HashSpillFile *file)
 {
-	if (BufFileSeek(file, 0, 0, SEEK_SET) != 0)
-		elog(ERROR, "could not rewind pg_batch hash join spill file");
+	/* The first reader starts at the beginning when it is opened. */
+	if (file->reader != NULL)
+		pg_batch_spill_reader_rewind(file->reader);
+}
+
+static void
+finish_active_partition(BatchHashJoinState *state)
+{
+	if (state->active_build_file != NULL)
+	{
+		pg_batch_spill_reader_close(state->active_build_file->reader);
+		state->active_build_file->reader = NULL;
+	}
+	if (state->active_probe_file != NULL)
+	{
+		pg_batch_spill_reader_close(state->active_probe_file->reader);
+		state->active_probe_file->reader = NULL;
+	}
+	state->active_build_file = NULL;
+	state->active_probe_file = NULL;
 }
 
 static int
@@ -888,8 +810,8 @@ partition_bits(int npartitions)
 }
 
 static bool
-start_partition_files(BatchHashJoinState *state, BufFile *build_file,
-					  BufFile *probe_file, int hash_shift)
+start_partition_files(BatchHashJoinState *state, HashSpillFile *build_file,
+					  HashSpillFile *probe_file, int hash_shift)
 {
 	state->active_build_file = build_file;
 	state->active_probe_file = probe_file;
@@ -912,8 +834,10 @@ repartition_current_partition(BatchHashJoinState *state)
 	uint64		required = (rows + state->build_chunk_rows - 1) /
 		state->build_chunk_rows;
 	int			npartitions;
-	BufFile    *build_file = state->build_files[state->current_partition];
-	BufFile    *probe_file = state->probe_files[state->current_partition];
+	HashSpillFile *build_file = state->build_files[state->current_partition];
+	HashSpillFile *probe_file = state->probe_files[state->current_partition];
+	TupleDesc	build_desc;
+	TupleDesc	probe_desc;
 
 	/*
 	 * Below this point another full write costs more than cached probe
@@ -923,11 +847,21 @@ repartition_current_partition(BatchHashJoinState *state)
 		return false;
 	npartitions = next_partition_count(required);
 	state->repartition_build_files = MemoryContextAllocZero(
-															state->spill_context, sizeof(BufFile *) * npartitions);
+		state->spill_context, sizeof(HashSpillFile *) * npartitions);
 	state->repartition_probe_files = MemoryContextAllocZero(
-															state->spill_context, sizeof(BufFile *) * npartitions);
+		state->spill_context, sizeof(HashSpillFile *) * npartitions);
 	state->repartition_build_rows = MemoryContextAllocZero(
-														   state->spill_context, sizeof(uint64) * npartitions);
+													   state->spill_context, sizeof(uint64) * npartitions);
+	build_desc = spill_tuple_desc(state->ninner_columns);
+	probe_desc = spill_tuple_desc(state->nouter_columns);
+	state->repartition_build_spill = pg_batch_spill_create(
+		state->spill_context, build_desc, state->ninner_columns, npartitions,
+		state->memory_limit / 4);
+	state->repartition_probe_spill = pg_batch_spill_create(
+		state->spill_context, probe_desc, state->nouter_columns, npartitions,
+		state->memory_limit / 4);
+	FreeTupleDesc(build_desc);
+	FreeTupleDesc(probe_desc);
 	state->nrepartitions = npartitions;
 	state->current_repartition = -1;
 	state->repartition_hash_shift = state->partition_shift +
@@ -941,8 +875,14 @@ repartition_current_partition(BatchHashJoinState *state)
 					 state->nouter_columns, state->repartition_probe_files,
 					 state->repartition_build_files, NULL,
 					 state->partition_shift, npartitions);
-	BufFileClose(build_file);
-	BufFileClose(probe_file);
+	pg_batch_spill_finish(state->repartition_build_spill, false);
+	pg_batch_spill_finish(state->repartition_probe_spill, true);
+	record_spill_writes(state, state->repartition_build_spill);
+	record_spill_writes(state, state->repartition_probe_spill);
+	pg_batch_spill_reader_close(build_file->reader);
+	pg_batch_spill_reader_close(probe_file->reader);
+	build_file->reader = NULL;
+	probe_file->reader = NULL;
 	state->build_files[state->current_partition] = NULL;
 	state->probe_files[state->current_partition] = NULL;
 	return true;
@@ -955,10 +895,6 @@ finish_repartition(BatchHashJoinState *state)
 	{
 		int			partition = state->current_repartition;
 
-		if (state->repartition_build_files[partition] != NULL)
-			BufFileClose(state->repartition_build_files[partition]);
-		if (state->repartition_probe_files[partition] != NULL)
-			BufFileClose(state->repartition_probe_files[partition]);
 		state->repartition_build_files[partition] = NULL;
 		state->repartition_probe_files[partition] = NULL;
 	}
@@ -967,6 +903,7 @@ finish_repartition(BatchHashJoinState *state)
 static bool
 start_next_partition(BatchHashJoinState *state)
 {
+	finish_active_partition(state);
 	for (;;)
 	{
 		if (state->repartition_build_files != NULL)
@@ -991,6 +928,10 @@ start_next_partition(BatchHashJoinState *state)
 			pfree(state->repartition_build_files);
 			pfree(state->repartition_probe_files);
 			pfree(state->repartition_build_rows);
+			pg_batch_spill_destroy(state->repartition_build_spill);
+			pg_batch_spill_destroy(state->repartition_probe_spill);
+			state->repartition_build_spill = NULL;
+			state->repartition_probe_spill = NULL;
 			state->repartition_build_files = NULL;
 			state->repartition_probe_files = NULL;
 			state->repartition_build_rows = NULL;
@@ -1023,14 +964,17 @@ start_next_partition(BatchHashJoinState *state)
 void
 hash_join_finish_spilled_build(BatchHashJoinState *state)
 {
-	/* Build buffers must be visible before probing starts. */
-	flush_spill_buffers(state, state->build_files, state->ninner_columns);
+	/* Destructive readers release completed build partitions early. */
+	pg_batch_spill_finish(state->build_spill, false);
+	record_spill_writes(state, state->build_spill);
 }
 
 void
 hash_join_finish_spilled_probe(BatchHashJoinState *state)
 {
-	flush_spill_buffers(state, state->probe_files, state->nouter_columns);
+	/* Probe partitions are rewound for every in-memory build chunk. */
+	pg_batch_spill_finish(state->probe_spill, true);
+	record_spill_writes(state, state->probe_spill);
 	state->current_partition = -1;
 	state->partition_active = false;
 }
@@ -1056,7 +1000,6 @@ hash_join_publish_resident_probe(BatchHashJoinState *state, bool final_batch)
 	}
 	block->selection = pg_batch_nrows_mask(nrows);
 	block->batch.nrows = nrows;
-	block->batch.consumed = false;
 	state->probe_batch = &block->batch;
 	state->probe_from_spill = true;
 	state->probe_from_resident = true;
@@ -1136,32 +1079,17 @@ hash_join_fetch_spilled_probe_batch(BatchHashJoinState *state)
 void
 hash_join_close_spill_files(BatchHashJoinState *state)
 {
-	for (int partition = 0; partition < state->npartitions; partition++)
-	{
-		if (state->build_files != NULL && state->build_files[partition] != NULL)
-		{
-			BufFileClose(state->build_files[partition]);
-			state->build_files[partition] = NULL;
-		}
-		if (state->probe_files != NULL && state->probe_files[partition] != NULL)
-		{
-			BufFileClose(state->probe_files[partition]);
-			state->probe_files[partition] = NULL;
-		}
-	}
-	for (int partition = 0; partition < state->nrepartitions; partition++)
-	{
-		if (state->repartition_build_files != NULL &&
-			state->repartition_build_files[partition] != NULL)
-		{
-			BufFileClose(state->repartition_build_files[partition]);
-			state->repartition_build_files[partition] = NULL;
-		}
-		if (state->repartition_probe_files != NULL &&
-			state->repartition_probe_files[partition] != NULL)
-		{
-			BufFileClose(state->repartition_probe_files[partition]);
-			state->repartition_probe_files[partition] = NULL;
-		}
-	}
+	finish_active_partition(state);
+	pg_batch_spill_destroy(state->build_spill);
+	pg_batch_spill_destroy(state->probe_spill);
+	pg_batch_spill_destroy(state->repartition_build_spill);
+	pg_batch_spill_destroy(state->repartition_probe_spill);
+	state->build_spill = NULL;
+	state->probe_spill = NULL;
+	state->repartition_build_spill = NULL;
+	state->repartition_probe_spill = NULL;
+	state->build_files = NULL;
+	state->probe_files = NULL;
+	state->repartition_build_files = NULL;
+	state->repartition_probe_files = NULL;
 }

@@ -14,28 +14,12 @@ bool		pg_batch_enable = true;
 bool		pg_batch_enable_hash_join = true;
 bool		pg_batch_enable_simd = true;
 double		pg_batch_bitmap_min_rows_per_page = 8.0;
-const PgBatchBridgeAPI *pg_batch_bridge;
-
-static void
-load_bridge(void)
-{
-	void	  **rendezvous = find_rendezvous_variable(PG_BATCH_BRIDGE_RENDEZVOUS);
-
-	if (*rendezvous == NULL)
-		load_file("$libdir/pg_batch_bridge", false);
-	pg_batch_bridge = *rendezvous;
-	if (pg_batch_bridge == NULL ||
-		pg_batch_bridge->abi_version != PG_BATCH_BRIDGE_ABI_VERSION ||
-		pg_batch_bridge->struct_size < sizeof(PgBatchBridgeAPI))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("incompatible pg_batch_bridge library")));
-}
+const PgBatchAPI *pg_batch_api;
 
 void
 _PG_init(void)
 {
-	load_bridge();
+	pg_batch_api = pg_batch_api_get();
 	DefineCustomBoolVariable("pg_batch.enable",
 							 "Enable pg_batch custom paths.", NULL,
 							 &pg_batch_enable, true, PGC_USERSET, 0,
@@ -55,13 +39,13 @@ _PG_init(void)
 							 8.0, 0.0, PG_BATCH_SIZE, PGC_USERSET, 0,
 								 NULL, NULL, NULL);
 	pg_batch_planner_init();
-	pg_batch_bridge->register_producer(&pg_batch_producer_ops);
+	pg_batch_api->register_producer(&pg_batch_producer_ops);
 }
 
 void
 _PG_fini(void)
 {
-	if (pg_batch_bridge != NULL)
-		pg_batch_bridge->unregister_producer(PG_BATCH_PRODUCER_NAME);
+	if (pg_batch_api != NULL)
+		pg_batch_api->unregister_producer(PG_BATCH_PRODUCER_NAME);
 	pg_batch_planner_fini();
 }

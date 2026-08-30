@@ -12,9 +12,9 @@ typedef struct BatchProjectState
 	CustomScanState css;
 	PlanState  *child;
 	PgBatchInput *input;
+	PgBatchOutput *output;
 	PgBatchExprProjection *projection;
-	const PgBatchBridgeRequest *request;
-	PgBatchBridgeBatch *active_batch;
+	const PgBatchRequest *request;
 	List	   *input_columns;
 	bool		published;
 	uint64	batches;
@@ -30,7 +30,7 @@ pg_batch_create_project_state(CustomScan *cscan)
 
 	NodeSetTag(&state->css, T_CustomScanState);
 	state->css.methods = &project_exec_methods;
-	state->css.slotOps = &PgBatchSlotOps;
+	state->css.slotOps = &TTSOpsVirtual;
 	return (Node *) state;
 }
 
@@ -50,33 +50,37 @@ project_begin(CustomScanState *node, EState *estate, int eflags)
 {
 	BatchProjectState *state = (BatchProjectState *) node;
 	CustomScan *cscan = castNode(CustomScan, node->ss.ps.plan);
-	PgBatchSlot *slot = pg_batch_slot_cast(node->ss.ss_ScanTupleSlot);
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	const char *producer_name = strVal(linitial(cscan->custom_private));
-	PgBatchBridgeBinding *child_binding;
-	const PgBatchBridgeRequest *child_request;
+	PgBatchBinding *child_binding;
+	const PgBatchRequest *child_request;
 	Bitmapset  *survivors;
-	List	   *logical_columns = NIL;
+	AttrNumber *source_attnums;
+	int			ncolumns;
 
 	pg_batch_init_children(node, estate, eflags);
 	state->child = linitial(node->custom_ps);
 	state->input_columns = lsecond_node(List, cscan->custom_private);
 	state->input = pg_batch_input_create(estate->es_query_cxt,
-		pg_batch_bridge, state->child, producer_name);
+		pg_batch_api, state->child, producer_name);
 	state->projection = pg_batch_expr_projection_create(
 		estate->es_query_cxt, cscan->custom_exprs, &node->ss.ps,
 		resolve_project_var, state->input_columns);
 
-	for (int column = 0; column < list_length(cscan->custom_exprs); column++)
-		logical_columns = lappend_int(logical_columns, column + 1);
-	pg_batch_configure_slot(slot, NULL, logical_columns, 0);
-	list_free(logical_columns);
-	state->request = pg_batch_bridge->get_request(slot->binding);
+	ncolumns = list_length(cscan->custom_exprs);
+	source_attnums = palloc_array(AttrNumber, ncolumns);
+	for (int column = 0; column < ncolumns; column++)
+		source_attnums[column] = column + 1;
+	state->output = pg_batch_output_create(estate->es_query_cxt,
+		pg_batch_api, slot, source_attnums, ncolumns);
+	pfree(source_attnums);
+	state->request = pg_batch_output_request(state->output);
 
 	child_binding = pg_batch_input_request_binding(state->input);
-	child_request = pg_batch_bridge->get_request(child_binding);
-	survivors = bms_union(child_request->survivor_columns,
+	child_request = pg_batch_api->get_request(child_binding);
+	survivors = bms_union(child_request->project_columns,
 		pg_batch_expr_projection_input_columns(state->projection));
-	pg_batch_bridge->set_request(child_binding, child_request->filter_columns,
+	pg_batch_api->set_request(child_binding, child_request->filter_columns,
 							 survivors, true);
 	bms_free(survivors);
 }
@@ -85,39 +89,41 @@ static TupleTableSlot *
 project_exec(CustomScanState *node)
 {
 	BatchProjectState *state = (BatchProjectState *) node;
-	PgBatchSlot *slot = pg_batch_slot_cast(node->ss.ss_ScanTupleSlot);
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	PgBatchInputBatch input;
-	PgBatchBridgeBatch *batch;
+	PgBatch *batch;
 	int			first_row;
 
 	if (!state->request->return_batch)
 		elog(ERROR, "pg_batch project requires a batch-aware parent");
 	if (state->published)
 	{
-		if (!state->active_batch->consumed)
+		if (!pg_batch_api->batch_finished(
+				pg_batch_output_binding(state->output)))
 			elog(ERROR, "pg_batch parent requested a new projected batch too early");
-		ExecClearTuple(&slot->base);
+		pg_batch_output_reset(state->output);
+		pg_batch_input_finish(state->input);
 		state->published = false;
-		state->active_batch = NULL;
 	}
-	if (!pg_batch_input_advance(state->input, &input))
-		return ExecClearTuple(&slot->base);
+	if (!pg_batch_input_next(state->input, &input))
+	{
+		pg_batch_output_reset(state->output);
+		return ExecClearTuple(slot);
+	}
 
 	ResetExprContext(node->ss.ps.ps_ExprContext);
 	batch = pg_batch_expr_projection_bind(state->projection, input.batch,
 									  node->ss.ps.ps_ExprContext);
-	pg_batch_bridge->publish_batch(slot->binding, batch);
-	first_row = pg_batch_bridge_next_selected(batch, -1);
+	first_row = pg_batch_next_selected(batch, -1);
 	if (first_row < 0)
 		elog(ERROR, "pg_batch project received an empty input batch");
-	pg_batch_select_row(&slot->base, first_row);
-	state->active_batch = batch;
+	pg_batch_output_publish(state->output, batch);
 	state->published = true;
 	state->batches++;
 	state->rows += pg_batch_row_count(batch);
 	if (node->ss.ps.instrument != NULL)
 		node->ss.ps.instrument->tuplecount += pg_batch_row_count(batch) - 1;
-	return &slot->base;
+	return slot;
 }
 
 static void
@@ -125,10 +131,9 @@ project_end(CustomScanState *node)
 {
 	BatchProjectState *state = (BatchProjectState *) node;
 
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
+	pg_batch_output_reset(state->output);
 	if (state->published)
 		pg_batch_input_finish(state->input);
-	state->active_batch = NULL;
 	state->published = false;
 	pg_batch_end_children(node);
 }
@@ -138,12 +143,11 @@ project_rescan(CustomScanState *node)
 {
 	BatchProjectState *state = (BatchProjectState *) node;
 
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
+	pg_batch_output_reset(state->output);
 	if (state->published)
 		pg_batch_input_finish(state->input);
 	pg_batch_rescan_children(node);
-	pg_batch_input_reset(state->input);
-	state->active_batch = NULL;
+	pg_batch_input_rescan(state->input);
 	state->published = false;
 	state->batches = 0;
 	state->rows = 0;

@@ -57,26 +57,26 @@ pg_batch_arrow_row_is_valid(const struct ArrowArray *array, int row)
 
 #endif							/* PG_BATCH_ARROW_HELPERS */
 
-#ifndef PG_BATCH_BRIDGE_ARROW_INTERFACE
-#define PG_BATCH_BRIDGE_ARROW_INTERFACE
+#ifndef PG_BATCH_ARROW_INTERFACE
+#define PG_BATCH_ARROW_INTERFACE
 
-#include "bridge.h"
+#include "batch.h"
 
-#define PG_BATCH_BRIDGE_ARROW_INTERFACE_NAME "pg_batch.arrow.c_data"
-#define PG_BATCH_BRIDGE_ARROW_INTERFACE_VERSION 1
+#define PG_BATCH_ARROW_INTERFACE_NAME "pg_batch.arrow.c_data"
+#define PG_BATCH_ARROW_INTERFACE_VERSION 1
 
-typedef struct PgBatchBridgeArrowView
+typedef struct PgBatchArrowView
 {
 	const struct ArrowArray *array;
 	const struct ArrowSchema *schema;
-} PgBatchBridgeArrowView;
+} PgBatchArrowView;
 
-typedef struct PgBatchBridgeArrowInterface
+typedef struct PgBatchArrowInterface
 {
 	uint32		abi_version;
 	Size		struct_size;
-	void		(*get_column) (PgBatchBridgeBatch *batch, int column,
-							   PgBatchBridgeArrowView *result);
-} PgBatchBridgeArrowInterface;
+	void		(*get_column) (PgBatch *batch, int column,
+							   PgBatchArrowView *result);
+} PgBatchArrowInterface;
 
-#endif							/* PG_BATCH_BRIDGE_ARROW_INTERFACE */
+#endif							/* PG_BATCH_ARROW_INTERFACE */

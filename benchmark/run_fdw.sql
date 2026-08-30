@@ -1,6 +1,6 @@
 \set ON_ERROR_STOP on
 
-CREATE EXTENSION IF NOT EXISTS pg_batch_bridge;
+CREATE EXTENSION IF NOT EXISTS pg_batch_api;
 CREATE EXTENSION IF NOT EXISTS pg_batch_fdw;
 CREATE EXTENSION IF NOT EXISTS pg_batch;
 
@@ -71,9 +71,9 @@ BEGIN
 END
 $do$;
 
--- Local heap is a reference point.  The other four modes isolate the scalar
+-- Local heap is a reference point. The other four modes isolate the scalar
 -- FDW boundary, batch filtering in the executor, source filtering, and eager
--- Arrow column decoding.  Each statement gets its own cached plan because
+-- Arrow column decoding. Each statement gets its own cached plan because
 -- pg_batch.enable and pg_batch_fdw.pushdown affect planning.
 SET pg_batch.enable = off;
 PREPARE fdw_heap_narrow_dense AS

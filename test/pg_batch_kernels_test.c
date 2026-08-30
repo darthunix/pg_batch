@@ -23,16 +23,16 @@ typedef struct TestDatumSource
 } TestDatumSource;
 
 static void
-test_get_datum_column(PgBatchBridgeBatch *batch, int column,
+test_get_datum_column(PgBatch *batch, int column,
 					  const uint64 *rows,
-					  PgBatchBridgeMaterializePhase phase,
-					  PgBatchBridgeDatumColumn *result)
+					  PgBatchColumnPhase phase,
+					  PgBatchDatumVector *result)
 {
 	TestDatumSource *source = batch->private_data;
 
 	Assert(column == 0);
 	Assert(rows != NULL);
-	Assert(phase == PG_BATCH_BRIDGE_MATERIALIZE_FILTER);
+	Assert(phase == PG_BATCH_COLUMN_FILTER);
 	source->datum_calls++;
 	result->values = source->values;
 	result->isnull = source->isnull;
@@ -41,7 +41,7 @@ test_get_datum_column(PgBatchBridgeBatch *batch, int column,
 }
 
 static bool
-test_get_int4_column(PgBatchBridgeBatch *batch, int column,
+test_get_int4_column(PgBatch *batch, int column,
 					 PgBatchInt4Vector *result)
 {
 	TestDatumSource *source = batch->private_data;
@@ -60,7 +60,7 @@ static const PgBatchInt4VectorInterface test_int4_interface = {
 };
 
 static const void *
-test_get_native_interface(PgBatchBridgeBatch *batch, const char *name,
+test_get_native_interface(PgBatch *batch, const char *name,
 						  uint32 version)
 {
 	TestDatumSource *source = batch->private_data;
@@ -72,9 +72,9 @@ test_get_native_interface(PgBatchBridgeBatch *batch, const char *name,
 	return NULL;
 }
 
-static const PgBatchBridgeBatchOps test_batch_ops = {
-	.abi_version = PG_BATCH_BRIDGE_ABI_VERSION,
-	.struct_size = sizeof(PgBatchBridgeBatchOps),
+static const PgBatchOps test_batch_ops = {
+	.abi_version = PG_BATCH_ABI_VERSION,
+	.struct_size = sizeof(PgBatchOps),
 	.get_datum_column = test_get_datum_column,
 	.get_native_interface = test_get_native_interface,
 };
@@ -90,7 +90,7 @@ pg_batch_kernels_test(PG_FUNCTION_ARGS)
 	PgBatchInt4Vector datum;
 	PgBatchInt4Vector packed;
 	TestDatumSource source;
-	PgBatchBridgeBatch batch;
+	PgBatch batch;
 	PgBatchInt4Reduction datum_reduction;
 	PgBatchInt4Reduction packed_reduction;
 	int32		arithmetic_values[6];
@@ -128,14 +128,14 @@ pg_batch_kernels_test(PG_FUNCTION_ARGS)
 	batch.ops = &test_batch_ops;
 	batch.private_data = &source;
 	pg_batch_get_int4_vector(&batch, 0, &datum_selection,
-						 PG_BATCH_BRIDGE_MATERIALIZE_FILTER, &datum);
+						 PG_BATCH_COLUMN_FILTER, &datum);
 	pg_batch_int4_vector_init_packed(&packed, packed_values,
 								  packed_validity, 1);
 	if (source.datum_calls != 1 || source.native_calls != 0)
 		PG_RETURN_BOOL(false);
 	source.use_native = true;
 	pg_batch_get_int4_vector(&batch, 0, &datum_selection,
-		PG_BATCH_BRIDGE_MATERIALIZE_FILTER, &packed);
+		PG_BATCH_COLUMN_FILTER, &packed);
 	if (source.datum_calls != 1 || source.native_calls != 1 ||
 		packed.layout != PG_BATCH_INT4_PACKED ||
 		pg_batch_int4_row_value(&packed, 5) != 6)

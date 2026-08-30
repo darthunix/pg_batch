@@ -1,4 +1,4 @@
-CREATE EXTENSION pg_batch_bridge;
+CREATE EXTENSION pg_batch_api;
 CREATE EXTENSION pg_batch_tam;
 CREATE EXTENSION pg_batch;
 
@@ -8,10 +8,12 @@ CREATE EXTENSION pg_batch;
 \set kernels_test :libdir '/pg_batch_kernels_test' :dlsuffix
 \set expr_test :libdir '/pg_batch_expr_test' :dlsuffix
 \set runtime_test :libdir '/pg_batch_runtime_test' :dlsuffix
+\set spill_test :libdir '/pg_batch_spill_test' :dlsuffix
 LOAD :'bridge_test';
 LOAD :'kernels_test';
 LOAD :'expr_test';
 LOAD :'runtime_test';
+LOAD :'spill_test';
 LOAD 'pg_batch_tam';
 LOAD 'pg_batch';
 
@@ -39,6 +41,14 @@ CREATE FUNCTION pg_batch_input_api_test()
 RETURNS boolean
 AS :'runtime_test', 'pg_batch_input_api_test'
 LANGUAGE C;
+CREATE FUNCTION pg_batch_output_test()
+RETURNS boolean
+AS :'runtime_test', 'pg_batch_output_test'
+LANGUAGE C;
+CREATE FUNCTION pg_batch_spill_test()
+RETURNS boolean
+AS :'spill_test', 'pg_batch_spill_test'
+LANGUAGE C;
 
 SELECT pg_batch_bridge_test_bad_abi();
 SELECT pg_batch_bridge_test_duplicate_provider();
@@ -46,6 +56,8 @@ SELECT pg_batch_kernels_test() AS installed_kernels_ok;
 SELECT pg_batch_expr_api_test() AS installed_expr_api_ok;
 SELECT pg_batch_datum_buffer_test() AS installed_datum_buffer_ok;
 SELECT pg_batch_input_api_test() AS installed_input_api_ok;
+SELECT pg_batch_output_test() AS installed_output_ok;
+SELECT pg_batch_spill_test() AS installed_spill_ok;
 
 SET max_parallel_workers_per_gather = 0;
 SET jit = off;
@@ -240,6 +252,49 @@ EXPLAIN (COSTS OFF)
 SELECT count(v) FILTER (WHERE v > 0) FROM pg_batch_kernel_values;
 EXPLAIN (COSTS OFF)
 SELECT v, count(*) FROM pg_batch_kernel_values GROUP BY v;
+
+-- Grouped aggregation keeps NULL semantics and spills raw rows through the
+-- reusable partitioned spill module when the resident group table is full.
+CREATE TEMP TABLE pg_batch_group_values AS
+SELECT CASE WHEN g % 101 = 0 THEN NULL ELSE g % 5000 END AS k,
+       CASE WHEN g % 17 = 0 THEN NULL ELSE g % 97 END AS v
+FROM generate_series(1, 20000) AS g;
+ANALYZE pg_batch_group_values;
+SET work_mem = '64kB';
+SET pg_batch.enable = on;
+CREATE TEMP TABLE pg_batch_group_result AS
+SELECT k, count(*) AS n, count(v) AS nn, sum(v) AS total,
+       min(v) AS minimum, max(v) AS maximum
+FROM pg_batch_group_values
+GROUP BY k;
+SET pg_batch.enable = off;
+CREATE TEMP TABLE pg_batch_group_plain AS
+SELECT k, count(*) AS n, count(v) AS nn, sum(v) AS total,
+       min(v) AS minimum, max(v) AS maximum
+FROM pg_batch_group_values
+GROUP BY k;
+SELECT NOT EXISTS (
+           (TABLE pg_batch_group_result EXCEPT ALL TABLE pg_batch_group_plain)
+           UNION ALL
+           (TABLE pg_batch_group_plain EXCEPT ALL TABLE pg_batch_group_result)
+       ) AS grouped_spill_matches;
+SET pg_batch.enable = on;
+CREATE TEMP TABLE pg_batch_group_hidden AS
+SELECT count(*) AS n FROM pg_batch_group_values GROUP BY k;
+SET pg_batch.enable = off;
+CREATE TEMP TABLE pg_batch_group_hidden_plain AS
+SELECT count(*) AS n FROM pg_batch_group_values GROUP BY k;
+SELECT NOT EXISTS (
+           (TABLE pg_batch_group_hidden
+            EXCEPT ALL TABLE pg_batch_group_hidden_plain)
+           UNION ALL
+           (TABLE pg_batch_group_hidden_plain
+            EXCEPT ALL TABLE pg_batch_group_hidden)
+       ) AS hidden_group_key_matches;
+SET pg_batch.enable = on;
+EXPLAIN (COSTS OFF)
+SELECT k, count(*), sum(v) FROM pg_batch_group_values GROUP BY k;
+RESET work_mem;
 
 EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
 SELECT c6 FROM pg_batch_test WHERE c2 < 10;
@@ -945,4 +1000,4 @@ DROP TABLE pg_batch_arrow;
 DROP TABLE pg_batch_test;
 DROP EXTENSION pg_batch;
 DROP EXTENSION pg_batch_tam;
-DROP EXTENSION pg_batch_bridge;
+DROP EXTENSION pg_batch_api;

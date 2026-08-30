@@ -8,7 +8,7 @@
 
 struct PgBatchDatumBuffer
 {
-	PgBatchBridgeBatch batch;
+	PgBatch batch;
 	TupleDesc	tuple_desc;
 	MemoryContext payload_context;
 	Datum	   *values;
@@ -24,10 +24,10 @@ struct PgBatchDatumBuffer
 };
 
 static void
-datum_buffer_get_column(PgBatchBridgeBatch *batch, int column,
+datum_buffer_get_column(PgBatch *batch, int column,
 						const uint64 *rows,
-						PgBatchBridgeMaterializePhase phase,
-						PgBatchBridgeDatumColumn *result)
+						PgBatchColumnPhase phase,
+						PgBatchDatumVector *result)
 {
 	PgBatchDatumBuffer *buffer = batch->private_data;
 	const uint64 *valid_rows;
@@ -46,9 +46,9 @@ datum_buffer_get_column(PgBatchBridgeBatch *batch, int column,
 	result->nwords = batch->nwords;
 }
 
-static const PgBatchBridgeBatchOps datum_buffer_ops = {
-	.abi_version = PG_BATCH_BRIDGE_ABI_VERSION,
-	.struct_size = sizeof(PgBatchBridgeBatchOps),
+static const PgBatchOps datum_buffer_ops = {
+	.abi_version = PG_BATCH_ABI_VERSION,
+	.struct_size = sizeof(PgBatchOps),
 	.get_datum_column = datum_buffer_get_column,
 };
 
@@ -98,8 +98,8 @@ pg_batch_datum_buffer_create(MemoryContext parent_context,
 			break;
 		}
 	}
-	buffer->batch.abi_version = PG_BATCH_BRIDGE_ABI_VERSION;
-	buffer->batch.struct_size = sizeof(PgBatchBridgeBatch);
+	buffer->batch.abi_version = PG_BATCH_ABI_VERSION;
+	buffer->batch.struct_size = sizeof(PgBatch);
 	buffer->batch.ops = &datum_buffer_ops;
 	buffer->batch.private_data = buffer;
 	pg_batch_datum_buffer_reset(buffer);
@@ -115,7 +115,6 @@ pg_batch_datum_buffer_reset(PgBatchDatumBuffer *buffer)
 	buffer->batch.nrows = 0;
 	buffer->batch.nwords = 0;
 	buffer->batch.table_oid = InvalidOid;
-	buffer->batch.consumed = true;
 }
 
 bool
@@ -179,7 +178,7 @@ pg_batch_datum_buffer_append_slot(PgBatchDatumBuffer *buffer,
 	buffer->nrows++;
 }
 
-PgBatchBridgeBatch *
+PgBatch *
 pg_batch_datum_buffer_finish(PgBatchDatumBuffer *buffer, Oid table_oid)
 {
 	if (buffer->sealed)

@@ -18,8 +18,8 @@ supports_relation(Relation relation)
 }
 
 static void
-plan_scan(const PgBatchBridgePlanRequest *request,
-		  PgBatchBridgePlanResult *result)
+plan_scan(const PgBatchSourcePlanRequest *request,
+		  PgBatchSourcePlanResult *result)
 {
 	List	   *specs = NIL;
 	List	   *source_exprs = NIL;
@@ -31,7 +31,7 @@ plan_scan(const PgBatchBridgePlanRequest *request,
 
 	MemSet(result, 0, sizeof(*result));
 	result->nquals = nquals;
-	result->qual_support = palloc0_array(PgBatchBridgeQualSupport, nquals);
+	result->qual_support = palloc0_array(PgBatchQualSupport, nquals);
 	if (pg_batch_tam_scan_mode == PG_BATCH_TAM_BATCH)
 		goto done;
 	if (list_length(request->clauses) != list_length(request->restrictinfos))
@@ -71,7 +71,7 @@ plan_scan(const PgBatchBridgePlanRequest *request,
 					   makeInteger(op), makeInteger(scalar_exprno),
 					   makeInteger(direct)));
 		result->qual_support[qualno] = exact ?
-			PG_BATCH_BRIDGE_QUAL_EXACT : PG_BATCH_BRIDGE_QUAL_PRUNE_ONLY;
+			PG_BATCH_QUAL_EXACT : PG_BATCH_QUAL_PRUNE_ONLY;
 next:
 		qualno++;
 	}
@@ -84,7 +84,7 @@ done:
 static int
 resolve_source_var(const Var *var, void *context)
 {
-	const PgBatchBridgeRequest *request = context;
+	const PgBatchRequest *request = context;
 
 	if (var->varno == INDEX_VAR && var->varattno <= request->ncolumns)
 		return var->varattno - 1;
@@ -109,7 +109,7 @@ scan_cleanup(void *arg)
 }
 
 static void *
-begin_scan(const PgBatchBridgeExecRequest *request)
+begin_scan(const PgBatchSourceExecRequest *request)
 {
 	List	   *private = castNode(List, request->source_private);
 	List	   *specs = lsecond_node(List, private);
@@ -222,9 +222,9 @@ explain_scan(void *provider_state, ExplainState *es)
 						   scan->stats.project_datums, es);
 }
 
-const PgBatchBridgeProviderOps pg_batch_tam_provider_ops = {
-	.abi_version = PG_BATCH_BRIDGE_ABI_VERSION,
-	.struct_size = sizeof(PgBatchBridgeProviderOps),
+const PgBatchProviderOps pg_batch_tam_provider_ops = {
+	.abi_version = PG_BATCH_ABI_VERSION,
+	.struct_size = sizeof(PgBatchProviderOps),
 	.provider_name = PG_BATCH_TAM_PROVIDER_NAME,
 	.supports_relation = supports_relation,
 	.plan_scan = plan_scan,

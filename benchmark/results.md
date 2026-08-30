@@ -11,6 +11,8 @@ build.
 The Arrow IPC FDW measurements were added on 2026-08-27 with the same build
 and database.
 The reusable hash-kernel comparison was added on 2026-08-28.
+The grouped aggregate and reusable spill measurements were added on
+2026-08-30.
 The B-tree bitmap, BRIN, and heap sanity measurements were refreshed later that
 day after exact-page recheck elimination and the bitmap planner guard were
 added. The B-tree script temporarily removed the BRIN indexes in a transaction
@@ -1028,6 +1030,53 @@ value. A specialized scalar sum loop removed a small heap regression and also
 improved packed input. Since every existing aggregate case is now at least as
 fast as `da57e22`, this stage does not add separate SIMD reduction code.
 
+## Grouped aggregate and reusable spill
+
+`run_group_aggregate.sql` creates one million rows with both a 1,000-value key
+and a 200,000-value key. Every 97th aggregate value is NULL. The measured
+queries use a direct `int4` grouping column and run all supported aggregate
+states in one node:
+
+```sql
+SELECT key, count(*), count(value), sum(value), min(value), max(value)
+FROM pg_batch_group_aggregate
+GROUP BY key;
+```
+
+Three warm-ups precede 11 alternating PostgreSQL and batch executions. The
+table reports medians. The 1 MB case forces both executors to use temporary
+storage.
+
+| Query | PostgreSQL, ms | Batch, ms | Speedup |
+|---|---:|---:|---:|
+| 1,000 groups, 64 MB | 52.626 | 24.455 | 2.15x |
+| 200,000 groups, 64 MB | 90.362 | 54.145 | 1.67x |
+| 200,000 groups, 1 MB | 145.278 | 68.562 | 2.12x |
+
+The grouped node hashes direct packed or Datum-backed `int4` vectors without
+forming scalar input tuples. Groups already present in memory continue to be
+updated after the memory threshold is reached; only new groups are divided
+between spill partitions. An oversized partition is divided again using the
+next hash bits.
+
+The same `spill/` library now stores hash-join partitions. It owns bounded
+64-row writer buffers, logical tapes, byte validity bitmaps, and
+rewindable or destructive readers. The aggregate and join still own their
+different partitioning and recursion policies. A direct C regression test
+forces writer eviction and checks rewind, NULLs, dense writes, and statistics.
+
+The hash join was measured against committed version `8f49945`, before its
+private spill implementation was replaced. The baseline and current in-memory
+medians use 15 samples after three warm-ups on the same warm heap tables. The
+final current spill median uses 35 samples after four warm-ups because shorter
+runs straddled the 3% threshold. The 1 MB result is 2.0% slower, which remains
+inside that threshold; the in-memory path is unchanged.
+
+| Hash join mode | `8f49945`, ms | Reusable spill, ms | Change |
+|---|---:|---:|---:|
+| In memory, 64 MB | 26.910 | 26.897 | -0.0% |
+| Spill, 1 MB | 53.430 | 54.498 | +2.0% |
+
 ## Reusable int4 hash kernel
 
 This experiment compares commit `08cc120` with the reusable batch hash
@@ -1071,7 +1120,8 @@ packed inputs, spill, and an early scalar `LIMIT`.
 
 This step changes the reusable boundary rather than the executor model.
 `runtime/` and `kernels/` are now position-independent static libraries built
-and installed by Meson. `nodes/`, `tam/`, and `fdw/` link those libraries
+and installed by Meson. `nodes/` and both directories under `examples/` link
+those libraries
 instead of compiling private copies. Installed headers and pkg-config files let
 an unrelated PGXS module use the same vector adapters and kernels. The
 regression test includes such a module; it is compiled only against the
@@ -1159,9 +1209,9 @@ both bindings and repeat the same error checks.
 
 The runtime now provides an opaque `PgBatchInput`. It resolves the named
 producer and request binding once, caches the binding of the actual returned
-slot, and owns the next, finish, advance, and rescan state. `advance` combines
-finishing the previous batch with fetching the next one for dense loops. The
-filter, aggregate, and both hash join inputs use this object. The aggregate
+slot, and owns the next, finish, and rescan state. Consumers finish each batch
+explicitly before requesting another one. The filter, aggregate, and both hash
+join inputs use this object. The aggregate
 planner also uses the producer's public output layout instead of recognizing
 specific `pg_batch` plan methods, so another registered producer can feed
 `PgBatchAgg` directly.

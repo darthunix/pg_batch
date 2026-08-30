@@ -3,33 +3,34 @@
 #include "executor/executor.h"
 
 #include "runtime.h"
+#include "node.h"
 
 struct PgBatchInput
 {
-	const PgBatchBridgeAPI *bridge;
+	const PgBatchAPI *api;
 	PlanState  *child;
-	PgBatchBridgeBinding *request_binding;
+	PgBatchBinding *request_binding;
 	TupleTableSlot *cached_slot;
-	PgBatchBridgeBinding *cached_binding;
-	PgBatchBridgeBinding *active_binding;
-	PgBatchBridgeBatch *active_batch;
+	PgBatchBinding *cached_binding;
+	PgBatchBinding *active_binding;
+	PgBatch *active_batch;
 };
 
 PgBatchInput *
 pg_batch_input_create(MemoryContext parent_context,
-					  const PgBatchBridgeAPI *bridge,
+					  const PgBatchAPI *api,
 					  PlanState *child, const char *producer_name)
 {
 	PgBatchInput *input;
-	const PgBatchBridgeProducerOps *producer;
+	const PgBatchProducerOps *producer;
 
-	if (parent_context == NULL || bridge == NULL || child == NULL ||
+	if (parent_context == NULL || api == NULL || child == NULL ||
 		producer_name == NULL || producer_name[0] == '\0')
-		elog(ERROR, "pg_batch input requires a context, bridge, child, and producer");
+		elog(ERROR, "pg_batch input requires a context, API, child, and producer");
 	input = MemoryContextAllocZero(parent_context, sizeof(*input));
-	input->bridge = bridge;
+	input->api = api;
 	input->child = child;
-	producer = bridge->get_producer(producer_name);
+	producer = api->get_producer(producer_name);
 	if (producer == NULL)
 		elog(ERROR, "pg_batch producer \"%s\" is not registered", producer_name);
 	input->request_binding = producer->get_request_binding(child);
@@ -39,7 +40,7 @@ pg_batch_input_create(MemoryContext parent_context,
 	return input;
 }
 
-PgBatchBridgeBinding *
+PgBatchBinding *
 pg_batch_input_request_binding(PgBatchInput *input)
 {
 	return input->request_binding;
@@ -49,7 +50,7 @@ static bool
 input_fetch(PgBatchInput *input, PgBatchInputBatch *result)
 {
 	TupleTableSlot *slot;
-	PgBatchBridgeBatch *batch;
+	PgBatch *batch;
 
 	if (result == NULL)
 		elog(ERROR, "pg_batch input requires a result");
@@ -62,11 +63,11 @@ input_fetch(PgBatchInput *input, PgBatchInputBatch *result)
 	if (slot != input->cached_slot)
 	{
 		input->cached_slot = slot;
-		input->cached_binding = input->bridge->find_binding(slot);
+		input->cached_binding = input->api->find_binding(slot);
 	}
 	if (input->cached_binding == NULL)
 		elog(ERROR, "pg_batch producer returned a slot without a batch binding");
-	batch = input->bridge->get_batch(input->cached_binding);
+	batch = input->api->get_batch(input->cached_binding);
 	if (batch == NULL)
 		elog(ERROR, "pg_batch producer returned no batch");
 
@@ -80,18 +81,11 @@ input_fetch(PgBatchInput *input, PgBatchInputBatch *result)
 bool
 pg_batch_input_next(PgBatchInput *input, PgBatchInputBatch *result)
 {
-	if (unlikely(input->active_batch != NULL))
-		elog(ERROR, "pg_batch input requested a new batch before finishing the previous one");
-	return input_fetch(input, result);
-}
-
-bool
-pg_batch_input_advance(PgBatchInput *input, PgBatchInputBatch *result)
-{
 	if (input->active_batch != NULL)
 	{
-		/* The bridge finish operation is exactly this hot state transition. */
-		input->active_batch->consumed = true;
+		/* A pass-through parent may have finished this binding directly. */
+		if (!input->api->batch_finished(input->active_binding))
+			elog(ERROR, "pg_batch input requested a new batch before finishing the previous one");
 		input->active_binding = NULL;
 		input->active_batch = NULL;
 	}
@@ -103,13 +97,13 @@ pg_batch_input_finish(PgBatchInput *input)
 {
 	if (unlikely(input->active_batch == NULL))
 		elog(ERROR, "pg_batch input has no active batch");
-	input->bridge->finish_batch(input->active_binding);
+	input->api->finish_batch(input->active_binding);
 	input->active_binding = NULL;
 	input->active_batch = NULL;
 }
 
 void
-pg_batch_input_reset(PgBatchInput *input)
+pg_batch_input_rescan(PgBatchInput *input)
 {
 	input->cached_slot = NULL;
 	input->cached_binding = NULL;

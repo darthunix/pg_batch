@@ -20,22 +20,29 @@ typedef struct PgBatchDatumBuffer PgBatchDatumBuffer;
 
 /* Cached execution state for consuming batches from one plan child. */
 typedef struct PgBatchInput PgBatchInput;
+typedef struct PgBatchOutput PgBatchOutput;
+
+/*
+ * Load the bridge extension when necessary and return its validated API.
+ * Callers may retain the returned pointer for the lifetime of the backend.
+ */
+extern const PgBatchAPI *pg_batch_api_get(void);
 
 /* Borrowed result of one successful input fetch. */
 typedef struct PgBatchInputBatch
 {
 	TupleTableSlot *slot;
-	PgBatchBridgeBatch *batch;
+	PgBatch *batch;
 } PgBatchInputBatch;
 
 static inline int
-pg_batch_row_count(const PgBatchBridgeBatch *batch)
+pg_batch_row_count(const PgBatch *batch)
 {
-	return pg_batch_bridge_selection_count(batch);
+	return pg_batch_selection_count(batch);
 }
 
 static inline bool
-pg_batch_has_rows(const PgBatchBridgeBatch *batch)
+pg_batch_has_rows(const PgBatch *batch)
 {
 	if (likely(batch->nwords == 1))
 		return batch->selection[0] != 0;
@@ -49,7 +56,7 @@ pg_batch_has_rows(const PgBatchBridgeBatch *batch)
 
 /* Return the active bits in one word, excluding bits beyond batch->nrows. */
 static inline uint64
-pg_batch_selection_word(const PgBatchBridgeBatch *batch, int word)
+pg_batch_selection_word(const PgBatch *batch, int word)
 {
 	uint64		rows;
 	int			remaining;
@@ -63,19 +70,19 @@ pg_batch_selection_word(const PgBatchBridgeBatch *batch, int word)
 }
 
 static inline void
-pg_batch_prepare_columns(PgBatchBridgeBatch *batch, const Bitmapset *columns,
+pg_batch_prepare_columns(PgBatch *batch, const Bitmapset *columns,
 						 const uint64 *selected_rows,
-						 PgBatchBridgeMaterializePhase phase)
+						 PgBatchColumnPhase phase)
 {
 	if (columns != NULL && batch->ops->prepare_columns != NULL)
 		batch->ops->prepare_columns(batch, columns, selected_rows, phase);
 }
 
 static inline void
-pg_batch_get_datum_column(PgBatchBridgeBatch *batch, int column,
+pg_batch_get_datum_column(PgBatch *batch, int column,
 						  const uint64 *selected_rows,
-						  PgBatchBridgeMaterializePhase phase,
-						  PgBatchBridgeDatumColumn *result)
+						  PgBatchColumnPhase phase,
+						  PgBatchDatumVector *result)
 {
 	if (batch->ops->get_datum_column == NULL)
 		elog(ERROR, "pg_batch source cannot materialize Datum columns");
@@ -83,22 +90,22 @@ pg_batch_get_datum_column(PgBatchBridgeBatch *batch, int column,
 }
 
 /* Materialize the selected rows of every requested column as Datums. */
-extern void pg_batch_materialize_columns(PgBatchBridgeBatch *batch,
+extern void pg_batch_materialize_columns(PgBatch *batch,
 										 const Bitmapset *columns,
 										 const uint64 *selected_rows,
-										 PgBatchBridgeMaterializePhase phase);
+										 PgBatchColumnPhase phase);
 
 /* Return a prepared Arrow column when the active batch publishes one. */
-extern bool pg_batch_get_arrow_column(PgBatchBridgeBatch *batch, int column,
-									  PgBatchBridgeArrowView *result);
+extern bool pg_batch_get_arrow_column(PgBatch *batch, int column,
+									  PgBatchArrowView *result);
 
 /*
  * Return an int4 view without converting native packed values to Datums.
  * The caller must first prepare the requested rows and column.
  */
-extern void pg_batch_get_int4_vector(PgBatchBridgeBatch *batch, int column,
+extern void pg_batch_get_int4_vector(PgBatch *batch, int column,
 									 const uint64 *selected_rows,
-									 PgBatchBridgeMaterializePhase phase,
+									 PgBatchColumnPhase phase,
 									 PgBatchInt4Vector *result);
 
 /*
@@ -131,7 +138,7 @@ extern void pg_batch_datum_buffer_append_slot(PgBatchDatumBuffer *buffer,
  * Seal and return the current batch, or NULL when the buffer is empty. The
  * returned batch and its column views remain valid until reset().
  */
-extern PgBatchBridgeBatch *pg_batch_datum_buffer_finish(
+extern PgBatch *pg_batch_datum_buffer_finish(
 	PgBatchDatumBuffer *buffer, Oid table_oid);
 
 /*
@@ -140,11 +147,11 @@ extern PgBatchBridgeBatch *pg_batch_datum_buffer_finish(
  * for the lifetime of the input.
  */
 extern PgBatchInput *pg_batch_input_create(
-	MemoryContext parent_context, const PgBatchBridgeAPI *bridge,
+	MemoryContext parent_context, const PgBatchAPI *api,
 	struct PlanState *child, const char *producer_name);
 
 /* Return the stable binding through which the child request is configured. */
-extern PgBatchBridgeBinding *pg_batch_input_request_binding(
+extern PgBatchBinding *pg_batch_input_request_binding(
 	PgBatchInput *input);
 
 /*
@@ -155,10 +162,6 @@ extern PgBatchBridgeBinding *pg_batch_input_request_binding(
 extern bool pg_batch_input_next(PgBatchInput *input,
 	PgBatchInputBatch *result);
 
-/* Finish the current batch, if any, then fetch the next one. */
-extern bool pg_batch_input_advance(PgBatchInput *input,
-	PgBatchInputBatch *result);
-
 /* Mark the current batch consumed before a later next() call. */
 extern void pg_batch_input_finish(PgBatchInput *input);
 
@@ -166,6 +169,38 @@ extern void pg_batch_input_finish(PgBatchInput *input);
  * Forget cached execution pointers after the caller has rescanned the child.
  * The child is responsible for releasing any batch that was still active.
  */
-extern void pg_batch_input_reset(PgBatchInput *input);
+extern void pg_batch_input_rescan(PgBatchInput *input);
+
+/*
+ * Attach a bridge binding and a Datum scalar adapter to a virtual output
+ * slot. The first slot attributes correspond to batch columns in order;
+ * additional batch columns may represent resjunk plan entries.
+ * source_attnums describes the full layout advertised through PgBatchRequest.
+ */
+extern PgBatchOutput *pg_batch_output_create(
+	MemoryContext parent_context, const PgBatchAPI *api,
+	TupleTableSlot *slot, const AttrNumber *source_attnums, int ncolumns);
+
+/* Return the binding used by parents to configure this node's request. */
+extern PgBatchBinding *pg_batch_output_binding(PgBatchOutput *output);
+
+/* Return the current bridge-owned request. */
+extern const PgBatchRequest *pg_batch_output_request(PgBatchOutput *output);
+
+/*
+ * Publish a batch and return the nonempty output slot. If a previous batch is
+ * active, its consumer must have finished it before this call.
+ */
+extern TupleTableSlot *pg_batch_output_publish(PgBatchOutput *output,
+	PgBatch *batch);
+
+/* Select another row for a scalar parent without changing the active batch. */
+extern TupleTableSlot *pg_batch_output_select(PgBatchOutput *output, int row);
+
+/* Finish the active batch on behalf of a scalar consumer. */
+extern void pg_batch_output_finish(PgBatchOutput *output);
+
+/* Release any active batch and forget tuple state during end or rescan. */
+extern void pg_batch_output_reset(PgBatchOutput *output);
 
 #endif							/* PG_BATCH_RUNTIME_H */

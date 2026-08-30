@@ -22,28 +22,12 @@ PG_FUNCTION_INFO_V1(pg_batch_fdw_validator);
 
 bool		pg_batch_fdw_pushdown = true;
 bool		pg_batch_fdw_column_pruning = true;
-const PgBatchBridgeAPI *pg_batch_fdw_bridge;
-
-static void
-load_bridge(void)
-{
-	void	  **rendezvous = find_rendezvous_variable(PG_BATCH_BRIDGE_RENDEZVOUS);
-
-	if (*rendezvous == NULL)
-		load_file("$libdir/pg_batch_bridge", false);
-	pg_batch_fdw_bridge = *rendezvous;
-	if (pg_batch_fdw_bridge == NULL ||
-		pg_batch_fdw_bridge->abi_version != PG_BATCH_BRIDGE_ABI_VERSION ||
-		pg_batch_fdw_bridge->struct_size < sizeof(PgBatchBridgeAPI))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("incompatible pg_batch_bridge library")));
-}
+const PgBatchAPI *pg_batch_fdw_api;
 
 void
 _PG_init(void)
 {
-	load_bridge();
+	pg_batch_fdw_api = pg_batch_api_get();
 	DefineCustomBoolVariable("pg_batch_fdw.pushdown",
 							 "Apply supported restrictions inside the Arrow source.",
 							 NULL, &pg_batch_fdw_pushdown, true,
@@ -52,14 +36,14 @@ _PG_init(void)
 							 "Decode Arrow columns only when a consumer requests them.",
 							 NULL, &pg_batch_fdw_column_pruning, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
-	pg_batch_fdw_bridge->register_provider(&pg_batch_fdw_provider_ops);
+	pg_batch_fdw_api->register_provider(&pg_batch_fdw_provider_ops);
 }
 
 void
 _PG_fini(void)
 {
-	if (pg_batch_fdw_bridge != NULL)
-		pg_batch_fdw_bridge->unregister_provider(PG_BATCH_FDW_PROVIDER_NAME);
+	if (pg_batch_fdw_api != NULL)
+		pg_batch_fdw_api->unregister_provider(PG_BATCH_FDW_PROVIDER_NAME);
 }
 
 Datum

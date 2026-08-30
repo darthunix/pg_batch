@@ -50,7 +50,7 @@ typedef struct DatumColumn
 typedef struct ActiveBatch
 {
 	struct PgBatchFdwScan *scan;
-	PgBatchBridgeBatch bridge_batch;
+	PgBatch bridge_batch;
 	uint64		selection;
 	int			start;
 	ArrowArray *columns;
@@ -65,7 +65,7 @@ struct PgBatchFdwScan
 	MemoryContext batch_context;
 	Relation	relation;
 	ExprContext *econtext;
-	const PgBatchBridgeRequest *request;
+	const PgBatchRequest *request;
 	IpcReader	reader;
 	ArrowArray *record_columns;
 	bool	   *record_decoded;
@@ -79,10 +79,10 @@ struct PgBatchFdwScan
 	PgBatchFdwStats stats;
 };
 
-static const PgBatchBridgeBatchOps batch_ops;
-static void prepare_columns(PgBatchBridgeBatch *bridge_batch,
+static const PgBatchOps batch_ops;
+static void prepare_columns(PgBatch *bridge_batch,
 	const Bitmapset *columns, const uint64 *rows,
-	PgBatchBridgeMaterializePhase phase);
+	PgBatchColumnPhase phase);
 
 static void
 nanoarrow_error(int code, ArrowError *error, const char *operation)
@@ -301,7 +301,7 @@ reader_next_record(PgBatchFdwScan *scan)
 
 static ArrowArray *
 decode_column(PgBatchFdwScan *scan, AttrNumber attnum,
-			  PgBatchBridgeMaterializePhase phase)
+			  PgBatchColumnPhase phase)
 {
 	IpcReader  *reader = &scan->reader;
 	ArrowArray *column;
@@ -325,14 +325,14 @@ decode_column(PgBatchFdwScan *scan, AttrNumber attnum,
 					&error, "decode an Arrow column");
 	scan->record_decoded[index] = true;
 	scan->stats.columns_decoded++;
-	if (phase == PG_BATCH_BRIDGE_MATERIALIZE_FILTER)
+	if (phase == PG_BATCH_COLUMN_FILTER)
 		scan->stats.filter_columns_decoded++;
 	else
 		scan->stats.project_columns_decoded++;
 	return column;
 }
 
-static PgBatchBridgeMaterializePhase
+static PgBatchColumnPhase
 request_phase_for_attnum(PgBatchFdwScan *scan, AttrNumber attnum)
 {
 	for (int i = 0; i < scan->nquals; i++)
@@ -340,16 +340,16 @@ request_phase_for_attnum(PgBatchFdwScan *scan, AttrNumber attnum)
 		int			column = scan->quals[i].column;
 
 		if (scan->request->source_attnums[column] == attnum)
-			return PG_BATCH_BRIDGE_MATERIALIZE_FILTER;
+			return PG_BATCH_COLUMN_FILTER;
 	}
 	for (int column = 0; column < scan->request->ncolumns; column++)
 	{
 		if (scan->request->source_attnums[column] == attnum)
 			return bms_is_member(column, scan->request->filter_columns) ?
-				PG_BATCH_BRIDGE_MATERIALIZE_FILTER :
-				PG_BATCH_BRIDGE_MATERIALIZE_PROJECT;
+				PG_BATCH_COLUMN_FILTER :
+				PG_BATCH_COLUMN_PROJECT;
 	}
-	return PG_BATCH_BRIDGE_MATERIALIZE_PROJECT;
+	return PG_BATCH_COLUMN_PROJECT;
 }
 
 static bool
@@ -396,9 +396,9 @@ apply_source_quals(ActiveBatch *active)
 		SourceQual *qual = &scan->quals[q];
 
 		prepare_columns(&active->bridge_batch, qual->column_mask,
-						&active->selection, PG_BATCH_BRIDGE_MATERIALIZE_FILTER);
+						&active->selection, PG_BATCH_COLUMN_FILTER);
 		pg_batch_expr_bind(qual->expr, &active->bridge_batch, scan->econtext,
-						   PG_BATCH_BRIDGE_MATERIALIZE_FILTER);
+						   PG_BATCH_COLUMN_FILTER);
 		pg_batch_expr_apply_filter(qual->expr, true);
 	}
 	scan->stats.rows_removed += initial - pg_popcount64(active->selection);
@@ -407,7 +407,7 @@ apply_source_quals(ActiveBatch *active)
 static int
 resolve_source_var(const Var *var, void *context)
 {
-	const PgBatchBridgeRequest *request = context;
+	const PgBatchRequest *request = context;
 
 	if (var->varno == INDEX_VAR && var->varattno <= request->ncolumns)
 		return var->varattno - 1;
@@ -421,7 +421,7 @@ resolve_source_var(const Var *var, void *context)
 
 static void
 prepare_column(ActiveBatch *active, int column,
-			   PgBatchBridgeMaterializePhase phase)
+			   PgBatchColumnPhase phase)
 {
 	PgBatchFdwScan *scan = active->scan;
 	AttrNumber	attnum;
@@ -444,9 +444,9 @@ prepare_column(ActiveBatch *active, int column,
 }
 
 static void
-prepare_columns(PgBatchBridgeBatch *bridge_batch,
+prepare_columns(PgBatch *bridge_batch,
 				const Bitmapset *columns, const uint64 *rows,
-				PgBatchBridgeMaterializePhase phase)
+				PgBatchColumnPhase phase)
 {
 	ActiveBatch *active = bridge_batch->private_data;
 	int			column = -1;
@@ -458,8 +458,8 @@ prepare_columns(PgBatchBridgeBatch *bridge_batch,
 }
 
 static void
-get_arrow_column(PgBatchBridgeBatch *bridge_batch, int column,
-				 PgBatchBridgeArrowView *view)
+get_arrow_column(PgBatch *bridge_batch, int column,
+				 PgBatchArrowView *view)
 {
 	ActiveBatch *active = bridge_batch->private_data;
 	PgBatchFdwScan *scan = active->scan;
@@ -473,17 +473,17 @@ get_arrow_column(PgBatchBridgeBatch *bridge_batch, int column,
 	view->schema = scan->reader.schema.children[attnum - 1];
 }
 
-static const PgBatchBridgeArrowInterface arrow_interface = {
-	.abi_version = PG_BATCH_BRIDGE_ARROW_INTERFACE_VERSION,
-	.struct_size = sizeof(PgBatchBridgeArrowInterface),
+static const PgBatchArrowInterface arrow_interface = {
+	.abi_version = PG_BATCH_ARROW_INTERFACE_VERSION,
+	.struct_size = sizeof(PgBatchArrowInterface),
 	.get_column = get_arrow_column,
 };
 
 static bool
-get_int4_column(PgBatchBridgeBatch *bridge_batch, int column,
+get_int4_column(PgBatch *bridge_batch, int column,
 				PgBatchInt4Vector *result)
 {
-	PgBatchBridgeArrowView view;
+	PgBatchArrowView view;
 
 	get_arrow_column(bridge_batch, column, &view);
 	pg_batch_int4_vector_init_packed(result, view.array->buffers[1],
@@ -499,23 +499,23 @@ static const PgBatchInt4VectorInterface int4_interface = {
 };
 
 static const void *
-get_native_interface(PgBatchBridgeBatch *batch, const char *name,
+get_native_interface(PgBatch *batch, const char *name,
 					 uint32 version)
 {
 	if (version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
 		strcmp(name, PG_BATCH_INT4_VECTOR_INTERFACE_NAME) == 0)
 		return &int4_interface;
-	if (version == PG_BATCH_BRIDGE_ARROW_INTERFACE_VERSION &&
-		strcmp(name, PG_BATCH_BRIDGE_ARROW_INTERFACE_NAME) == 0)
+	if (version == PG_BATCH_ARROW_INTERFACE_VERSION &&
+		strcmp(name, PG_BATCH_ARROW_INTERFACE_NAME) == 0)
 		return &arrow_interface;
 	return NULL;
 }
 
 static void
-get_datum_column(PgBatchBridgeBatch *bridge_batch, int column,
+get_datum_column(PgBatch *bridge_batch, int column,
 				 const uint64 *rows,
-				 PgBatchBridgeMaterializePhase phase,
-				 PgBatchBridgeDatumColumn *result)
+				 PgBatchColumnPhase phase,
+				 PgBatchDatumVector *result)
 {
 	ActiveBatch *active = bridge_batch->private_data;
 	PgBatchFdwScan *scan = active->scan;
@@ -546,7 +546,7 @@ get_datum_column(PgBatchBridgeBatch *bridge_batch, int column,
 			Int32GetDatum(values[array->offset + row]);
 		datum->isnull[row] = isnull;
 		datum->valid_rows |= bit;
-		if (phase == PG_BATCH_BRIDGE_MATERIALIZE_FILTER)
+		if (phase == PG_BATCH_COLUMN_FILTER)
 			scan->stats.filter_datums++;
 		else
 			scan->stats.project_datums++;
@@ -559,7 +559,7 @@ get_datum_column(PgBatchBridgeBatch *bridge_batch, int column,
 }
 
 static void
-release_batch(PgBatchBridgeBatch *bridge_batch)
+release_batch(PgBatch *bridge_batch)
 {
 	ActiveBatch *active = bridge_batch->private_data;
 
@@ -567,9 +567,9 @@ release_batch(PgBatchBridgeBatch *bridge_batch)
 		active->scan->active = NULL;
 }
 
-static const PgBatchBridgeBatchOps batch_ops = {
-	.abi_version = PG_BATCH_BRIDGE_ABI_VERSION,
-	.struct_size = sizeof(PgBatchBridgeBatchOps),
+static const PgBatchOps batch_ops = {
+	.abi_version = PG_BATCH_ABI_VERSION,
+	.struct_size = sizeof(PgBatchOps),
 	.prepare_columns = prepare_columns,
 	.get_datum_column = get_datum_column,
 	.get_native_interface = get_native_interface,
@@ -600,7 +600,7 @@ scan_cleanup(void *arg)
 PgBatchFdwScan *
 pg_batch_fdw_scan_begin(Relation relation, PlanState *parent,
 						Node *source_private, List *source_exprs,
-						const PgBatchBridgeRequest *request,
+						const PgBatchRequest *request,
 						MemoryContext query_context)
 {
 	MemoryContext context;
@@ -651,7 +651,7 @@ pg_batch_fdw_scan_begin(Relation relation, PlanState *parent,
 	return scan;
 }
 
-PgBatchBridgeBatch *
+PgBatch *
 pg_batch_fdw_scan_next(PgBatchFdwScan *scan)
 {
 	ActiveBatch *active;
@@ -685,8 +685,8 @@ pg_batch_fdw_scan_next(PgBatchFdwScan *scan)
 												 sizeof(DatumColumn) * ncolumns);
 		}
 		active->selection = UINT64_MAX >> (64 - nrows);
-		active->bridge_batch.abi_version = PG_BATCH_BRIDGE_ABI_VERSION;
-		active->bridge_batch.struct_size = sizeof(PgBatchBridgeBatch);
+		active->bridge_batch.abi_version = PG_BATCH_ABI_VERSION;
+		active->bridge_batch.struct_size = sizeof(PgBatch);
 		active->bridge_batch.nrows = nrows;
 		active->bridge_batch.nwords = 1;
 		active->bridge_batch.selection = &active->selection;
@@ -761,7 +761,7 @@ pg_batch_fdw_begin_foreign_scan(ForeignScanState *node, int eflags)
 {
 	ForeignScan *plan = castNode(ForeignScan, node->ss.ps.plan);
 	MemoryContext oldcontext;
-	PgBatchBridgeRequest *request;
+	PgBatchRequest *request;
 	AttrNumber *attnums;
 	int			natts;
 
@@ -769,7 +769,7 @@ pg_batch_fdw_begin_foreign_scan(ForeignScanState *node, int eflags)
 		return;
 	natts = RelationGetNumberOfAttributes(node->ss.ss_currentRelation);
 	oldcontext = MemoryContextSwitchTo(node->ss.ps.state->es_query_cxt);
-	request = palloc0_object(PgBatchBridgeRequest);
+	request = palloc0_object(PgBatchRequest);
 	attnums = palloc_array(AttrNumber, natts);
 	for (int i = 0; i < natts; i++)
 		attnums[i] = i + 1;
@@ -792,7 +792,7 @@ pg_batch_fdw_iterate_foreign_scan(ForeignScanState *node)
 
 	for (;;)
 	{
-		PgBatchBridgeBatch *batch;
+		PgBatch *batch;
 		int			row;
 
 		if (scan->active == NULL)
@@ -803,7 +803,7 @@ pg_batch_fdw_iterate_foreign_scan(ForeignScanState *node)
 			scan->scalar_row = -1;
 		}
 		batch = &scan->active->bridge_batch;
-		row = pg_batch_bridge_next_selected(batch, scan->scalar_row);
+		row = pg_batch_next_selected(batch, scan->scalar_row);
 		if (row < 0)
 		{
 			release_batch(batch);
@@ -813,11 +813,11 @@ pg_batch_fdw_iterate_foreign_scan(ForeignScanState *node)
 		ExecClearTuple(slot);
 		for (int column = 0; column < natts; column++)
 		{
-			PgBatchBridgeDatumColumn datum;
+			PgBatchDatumVector datum;
 			uint64		rows = UINT64CONST(1) << row;
 
 			get_datum_column(batch, column, &rows,
-							 PG_BATCH_BRIDGE_MATERIALIZE_PROJECT, &datum);
+							 PG_BATCH_COLUMN_PROJECT, &datum);
 			slot->tts_values[column] = datum.values[row];
 			slot->tts_isnull[column] = datum.isnull[row];
 		}

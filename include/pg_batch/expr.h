@@ -50,8 +50,8 @@ extern int pg_batch_expr_input_column(const PgBatchExpr *expr);
 
 /* Bind reusable expression state to one active batch. */
 extern void pg_batch_expr_bind(
-	PgBatchExpr *expr, PgBatchBridgeBatch *batch, ExprContext *econtext,
-	PgBatchBridgeMaterializePhase phase);
+	PgBatchExpr *expr, PgBatch *batch, ExprContext *econtext,
+	PgBatchColumnPhase phase);
 
 /*
  * Evaluate a value expression or apply a filter to batch->selection. The
@@ -71,8 +71,8 @@ extern PgBatchExprProjection *pg_batch_expr_projection_create(
 	PgBatchExprResolveVar resolve_var, void *resolve_context);
 
 /* Bind the projection and return its format-neutral output batch. */
-extern PgBatchBridgeBatch *pg_batch_expr_projection_bind(
-	PgBatchExprProjection *projection, PgBatchBridgeBatch *input,
+extern PgBatch *pg_batch_expr_projection_bind(
+	PgBatchExprProjection *projection, PgBatch *input,
 	ExprContext *econtext);
 
 /* Borrowed union of compact input columns used by the projection. */
