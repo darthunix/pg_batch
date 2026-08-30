@@ -4,103 +4,10 @@
 #include "commands/explain.h"
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
-#include "utils/fmgroids.h"
 #include "utils/memutils.h"
+#include "optimizer/restrictinfo.h"
 
 #include "internal.h"
-
-static Node *
-strip_relabel(Node *node)
-{
-	if (IsA(node, RelabelType))
-		return (Node *) castNode(RelabelType, node)->arg;
-	return node;
-}
-
-static bool
-is_scalar_operand(Node *node)
-{
-	return IsA(node, Const) ||
-		(IsA(node, Param) &&
-		 (castNode(Param, node)->paramkind == PARAM_EXTERN ||
-		  castNode(Param, node)->paramkind == PARAM_EXEC));
-}
-
-static bool
-map_source_operator(Oid funcid, uint8 var_argno,
-					SourceOperator *result)
-{
-	SourceOperator op;
-
-	switch (funcid)
-	{
-		case F_INT4EQ:
-			op = PG_BATCH_TAM_SOURCE_EQ;
-			break;
-		case F_INT4NE:
-			op = PG_BATCH_TAM_SOURCE_NE;
-			break;
-		case F_INT4LT:
-			op = PG_BATCH_TAM_SOURCE_LT;
-			break;
-		case F_INT4LE:
-			op = PG_BATCH_TAM_SOURCE_LE;
-			break;
-		case F_INT4GT:
-			op = PG_BATCH_TAM_SOURCE_GT;
-			break;
-		case F_INT4GE:
-			op = PG_BATCH_TAM_SOURCE_GE;
-			break;
-		default:
-			return false;
-	}
-	if (var_argno == 1)
-	{
-		if (op == PG_BATCH_TAM_SOURCE_LT)
-			op = PG_BATCH_TAM_SOURCE_GT;
-		else if (op == PG_BATCH_TAM_SOURCE_LE)
-			op = PG_BATCH_TAM_SOURCE_GE;
-		else if (op == PG_BATCH_TAM_SOURCE_GT)
-			op = PG_BATCH_TAM_SOURCE_LT;
-		else if (op == PG_BATCH_TAM_SOURCE_GE)
-			op = PG_BATCH_TAM_SOURCE_LE;
-	}
-	*result = op;
-	return true;
-}
-
-static bool
-match_source_qual(Node *clause, Index relid, AttrNumber *attnum,
-				  SourceOperator *source_op, Node **scalar)
-{
-	OpExpr	   *op;
-	Node	   *args[2];
-	uint8		var_argno;
-	Var		   *var;
-
-	if (!IsA(clause, OpExpr))
-		return false;
-	op = castNode(OpExpr, clause);
-	if (list_length(op->args) != 2)
-		return false;
-	args[0] = strip_relabel(linitial(op->args));
-	args[1] = strip_relabel(lsecond(op->args));
-	if (IsA(args[0], Var) && is_scalar_operand(args[1]))
-		var_argno = 0;
-	else if (is_scalar_operand(args[0]) && IsA(args[1], Var))
-		var_argno = 1;
-	else
-		return false;
-	var = castNode(Var, args[var_argno]);
-	if (var->varno != relid || var->varlevelsup != 0 || var->varattno <= 0 ||
-		var->varreturningtype != VAR_RETURNING_DEFAULT ||
-		!map_source_operator(op->opfuncid, var_argno, source_op))
-		return false;
-	*attnum = var->varattno;
-	*scalar = args[1 - var_argno];
-	return true;
-}
 
 static bool
 supports_relation(Relation relation)
@@ -119,38 +26,74 @@ plan_scan(const PgBatchBridgePlanRequest *request,
 	int			nquals = list_length(request->clauses);
 	int			qualno = 0;
 	int			exprno = 0;
+	ListCell   *clause_cell;
+	ListCell   *rinfo_cell;
 
 	MemSet(result, 0, sizeof(*result));
 	result->nquals = nquals;
 	result->qual_support = palloc0_array(PgBatchBridgeQualSupport, nquals);
-	if (pg_batch_tam_scan_mode != PG_BATCH_TAM_BATCH)
+	if (pg_batch_tam_scan_mode == PG_BATCH_TAM_BATCH)
+		goto done;
+	if (list_length(request->clauses) != list_length(request->restrictinfos))
+		elog(ERROR, "pg_batch TAM received misaligned restrictions");
+	forboth(clause_cell, request->clauses, rinfo_cell, request->restrictinfos)
 	{
-		foreach_ptr(Node, clause, request->clauses)
-		{
-			AttrNumber	attnum;
-			SourceOperator source_op;
-			Node	   *scalar;
+		Node	   *clause = lfirst(clause_cell);
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, rinfo_cell);
+		AttrNumber	attnum = InvalidAttrNumber;
+		PgBatchInt4Op op = PG_BATCH_INT4_EQ;
+		Node	   *scalar = NULL;
+		bool		direct;
+		bool		exact;
+		int			filter_exprno = -1;
+		int			scalar_exprno = -1;
 
-			if (match_source_qual(clause, request->rel->relid,
-								  &attnum, &source_op, &scalar))
-			{
-				source_exprs = lappend(source_exprs, copyObject(scalar));
-				specs = lappend(specs,
-								list_make3(makeInteger(attnum),
-										   makeInteger(source_op),
-										   makeInteger(exprno)));
-				result->qual_support[qualno] =
-					pg_batch_tam_scan_mode == PG_BATCH_TAM_FILTER ?
-					PG_BATCH_BRIDGE_QUAL_EXACT :
-					PG_BATCH_BRIDGE_QUAL_PRUNE_ONLY;
-				exprno++;
-			}
-			qualno++;
+		if (!restriction_is_securely_promotable(rinfo, request->rel))
+			goto next;
+		direct = pg_batch_expr_match_int4_comparison(clause,
+			request->rel->relid, &attnum, &op, &scalar);
+		exact = pg_batch_tam_scan_mode == PG_BATCH_TAM_FILTER &&
+			pg_batch_expr_supports_filter(clause, request->rel->relid);
+		if (!direct && !exact)
+			goto next;
+		if (exact)
+		{
+			filter_exprno = exprno++;
+			source_exprs = lappend(source_exprs, copyObject(clause));
 		}
+		if (direct)
+		{
+			scalar_exprno = exprno++;
+			source_exprs = lappend(source_exprs, copyObject(scalar));
+		}
+		specs = lappend(specs,
+			list_make5(makeInteger(filter_exprno), makeInteger(attnum),
+					   makeInteger(op), makeInteger(scalar_exprno),
+					   makeInteger(direct)));
+		result->qual_support[qualno] = exact ?
+			PG_BATCH_BRIDGE_QUAL_EXACT : PG_BATCH_BRIDGE_QUAL_PRUNE_ONLY;
+next:
+		qualno++;
 	}
+done:
 	result->source_exprs = source_exprs;
 	result->source_private = (Node *)
 		list_make2(makeInteger(pg_batch_tam_scan_mode), specs);
+}
+
+static int
+resolve_source_var(const Var *var, void *context)
+{
+	const PgBatchBridgeRequest *request = context;
+
+	if (var->varno == INDEX_VAR && var->varattno <= request->ncolumns)
+		return var->varattno - 1;
+	for (int column = 0; column < request->ncolumns; column++)
+	{
+		if (request->source_attnums[column] == var->varattno)
+			return column;
+	}
+	return -1;
 }
 
 static void
@@ -201,13 +144,24 @@ begin_scan(const PgBatchBridgeExecRequest *request)
 	scan->quals = palloc0_array(SourceQual, scan->nquals);
 	foreach_ptr(List, spec, specs)
 	{
-		int			exprno = intVal(lthird(spec));
+		int			filter_exprno = intVal(linitial(spec));
+		int			scalar_exprno = intVal(lfourth(spec));
 		SourceQual *qual = &scan->quals[qualno++];
 
-		qual->attnum = intVal(linitial(spec));
-		qual->op = intVal(lsecond(spec));
-		qual->scalar_expr = ExecInitExpr(list_nth(request->source_exprs, exprno),
-										 request->parent);
+		qual->attnum = intVal(lsecond(spec));
+		qual->op = intVal(lthird(spec));
+		qual->prunable = intVal(list_nth(spec, 4)) != 0;
+		if (filter_exprno >= 0)
+		{
+			qual->expr = pg_batch_expr_compile_filter(
+				list_nth(request->source_exprs, filter_exprno), request->parent,
+				resolve_source_var, (void *) request->slot_request);
+			qual->column = pg_batch_expr_input_column(qual->expr);
+			qual->column_mask = bms_make_singleton(qual->column);
+		}
+		if (scalar_exprno >= 0)
+			qual->scalar_expr = ExecInitExpr(
+				list_nth(request->source_exprs, scalar_exprno), request->parent);
 	}
 	MemoryContextSwitchTo(oldcontext);
 	return scan;
@@ -221,7 +175,7 @@ rescan(void *provider_state)
 	scan->group_index = 0;
 	scan->batch_index = 0;
 	scan->group_ready = false;
-	scan->quals_ready = false;
+	scan->prune_quals_ready = false;
 }
 
 static void

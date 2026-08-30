@@ -15,6 +15,7 @@
 #include "arrow.h"
 #include "runtime.h"
 #include "kernels.h"
+#include "expr.h"
 
 #define PG_BATCH_SIZE 64
 #define PG_BATCH_ALL_ROWS UINT64_MAX
@@ -139,10 +140,10 @@ extern void pg_batch_load_batch(PgBatchSlot *bslot, Buffer buffer,
 								const OffsetNumber *item_offsets, int nrows);
 extern void pg_batch_select_row(TupleTableSlot *slot, int row);
 
-extern OpExpr *pg_batch_match_qual(Node *clause, uint8 *var_argno);
 extern Node *pg_batch_create_scan_state(CustomScan *cscan);
 extern Node *pg_batch_create_filter_state(CustomScan *cscan);
 extern Node *pg_batch_create_pack_state(CustomScan *cscan);
+extern Node *pg_batch_create_project_state(CustomScan *cscan);
 extern Node *pg_batch_create_hash_join_state(CustomScan *cscan);
 extern TupleTableSlot *pg_batch_hash_join_output_slot(CustomScanState *state);
 extern Node *pg_batch_create_agg_state(CustomScan *cscan);

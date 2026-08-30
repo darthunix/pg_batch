@@ -3,6 +3,7 @@ PG_CONFIG ?= pg_config
 MESON_BUILD_DIR = $(CURDIR)/build/meson-libs
 PG_BATCH_RUNTIME_LIB = $(MESON_BUILD_DIR)/runtime/libpg_batch_runtime.a
 PG_BATCH_KERNELS_LIB = $(MESON_BUILD_DIR)/kernels/libpg_batch_kernels.a
+PG_BATCH_EXPR_LIB = $(MESON_BUILD_DIR)/expr/libpg_batch_expr.a
 PG_PKGLIBDIR = $(shell $(PG_CONFIG) --pkglibdir)
 PG_INCLUDEDIR_SERVER = $(shell $(PG_CONFIG) --includedir-server)
 NANOARROW_SOURCE = $(CURDIR)/third_party/nanoarrow
@@ -54,7 +55,8 @@ fdw: nanoarrow
 $(SUBDIRS):
 	$(MAKE) -C $@ PG_CONFIG="$(PG_CONFIG)" \
 		PG_BATCH_RUNTIME_LIB="$(PG_BATCH_RUNTIME_LIB)" \
-		PG_BATCH_KERNELS_LIB="$(PG_BATCH_KERNELS_LIB)"
+		PG_BATCH_KERNELS_LIB="$(PG_BATCH_KERNELS_LIB)" \
+		PG_BATCH_EXPR_LIB="$(PG_BATCH_EXPR_LIB)"
 
 clean:
 	@for dir in $(SUBDIRS) test; do \
@@ -78,11 +80,15 @@ uninstall:
 	rm -f \
 		"$(DESTDIR)$(PG_PKGLIBDIR)/libpg_batch_runtime.a" \
 		"$(DESTDIR)$(PG_PKGLIBDIR)/libpg_batch_kernels.a" \
+		"$(DESTDIR)$(PG_PKGLIBDIR)/libpg_batch_expr.a" \
 		"$(DESTDIR)$(PG_PKGLIBDIR)/pkgconfig/pg_batch-runtime.pc" \
 		"$(DESTDIR)$(PG_PKGLIBDIR)/pkgconfig/pg_batch-kernels.pc" \
+		"$(DESTDIR)$(PG_PKGLIBDIR)/pkgconfig/pg_batch-expr.pc" \
 		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch_runtime/runtime.h" \
 		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch_runtime/vector.h" \
 		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch_kernels/kernels.h"
+	rm -f \
+		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch_expr/expr.h"
 
 installcheck:
 	$(MAKE) -C test PG_CONFIG="$(PG_CONFIG)" all

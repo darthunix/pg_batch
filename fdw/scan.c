@@ -35,10 +35,9 @@ typedef struct IpcReader
 
 typedef struct SourceQual
 {
-	AttrNumber	attnum;
-	PgBatchFdwOperator op;
-	ExprState  *scalar_expr;
-	NullableDatum scalar;
+	PgBatchExpr *expr;
+	Bitmapset  *column_mask;
+	int			column;
 } SourceQual;
 
 typedef struct DatumColumn
@@ -74,7 +73,6 @@ struct PgBatchFdwScan
 	int			record_offset;
 	SourceQual *quals;
 	int			nquals;
-	bool		quals_ready;
 	bool		cleaned;
 	ActiveBatch *active;
 	int			scalar_row;
@@ -82,6 +80,9 @@ struct PgBatchFdwScan
 };
 
 static const PgBatchBridgeBatchOps batch_ops;
+static void prepare_columns(PgBatchBridgeBatch *bridge_batch,
+	const Bitmapset *columns, const uint64 *rows,
+	PgBatchBridgeMaterializePhase phase);
 
 static void
 nanoarrow_error(int code, ArrowError *error, const char *operation)
@@ -336,7 +337,9 @@ request_phase_for_attnum(PgBatchFdwScan *scan, AttrNumber attnum)
 {
 	for (int i = 0; i < scan->nquals; i++)
 	{
-		if (scan->quals[i].attnum == attnum)
+		int			column = scan->quals[i].column;
+
+		if (scan->request->source_attnums[column] == attnum)
 			return PG_BATCH_BRIDGE_MATERIALIZE_FILTER;
 	}
 	for (int column = 0; column < scan->request->ncolumns; column++)
@@ -359,7 +362,8 @@ load_record(PgBatchFdwScan *scan)
 	if (!reader_next_record(scan))
 		return false;
 	if (scan->nquals > 0)
-		length_attnum = scan->quals[0].attnum;
+		length_attnum = scan->request->source_attnums[
+			scan->quals[0].column];
 	else if (scan->request->ncolumns > 0)
 		length_attnum = scan->request->source_attnums[0];
 	else
@@ -381,71 +385,38 @@ load_record(PgBatchFdwScan *scan)
 }
 
 static void
-prepare_quals(PgBatchFdwScan *scan)
-{
-	if (scan->quals_ready)
-		return;
-	ResetExprContext(scan->econtext);
-	for (int i = 0; i < scan->nquals; i++)
-	{
-		SourceQual *qual = &scan->quals[i];
-
-		qual->scalar.value = ExecEvalExpr(qual->scalar_expr, scan->econtext,
-										  &qual->scalar.isnull);
-	}
-	scan->quals_ready = true;
-}
-
-static PgBatchInt4Op
-source_kernel_op(PgBatchFdwOperator op)
-{
-	switch (op)
-	{
-		case PG_BATCH_FDW_EQ:
-			return PG_BATCH_INT4_EQ;
-		case PG_BATCH_FDW_NE:
-			return PG_BATCH_INT4_NE;
-		case PG_BATCH_FDW_LT:
-			return PG_BATCH_INT4_LT;
-		case PG_BATCH_FDW_LE:
-			return PG_BATCH_INT4_LE;
-		case PG_BATCH_FDW_GT:
-			return PG_BATCH_INT4_GT;
-		case PG_BATCH_FDW_GE:
-			return PG_BATCH_INT4_GE;
-	}
-	pg_unreachable();
-}
-
-static void
 apply_source_quals(ActiveBatch *active)
 {
 	PgBatchFdwScan *scan = active->scan;
 	int			initial = pg_popcount64(active->selection);
 
-	prepare_quals(scan);
+	ResetExprContext(scan->econtext);
 	for (int q = 0; q < scan->nquals && active->selection != 0; q++)
 	{
 		SourceQual *qual = &scan->quals[q];
-		ArrowArray *column;
-		PgBatchInt4Vector vector;
 
-		if (qual->scalar.isnull)
-		{
-			active->selection = 0;
-			break;
-		}
-		column = decode_column(scan, qual->attnum,
+		prepare_columns(&active->bridge_batch, qual->column_mask,
+						&active->selection, PG_BATCH_BRIDGE_MATERIALIZE_FILTER);
+		pg_batch_expr_bind(qual->expr, &active->bridge_batch, scan->econtext,
 						   PG_BATCH_BRIDGE_MATERIALIZE_FILTER);
-		pg_batch_int4_vector_init_packed(&vector, column->buffers[1],
-									 column->buffers[0],
-									 column->offset + active->start);
-		pg_batch_filter_int4(&vector, active->bridge_batch.nrows,
-							 active->bridge_batch.nwords, &active->selection,
-							 source_kernel_op(qual->op),
-							 DatumGetInt32(qual->scalar.value), true);
+		pg_batch_expr_apply_filter(qual->expr, true);
 	}
 	scan->stats.rows_removed += initial - pg_popcount64(active->selection);
+}
+
+static int
+resolve_source_var(const Var *var, void *context)
+{
+	const PgBatchBridgeRequest *request = context;
+
+	if (var->varno == INDEX_VAR && var->varattno <= request->ncolumns)
+		return var->varattno - 1;
+	for (int column = 0; column < request->ncolumns; column++)
+	{
+		if (request->source_attnums[column] == var->varattno)
+			return column;
+	}
+	return -1;
 }
 
 static void
@@ -508,10 +479,32 @@ static const PgBatchBridgeArrowInterface arrow_interface = {
 	.get_column = get_arrow_column,
 };
 
+static bool
+get_int4_column(PgBatchBridgeBatch *bridge_batch, int column,
+				PgBatchInt4Vector *result)
+{
+	PgBatchBridgeArrowView view;
+
+	get_arrow_column(bridge_batch, column, &view);
+	pg_batch_int4_vector_init_packed(result, view.array->buffers[1],
+		view.array->null_count == 0 ? NULL : view.array->buffers[0],
+		view.array->offset);
+	return true;
+}
+
+static const PgBatchInt4VectorInterface int4_interface = {
+	.abi_version = PG_BATCH_INT4_VECTOR_INTERFACE_VERSION,
+	.struct_size = sizeof(PgBatchInt4VectorInterface),
+	.get_column = get_int4_column,
+};
+
 static const void *
 get_native_interface(PgBatchBridgeBatch *batch, const char *name,
 					 uint32 version)
 {
+	if (version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
+		strcmp(name, PG_BATCH_INT4_VECTOR_INTERFACE_NAME) == 0)
+		return &int4_interface;
 	if (version == PG_BATCH_BRIDGE_ARROW_INTERFACE_VERSION &&
 		strcmp(name, PG_BATCH_BRIDGE_ARROW_INTERFACE_NAME) == 0)
 		return &arrow_interface;
@@ -638,14 +631,15 @@ pg_batch_fdw_scan_begin(Relation relation, PlanState *parent,
 	scan->record_decoded = palloc0_array(bool, natts);
 	scan->nquals = list_length(specs);
 	scan->quals = palloc0_array(SourceQual, scan->nquals);
-	foreach_ptr(List, spec, specs)
+	foreach_int(exprno, specs)
 	{
 		SourceQual *qual = &scan->quals[qualno++];
-		int			exprno = intVal(lthird(spec));
 
-		qual->attnum = intVal(linitial(spec));
-		qual->op = intVal(lsecond(spec));
-		qual->scalar_expr = ExecInitExpr(list_nth(source_exprs, exprno), parent);
+		qual->expr = pg_batch_expr_compile_filter(
+			list_nth(source_exprs, exprno), parent, resolve_source_var,
+			(void *) request);
+		qual->column = pg_batch_expr_input_column(qual->expr);
+		qual->column_mask = bms_make_singleton(qual->column);
 	}
 	scan->cleanup.func = scan_cleanup;
 	scan->cleanup.arg = scan;
@@ -716,7 +710,6 @@ pg_batch_fdw_scan_rescan(PgBatchFdwScan *scan)
 	if (scan->active != NULL)
 		elog(ERROR, "pg_batch_fdw cannot rescan with an active batch");
 	reader_reset(scan);
-	scan->quals_ready = false;
 	scan->scalar_row = -1;
 }
 

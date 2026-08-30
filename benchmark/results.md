@@ -1210,13 +1210,49 @@ The mixed-width heap cases also stayed within the threshold: the four batch
 medians changed by +0.3% to +2.4%. No tested filter, aggregate, in-memory
 join, mixed input, spill, or early-stop case regressed by 3%.
 
+## Reusable expression module
+
+The scan, compressed table AM, and Arrow FDW used to recognize and execute
+direct comparisons independently. The new `expr/` static library handles one
+restricted language for all three: one `int4` column, scalar constants or
+parameters, `+`, `-`, `*`, `/`, `%`, unary minus, and a final comparison.
+`PgBatchProject` uses the same library to feed computed values to the batch
+aggregate without producing rows or Datums.
+
+The focused regression check compared committed version `1963071` with the
+expression build over the same warm heap tables. Each sample contains 20
+executions, following five warm-ups. The table reports 31-sample medians:
+
+| Existing workload | `1963071`, ms | Expressions, ms | Change |
+|---|---:|---:|---:|
+| Full batches, no columns | 4.636 | 4.672 | +0.8% |
+| Dense filter pass-through | 9.235 | 9.354 | +1.3% |
+| Early filter, late projection | 3.686 | 3.779 | +2.5% |
+| Count and sum on one column | 12.884 | 12.858 | -0.2% |
+
+`run_expr.sql` then alternated the ordinary PostgreSQL and batch plans in one
+backend for 21 samples. The narrow table contains two million rows. The wide
+table contains 250,000 rows and 60 `int4` columns.
+
+| New expression workload | PostgreSQL, ms | Batch, ms | Change |
+|---|---:|---:|---:|
+| Count after `(c1 + 3) * 2 < 2000000` | 40.503 | 17.992 | -55.6% |
+| `sum(c4 + 1)` after `c1 < 1000000` | 39.379 | 18.782 | -52.3% |
+| Arithmetic filter and `sum(c4 + 1)` | 42.732 | 25.285 | -40.8% |
+| `sum(c60 + 1)` after `c2 + 1 < 1000` | 7.763 | 4.084 | -47.4% |
+
+The existing paths remain below the 3% regression threshold. The supported
+expression cases take 44% to 59% of the ordinary executor time, including the
+wide query where the projection column stays lazy until filtering finishes.
+
 ## Limits of the measurements
 
-- The prototype prepares all requested filter columns before evaluating the
-  dense conditions. It does not yet delay a late filter column until an earlier
-  selective condition has run.
-- Exact source filtering currently supports the six built-in `int4`
-  comparisons. Unsupported conditions remain in `PgBatchScan`.
+- The expression module supports one `int4` input column per expression.
+  Expressions involving several columns, other types, Boolean `OR` or `NOT`,
+  and arbitrary functions remain in PostgreSQL's scalar executor.
+- The heap path evaluates filters in planner order and prepares late filter
+  columns lazily when the tuple deformation cursor permits it. This is still a
+  narrow policy rather than a general expression cost model.
 - The table access method is a heap-compatible interface test. The compressed
   snapshot is backend-local, already in memory, and is not maintained after
   table changes.

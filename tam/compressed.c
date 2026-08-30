@@ -559,6 +559,8 @@ group_may_match(CompressedScan *scan,
 		int32		scalar;
 		bool		matches;
 
+		if (!qual->prunable)
+			continue;
 		if (qual->scalar.isnull)
 			return PG_BATCH_GROUP_SKIP_MINMAX;
 		column = &group->columns[qual->attnum - 1];
@@ -567,28 +569,28 @@ group_may_match(CompressedScan *scan,
 		scalar = DatumGetInt32(qual->scalar.value);
 		switch (qual->op)
 		{
-			case PG_BATCH_TAM_SOURCE_EQ:
+			case PG_BATCH_INT4_EQ:
 				matches = scalar >= column->minimum && scalar <= column->maximum;
 				break;
-			case PG_BATCH_TAM_SOURCE_NE:
+			case PG_BATCH_INT4_NE:
 				matches = column->minimum != scalar || column->maximum != scalar;
 				break;
-			case PG_BATCH_TAM_SOURCE_LT:
+			case PG_BATCH_INT4_LT:
 				matches = column->minimum < scalar;
 				break;
-			case PG_BATCH_TAM_SOURCE_LE:
+			case PG_BATCH_INT4_LE:
 				matches = column->minimum <= scalar;
 				break;
-			case PG_BATCH_TAM_SOURCE_GT:
+			case PG_BATCH_INT4_GT:
 				matches = column->maximum > scalar;
 				break;
-			case PG_BATCH_TAM_SOURCE_GE:
+			case PG_BATCH_INT4_GE:
 				matches = column->maximum >= scalar;
 				break;
 		}
 		if (!matches)
 			return PG_BATCH_GROUP_SKIP_MINMAX;
-		if (qual->op == PG_BATCH_TAM_SOURCE_EQ &&
+		if (qual->op == PG_BATCH_INT4_EQ &&
 			!column->distinct_overflow &&
 			!group_contains(column, scalar))
 			return PG_BATCH_GROUP_SKIP_MEMBERSHIP;
@@ -715,6 +717,25 @@ static const PgBatchBridgeArrowInterface pg_batch_compressed_arrow = {
 	.get_column = get_arrow_column,
 };
 
+static bool
+get_int4_column(PgBatchBridgeBatch *bridge_batch, int column,
+				PgBatchInt4Vector *result)
+{
+	PgBatchBridgeArrowView view;
+
+	get_arrow_column(bridge_batch, column, &view);
+	pg_batch_int4_vector_init_packed(result, view.array->buffers[1],
+		view.array->null_count == 0 ? NULL : view.array->buffers[0],
+		view.array->offset);
+	return true;
+}
+
+static const PgBatchInt4VectorInterface pg_batch_compressed_int4 = {
+	.abi_version = PG_BATCH_INT4_VECTOR_INTERFACE_VERSION,
+	.struct_size = sizeof(PgBatchInt4VectorInterface),
+	.get_column = get_int4_column,
+};
+
 static void
 get_datum_column(PgBatchBridgeBatch *bridge_batch,
 				 int column, const uint64 *rows,
@@ -768,6 +789,9 @@ static const void *
 get_native_interface(PgBatchBridgeBatch *batch,
 					 const char *name, uint32 version)
 {
+	if (version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
+		strcmp(name, PG_BATCH_INT4_VECTOR_INTERFACE_NAME) == 0)
+		return &pg_batch_compressed_int4;
 	if (version == PG_BATCH_BRIDGE_ARROW_INTERFACE_VERSION &&
 		strcmp(name, PG_BATCH_BRIDGE_ARROW_INTERFACE_NAME) == 0)
 		return &pg_batch_compressed_arrow;
@@ -812,27 +836,6 @@ load_batch(CompressedScan *scan,
 	scan->active = active;
 }
 
-static PgBatchInt4Op
-source_kernel_op(SourceOperator op)
-{
-	switch (op)
-	{
-		case PG_BATCH_TAM_SOURCE_EQ:
-			return PG_BATCH_INT4_EQ;
-		case PG_BATCH_TAM_SOURCE_NE:
-			return PG_BATCH_INT4_NE;
-		case PG_BATCH_TAM_SOURCE_LT:
-			return PG_BATCH_INT4_LT;
-		case PG_BATCH_TAM_SOURCE_LE:
-			return PG_BATCH_INT4_LE;
-		case PG_BATCH_TAM_SOURCE_GT:
-			return PG_BATCH_INT4_GT;
-		case PG_BATCH_TAM_SOURCE_GE:
-			return PG_BATCH_INT4_GE;
-	}
-	pg_unreachable();
-}
-
 static void
 filter_batch(CompressedScan *scan)
 {
@@ -841,38 +844,32 @@ filter_batch(CompressedScan *scan)
 
 	for (int q = 0; q < scan->nquals && active->selection != 0; q++)
 	{
-		const SourceQual *qual = &scan->quals[q];
-		CompressedColumn *stored =
-			&active->batch->columns[qual->attnum - 1];
-		const int32 *values;
-		PgBatchInt4Vector column;
+		SourceQual *qual = &scan->quals[q];
 
-		if (qual->scalar.isnull)
-		{
-			active->selection = 0;
-			break;
-		}
-		values = column_values(active, stored);
-		pg_batch_int4_vector_init_packed(&column, values,
-			stored->null_count == 0 ? NULL : stored->validity, 0);
-		pg_batch_filter_int4(&column, active->bridge_batch.nrows,
-							 active->bridge_batch.nwords, &active->selection,
-							 source_kernel_op(qual->op),
-							 DatumGetInt32(qual->scalar.value), true);
+		if (qual->expr == NULL)
+			continue;
+		prepare_columns(&active->bridge_batch, qual->column_mask,
+						&active->selection, PG_BATCH_BRIDGE_MATERIALIZE_FILTER);
+		pg_batch_expr_bind(qual->expr, &active->bridge_batch, scan->econtext,
+						   PG_BATCH_BRIDGE_MATERIALIZE_FILTER);
+		pg_batch_expr_apply_filter(qual->expr, true);
 	}
 	scan->stats.rows_removed_by_source_filter +=
 		pg_popcount64(initial) - pg_popcount64(active->selection);
 }
 
 static void
-prepare_source_quals(CompressedScan *scan)
+prepare_prune_quals(CompressedScan *scan)
 {
 	ResetExprContext(scan->econtext);
 	for (int q = 0; q < scan->nquals; q++)
-		scan->quals[q].scalar.value =
-			ExecEvalExpr(scan->quals[q].scalar_expr, scan->econtext,
-						 &scan->quals[q].scalar.isnull);
-	scan->quals_ready = true;
+	{
+		if (scan->quals[q].scalar_expr != NULL)
+			scan->quals[q].scalar.value =
+				ExecEvalExpr(scan->quals[q].scalar_expr, scan->econtext,
+							 &scan->quals[q].scalar.isnull);
+	}
+	scan->prune_quals_ready = true;
 }
 
 bool
@@ -881,8 +878,8 @@ pg_batch_compressed_scan_next(PgBatchBridgeBinding *binding,
 {
 	CompressedRelation *compressed = scan->relation;
 
-	if (!scan->quals_ready)
-		prepare_source_quals(scan);
+	if (!scan->prune_quals_ready)
+		prepare_prune_quals(scan);
 
 	/*
 	 * Storage groups decide whether any of their 64-row executor batches need
@@ -922,7 +919,10 @@ pg_batch_compressed_scan_next(PgBatchBridgeBinding *binding,
 			load_batch(scan, stored_batch);
 			scan->stats.encoded_bytes_touched += stored_batch->bytes;
 			if (scan->mode == PG_BATCH_TAM_FILTER)
+			{
+				ResetExprContext(scan->econtext);
 				filter_batch(scan);
+			}
 			if (scan->active->selection == 0)
 			{
 				release_batch(

@@ -10,99 +10,8 @@
 #include "optimizer/planmain.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/restrictinfo.h"
-#include "utils/fmgroids.h"
 
 #include "internal.h"
-
-/* The same matcher is used by the scalar ForeignScan and direct batch path. */
-static bool
-is_scalar_operand(Node *node)
-{
-	return IsA(node, Const) ||
-		(IsA(node, Param) &&
-		 (castNode(Param, node)->paramkind == PARAM_EXTERN ||
-		  castNode(Param, node)->paramkind == PARAM_EXEC));
-}
-
-static bool
-map_operator(Oid function_oid, uint8 var_argno, PgBatchFdwOperator *result)
-{
-	PgBatchFdwOperator op;
-
-	switch (function_oid)
-	{
-		case F_INT4EQ:
-			op = PG_BATCH_FDW_EQ;
-			break;
-		case F_INT4NE:
-			op = PG_BATCH_FDW_NE;
-			break;
-		case F_INT4LT:
-			op = PG_BATCH_FDW_LT;
-			break;
-		case F_INT4LE:
-			op = PG_BATCH_FDW_LE;
-			break;
-		case F_INT4GT:
-			op = PG_BATCH_FDW_GT;
-			break;
-		case F_INT4GE:
-			op = PG_BATCH_FDW_GE;
-			break;
-		default:
-			return false;
-	}
-	if (var_argno == 1)
-	{
-		if (op == PG_BATCH_FDW_LT)
-			op = PG_BATCH_FDW_GT;
-		else if (op == PG_BATCH_FDW_LE)
-			op = PG_BATCH_FDW_GE;
-		else if (op == PG_BATCH_FDW_GT)
-			op = PG_BATCH_FDW_LT;
-		else if (op == PG_BATCH_FDW_GE)
-			op = PG_BATCH_FDW_LE;
-	}
-	*result = op;
-	return true;
-}
-
-static bool
-match_qual(Node *clause, Index relid, AttrNumber *attnum,
-		   PgBatchFdwOperator *source_op, Node **scalar)
-{
-	OpExpr	   *op;
-	Node	   *args[2];
-	uint8		var_argno;
-	Var		   *var;
-
-	if (!IsA(clause, OpExpr))
-		return false;
-	op = castNode(OpExpr, clause);
-	if (list_length(op->args) != 2)
-		return false;
-	args[0] = linitial(op->args);
-	args[1] = lsecond(op->args);
-	if (IsA(args[0], RelabelType))
-		args[0] = (Node *) castNode(RelabelType, args[0])->arg;
-	if (IsA(args[1], RelabelType))
-		args[1] = (Node *) castNode(RelabelType, args[1])->arg;
-	if (IsA(args[0], Var) && is_scalar_operand(args[1]))
-		var_argno = 0;
-	else if (is_scalar_operand(args[0]) && IsA(args[1], Var))
-		var_argno = 1;
-	else
-		return false;
-	var = castNode(Var, args[var_argno]);
-	if (var->varno != relid || var->varlevelsup != 0 ||
-		var->varattno <= 0 || var->vartype != INT4OID ||
-		var->varreturningtype != VAR_RETURNING_DEFAULT ||
-		!map_operator(op->opfuncid, var_argno, source_op))
-		return false;
-	*attnum = var->varattno;
-	*scalar = args[1 - var_argno];
-	return true;
-}
 
 static void
 classify_quals(RelOptInfo *rel, List *clauses, List *restrictinfos,
@@ -120,19 +29,13 @@ classify_quals(RelOptInfo *rel, List *clauses, List *restrictinfos,
 	{
 		Node	   *clause = lfirst(clause_cell);
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, rinfo_cell);
-		AttrNumber	attnum;
-		PgBatchFdwOperator op;
-		Node	   *scalar;
-
 		if (pg_batch_fdw_pushdown &&
 			restriction_is_securely_promotable(rinfo, rel) &&
-			match_qual(clause, rel->relid, &attnum, &op, &scalar))
+			pg_batch_expr_supports_filter(clause, rel->relid))
 		{
 			support[qualno] = PG_BATCH_BRIDGE_QUAL_EXACT;
-			*source_exprs = lappend(*source_exprs, copyObject(scalar));
-			*specs = lappend(*specs,
-							 list_make3(makeInteger(attnum), makeInteger(op),
-										makeInteger(exprno++)));
+			*source_exprs = lappend(*source_exprs, copyObject(clause));
+			*specs = lappend_int(*specs, exprno++);
 		}
 		qualno++;
 	}

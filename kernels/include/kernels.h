@@ -21,6 +21,17 @@ typedef enum PgBatchInt4Op
 	PG_BATCH_INT4_GE
 } PgBatchInt4Op;
 
+/* Arithmetic supported by the int4 expression executor. */
+typedef enum PgBatchInt4ArithmeticOp
+{
+	PG_BATCH_INT4_ADD,
+	PG_BATCH_INT4_SUBTRACT,
+	PG_BATCH_INT4_MULTIPLY,
+	PG_BATCH_INT4_DIVIDE,
+	PG_BATCH_INT4_MODULO,
+	PG_BATCH_INT4_NEGATE
+} PgBatchInt4ArithmeticOp;
+
 /* Values that one int4 reduction pass should calculate. */
 typedef enum PgBatchInt4ReduceFlag
 {
@@ -49,6 +60,16 @@ extern void pg_batch_filter_int4(const PgBatchInt4Vector *column,
 								 int nrows, int nwords, uint64 *selection,
 								 PgBatchInt4Op op, int32 scalar,
 								 bool enable_simd);
+
+/*
+ * Apply one arithmetic operation to selected, non-NULL rows. Output values
+ * are packed int32 values indexed by row. output_validity is an Arrow-style
+ * bitmap: one means that the output value is present and non-NULL.
+ */
+extern void pg_batch_int4_arithmetic_scalar(
+	const PgBatchInt4Vector *input, int nrows, int nwords,
+	const uint64 *selection, PgBatchInt4ArithmeticOp op, int32 scalar,
+	bool scalar_on_left, int32 *output_values, uint8 *output_validity);
 
 /* Calculate the requested reductions without changing the row selection. */
 extern void pg_batch_reduce_int4(const PgBatchInt4Vector *column,

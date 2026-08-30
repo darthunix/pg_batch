@@ -6,9 +6,11 @@ CREATE EXTENSION pg_batch;
 \getenv dlsuffix PG_DLSUFFIX
 \set bridge_test :libdir '/pg_batch_bridge_test' :dlsuffix
 \set kernels_test :libdir '/pg_batch_kernels_test' :dlsuffix
+\set expr_test :libdir '/pg_batch_expr_test' :dlsuffix
 \set runtime_test :libdir '/pg_batch_runtime_test' :dlsuffix
 LOAD :'bridge_test';
 LOAD :'kernels_test';
+LOAD :'expr_test';
 LOAD :'runtime_test';
 LOAD 'pg_batch_tam';
 LOAD 'pg_batch';
@@ -25,6 +27,10 @@ CREATE FUNCTION pg_batch_kernels_test()
 RETURNS boolean
 AS :'kernels_test', 'pg_batch_kernels_test'
 LANGUAGE C;
+CREATE FUNCTION pg_batch_expr_api_test()
+RETURNS boolean
+AS :'expr_test', 'pg_batch_expr_api_test'
+LANGUAGE C;
 CREATE FUNCTION pg_batch_datum_buffer_test()
 RETURNS boolean
 AS :'runtime_test', 'pg_batch_datum_buffer_test'
@@ -37,6 +43,7 @@ LANGUAGE C;
 SELECT pg_batch_bridge_test_bad_abi();
 SELECT pg_batch_bridge_test_duplicate_provider();
 SELECT pg_batch_kernels_test() AS installed_kernels_ok;
+SELECT pg_batch_expr_api_test() AS installed_expr_api_ok;
 SELECT pg_batch_datum_buffer_test() AS installed_datum_buffer_ok;
 SELECT pg_batch_input_api_test() AS installed_input_api_ok;
 
@@ -177,6 +184,52 @@ SELECT NOT EXISTS (
            (TABLE pg_batch_reduction_plain
             EXCEPT ALL TABLE pg_batch_reduction_batch)
        ) AS reductions_match;
+
+SET pg_batch.enable = on;
+EXPLAIN (COSTS OFF)
+SELECT sum(c6 + 1), count(c6 + 1), min(c6 + 1), max(c6 + 1)
+FROM pg_batch_test
+WHERE (c2 + 3) * 2 > 20;
+
+CREATE TEMP TABLE pg_batch_expr_batch AS
+SELECT sum(c6 + 1) AS plus_value,
+       sum(100 - c6) AS left_value,
+       sum(c6 * 2) AS multiplied,
+       sum(c6 / 2) AS divided,
+       sum(c6 % 7) AS modulo,
+       sum(-c6) AS negated,
+       count(c2 + 1) AS nonnull
+FROM pg_batch_test
+WHERE (c2 + 3) * 2 > 20;
+
+PREPARE pg_batch_expr_parameter(integer, integer) AS
+SELECT sum(c6 + $1) FROM pg_batch_test WHERE c2 + $1 < $2;
+EXECUTE pg_batch_expr_parameter(3, 20);
+EXECUTE pg_batch_expr_parameter(NULL, 20);
+DEALLOCATE pg_batch_expr_parameter;
+
+SET pg_batch.enable = off;
+CREATE TEMP TABLE pg_batch_expr_plain AS
+SELECT sum(c6 + 1) AS plus_value,
+       sum(100 - c6) AS left_value,
+       sum(c6 * 2) AS multiplied,
+       sum(c6 / 2) AS divided,
+       sum(c6 % 7) AS modulo,
+       sum(-c6) AS negated,
+       count(c2 + 1) AS nonnull
+FROM pg_batch_test
+WHERE (c2 + 3) * 2 > 20;
+
+SELECT NOT EXISTS (
+           (TABLE pg_batch_expr_batch EXCEPT ALL TABLE pg_batch_expr_plain)
+           UNION ALL
+           (TABLE pg_batch_expr_plain EXCEPT ALL TABLE pg_batch_expr_batch)
+       ) AS expressions_match;
+
+SET pg_batch.enable = on;
+SELECT sum(c6 + 2147483647) FROM pg_batch_test;
+SELECT count(*) FROM pg_batch_test WHERE 10 / (c1 - 1) > 0;
+SELECT sum(-v) FROM pg_batch_kernel_values;
 
 SET pg_batch.enable = on;
 EXPLAIN (COSTS OFF)
@@ -589,6 +642,18 @@ SELECT count(*), sum(c3) FROM pg_batch_tam WHERE c2 = 2 AND c1 > 100;
 CREATE TEMP TABLE smart_tam AS
 SELECT c1, c3 FROM pg_batch_tam WHERE c2 = 2 AND c1 > 100;
 
+CREATE TEMP TABLE smart_tam_expr AS
+SELECT sum(c3 + 1) AS total, min(c3 + 1) AS minimum
+FROM pg_batch_tam
+WHERE c2 + 1 = 3;
+
+SET pg_batch.enable = off;
+CREATE TEMP TABLE smart_tam_expr_plain AS
+SELECT sum(c3 + 1) AS total, min(c3 + 1) AS minimum
+FROM pg_batch_tam
+WHERE c2 + 1 = 3;
+SET pg_batch.enable = on;
+
 PREPARE pg_batch_tam_parameter(integer, integer) AS
 SELECT count(*), sum(c3)
 FROM pg_batch_tam
@@ -615,7 +680,12 @@ SELECT NOT EXISTS (
            (TABLE smart_tam EXCEPT ALL TABLE smart_plain)
            UNION ALL
            (TABLE smart_plain EXCEPT ALL TABLE smart_tam)
-       ) AS tam_rows_match;
+       ) AS tam_rows_match,
+       NOT EXISTS (
+           (TABLE smart_tam_expr EXCEPT ALL TABLE smart_tam_expr_plain)
+           UNION ALL
+           (TABLE smart_tam_expr_plain EXCEPT ALL TABLE smart_tam_expr)
+       ) AS tam_expressions_match;
 
 SET pg_batch_tam.enable = off;
 EXPLAIN (COSTS OFF)

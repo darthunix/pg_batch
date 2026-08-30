@@ -19,6 +19,7 @@
 #include "arrow.h"
 #include "kernels.h"
 #include "runtime.h"
+#include "expr.h"
 
 typedef struct ArrowArray ArrowArray;
 typedef struct ArrowArrayView ArrowArrayView;
@@ -32,16 +33,6 @@ typedef struct ArrowSchema ArrowSchema;
 
 #define PG_BATCH_FDW_PROVIDER_NAME "pg_batch_arrow_fdw"
 #define PG_BATCH_FDW_BATCH_SIZE 64
-
-typedef enum PgBatchFdwOperator
-{
-	PG_BATCH_FDW_EQ,
-	PG_BATCH_FDW_NE,
-	PG_BATCH_FDW_LT,
-	PG_BATCH_FDW_LE,
-	PG_BATCH_FDW_GT,
-	PG_BATCH_FDW_GE
-} PgBatchFdwOperator;
 
 typedef struct PgBatchFdwStats
 {

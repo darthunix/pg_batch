@@ -14,6 +14,12 @@ typedef struct TestDatumSource
 	const Datum *values;
 	const bool *isnull;
 	const uint64 *available;
+	const int32 *packed_values;
+	const uint8 *packed_validity;
+	int64		packed_offset;
+	int			datum_calls;
+	int			native_calls;
+	bool		use_native;
 } TestDatumSource;
 
 static void
@@ -27,16 +33,50 @@ test_get_datum_column(PgBatchBridgeBatch *batch, int column,
 	Assert(column == 0);
 	Assert(rows != NULL);
 	Assert(phase == PG_BATCH_BRIDGE_MATERIALIZE_FILTER);
+	source->datum_calls++;
 	result->values = source->values;
 	result->isnull = source->isnull;
 	result->valid_rows = source->available;
 	result->nwords = 1;
 }
 
+static bool
+test_get_int4_column(PgBatchBridgeBatch *batch, int column,
+					 PgBatchInt4Vector *result)
+{
+	TestDatumSource *source = batch->private_data;
+
+	Assert(column == 0);
+	source->native_calls++;
+	pg_batch_int4_vector_init_packed(result, source->packed_values,
+		source->packed_validity, source->packed_offset);
+	return true;
+}
+
+static const PgBatchInt4VectorInterface test_int4_interface = {
+	.abi_version = PG_BATCH_INT4_VECTOR_INTERFACE_VERSION,
+	.struct_size = sizeof(PgBatchInt4VectorInterface),
+	.get_column = test_get_int4_column,
+};
+
+static const void *
+test_get_native_interface(PgBatchBridgeBatch *batch, const char *name,
+						  uint32 version)
+{
+	TestDatumSource *source = batch->private_data;
+
+	if (source->use_native &&
+		version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
+		strcmp(name, PG_BATCH_INT4_VECTOR_INTERFACE_NAME) == 0)
+		return &test_int4_interface;
+	return NULL;
+}
+
 static const PgBatchBridgeBatchOps test_batch_ops = {
 	.abi_version = PG_BATCH_BRIDGE_ABI_VERSION,
 	.struct_size = sizeof(PgBatchBridgeBatchOps),
 	.get_datum_column = test_get_datum_column,
+	.get_native_interface = test_get_native_interface,
 };
 
 Datum
@@ -53,6 +93,9 @@ pg_batch_kernels_test(PG_FUNCTION_ARGS)
 	PgBatchBridgeBatch batch;
 	PgBatchInt4Reduction datum_reduction;
 	PgBatchInt4Reduction packed_reduction;
+	int32		arithmetic_values[6];
+	uint8		arithmetic_validity[1];
+	PgBatchInt4Vector arithmetic;
 	uint64		datum_selection = UINT64CONST(0x3f);
 	uint64		packed_selection = UINT64CONST(0x3f);
 	uint64		datum_hash_rows;
@@ -64,12 +107,23 @@ pg_batch_kernels_test(PG_FUNCTION_ARGS)
 	uint32		flags = PG_BATCH_INT4_REDUCE_COUNT |
 		PG_BATCH_INT4_REDUCE_SUM | PG_BATCH_INT4_REDUCE_MIN |
 		PG_BATCH_INT4_REDUCE_MAX;
+	Datum		wide_values[70];
+	bool		wide_nulls[70] = {false};
+	uint64	wide_available[2] = {UINT64_MAX, UINT64CONST(0x3f)};
+	uint64	wide_selection[2] = {UINT64_MAX, UINT64CONST(0x3f)};
+	int32		wide_output[70];
+	uint8		wide_validity[9];
+	PgBatchInt4Vector wide;
 
 	for (int row = 0; row < 6; row++)
 		datum_values[row] = Int32GetDatum(row + 1);
+	MemSet(&source, 0, sizeof(source));
 	source.values = datum_values;
 	source.isnull = datum_nulls;
 	source.available = &available;
+	source.packed_values = packed_values;
+	source.packed_validity = packed_validity;
+	source.packed_offset = 1;
 	MemSet(&batch, 0, sizeof(batch));
 	batch.ops = &test_batch_ops;
 	batch.private_data = &source;
@@ -77,6 +131,15 @@ pg_batch_kernels_test(PG_FUNCTION_ARGS)
 						 PG_BATCH_BRIDGE_MATERIALIZE_FILTER, &datum);
 	pg_batch_int4_vector_init_packed(&packed, packed_values,
 								  packed_validity, 1);
+	if (source.datum_calls != 1 || source.native_calls != 0)
+		PG_RETURN_BOOL(false);
+	source.use_native = true;
+	pg_batch_get_int4_vector(&batch, 0, &datum_selection,
+		PG_BATCH_BRIDGE_MATERIALIZE_FILTER, &packed);
+	if (source.datum_calls != 1 || source.native_calls != 1 ||
+		packed.layout != PG_BATCH_INT4_PACKED ||
+		pg_batch_int4_row_value(&packed, 5) != 6)
+		PG_RETURN_BOOL(false);
 
 	pg_batch_reduce_int4(&datum, 6, 1, &datum_selection, flags,
 						 &datum_reduction);
@@ -102,6 +165,18 @@ pg_batch_kernels_test(PG_FUNCTION_ARGS)
 			PG_RETURN_BOOL(false);
 	}
 
+	for (int row = 0; row < 70; row++)
+		wide_values[row] = Int32GetDatum(row - 35);
+	wide_nulls[64] = true;
+	pg_batch_int4_vector_init_datum(&wide, wide_values, wide_nulls,
+		wide_available, 2);
+	pg_batch_int4_arithmetic_scalar(&wide, 70, 2, wide_selection,
+		PG_BATCH_INT4_SUBTRACT, 100, true, wide_output, wide_validity);
+	if ((wide_validity[8] & UINT8_C(0x3f)) != UINT8_C(0x3e) ||
+		wide_output[0] != 135 || wide_output[63] != 72 ||
+		wide_output[69] != 66)
+		PG_RETURN_BOOL(false);
+
 	pg_batch_filter_int4(&datum, 6, 1, &datum_selection,
 						 PG_BATCH_INT4_GT, 3, true);
 	pg_batch_filter_int4(&packed, 6, 1, &packed_selection,
@@ -109,6 +184,23 @@ pg_batch_kernels_test(PG_FUNCTION_ARGS)
 	if (datum_selection != UINT64CONST(0x38) ||
 		packed_selection != datum_selection)
 		PG_RETURN_BOOL(false);
+
+	datum_selection = UINT64CONST(0x3f);
+	pg_batch_int4_arithmetic_scalar(&datum, 6, 1, &datum_selection,
+								 PG_BATCH_INT4_MULTIPLY, 2, false,
+								 arithmetic_values, arithmetic_validity);
+	pg_batch_int4_vector_init_packed(&arithmetic, arithmetic_values,
+								 arithmetic_validity, 0);
+	if (arithmetic_validity[0] != UINT8_C(0x3b))
+		PG_RETURN_BOOL(false);
+	for (int row = 0; row < 6; row++)
+	{
+		if (row == 2)
+			continue;
+		if (pg_batch_int4_row_is_null(&arithmetic, row) ||
+			pg_batch_int4_row_value(&arithmetic, row) != (row + 1) * 2)
+			PG_RETURN_BOOL(false);
+	}
 
 	/* A Datum vector may leave rows unavailable when they are not selected. */
 	available = UINT64CONST(0x21);

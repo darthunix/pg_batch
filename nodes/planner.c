@@ -50,6 +50,9 @@ static Plan *plan_hash_join(PlannerInfo *root, RelOptInfo *rel,
 static Plan *plan_pack(PlannerInfo *root, RelOptInfo *rel,
 					   CustomPath *best_path, List *tlist,
 					   List *clauses, List *custom_plans);
+static Plan *plan_project(PlannerInfo *root, RelOptInfo *rel,
+						  CustomPath *best_path, List *tlist,
+						  List *clauses, List *custom_plans);
 
 static const CustomPathMethods pg_batch_base_path_methods = {
 	.CustomName = "PgBatchFilterProject",
@@ -69,6 +72,11 @@ static const CustomPathMethods pg_batch_hash_join_path_methods = {
 static const CustomPathMethods pg_batch_pack_path_methods = {
 	.CustomName = "PgBatchPack",
 	.PlanCustomPath = plan_pack,
+};
+
+static const CustomPathMethods pg_batch_project_path_methods = {
+	.CustomName = "PgBatchProject",
+	.PlanCustomPath = plan_project,
 };
 
 static const CustomScanMethods pg_batch_scan_plan_methods = {
@@ -96,6 +104,11 @@ static const CustomScanMethods pg_batch_pack_plan_methods = {
 	.CreateCustomScanState = pg_batch_create_pack_state,
 };
 
+static const CustomScanMethods pg_batch_project_plan_methods = {
+	.CustomName = "PgBatchProject",
+	.CreateCustomScanState = pg_batch_create_project_state,
+};
+
 static bool
 nodes_supports_batch_path(const Path *path)
 {
@@ -106,7 +119,8 @@ nodes_supports_batch_path(const Path *path)
 	custom = castNode(CustomPath, path);
 	return custom->methods == &pg_batch_base_path_methods ||
 		custom->methods == &pg_batch_hash_join_path_methods ||
-		custom->methods == &pg_batch_pack_path_methods;
+		custom->methods == &pg_batch_pack_path_methods ||
+		custom->methods == &pg_batch_project_path_methods;
 }
 
 static int
@@ -153,6 +167,7 @@ nodes_get_output_layout(const Plan *plan,
 		}
 	}
 	else if (scan->methods == &pg_batch_hash_join_plan_methods ||
+			 scan->methods == &pg_batch_project_plan_methods ||
 			 scan->methods == &pg_batch_pack_plan_methods)
 	{
 		while (column < list_length(plan->targetlist))
@@ -185,15 +200,6 @@ const PgBatchBridgeProducerOps pg_batch_producer_ops = {
 };
 
 static bool
-is_scalar_operand(Node *node)
-{
-	return IsA(node, Const) ||
-		(IsA(node, Param) &&
-		 (castNode(Param, node)->paramkind == PARAM_EXTERN ||
-		  castNode(Param, node)->paramkind == PARAM_EXEC));
-}
-
-static bool
 function_is_safe(Oid funcid)
 {
 	HeapTuple	tuple;
@@ -209,35 +215,6 @@ function_is_safe(Oid funcid)
 		proc->proleakproof;
 	ReleaseSysCache(tuple);
 	return result;
-}
-
-OpExpr *
-pg_batch_match_qual(Node *clause, uint8 *var_argno)
-{
-	OpExpr	   *op;
-	Node	   *args[2];
-	Var		   *var;
-
-	if (!IsA(clause, OpExpr))
-		return NULL;
-	op = castNode(OpExpr, clause);
-	if (list_length(op->args) != 2)
-		return NULL;
-	args[0] = pg_batch_strip_relabel(linitial(op->args));
-	args[1] = pg_batch_strip_relabel(lsecond(op->args));
-	if (IsA(args[0], Var) && is_scalar_operand(args[1]))
-		*var_argno = 0;
-	else if (is_scalar_operand(args[0]) && IsA(args[1], Var))
-		*var_argno = 1;
-	else
-		return NULL;
-	var = castNode(Var, args[*var_argno]);
-	if (var->varattno <= 0 || var->varlevelsup != 0 ||
-		var->varreturningtype != VAR_RETURNING_DEFAULT)
-		return NULL;
-	if (!function_is_safe(op->opfuncid))
-		return NULL;
-	return op;
 }
 
 static bool
@@ -431,22 +408,10 @@ base_path_is_useful(PlannerInfo *root, RelOptInfo *rel)
 		List	   *specs = query_aggregate_specs(root);
 
 		result = list_length(root->parse->rtable) == 1 && specs != NIL;
-		foreach_ptr(List, spec, specs)
-		{
-			Node	   *expr = lsecond(spec);
-
-			if (expr != NULL && !IsA(pg_batch_strip_relabel(expr), Var))
-			{
-				result = false;
-				break;
-			}
-		}
 	}
 	else
 	{
-		uint8		var_argno;
-
-		result = pg_batch_match_qual(linitial(quals), &var_argno) != NULL;
+		result = pg_batch_expr_supports_filter(linitial(quals), rel->relid);
 	}
 	list_free(quals);
 	return result;
@@ -481,10 +446,9 @@ bitmap_restrictions_are_batchable(RelOptInfo *rel)
 {
 	foreach_ptr(RestrictInfo, rinfo, rel->baserestrictinfo)
 	{
-		uint8		var_argno;
-
 		if (!rinfo->pseudoconstant &&
-			pg_batch_match_qual((Node *) rinfo->clause, &var_argno) == NULL)
+			!pg_batch_expr_supports_filter((Node *) rinfo->clause,
+										 rel->relid))
 			return false;
 	}
 	return true;
@@ -908,10 +872,7 @@ parse_aggregate(Aggref *agg, PgBatchAggKind *kind, Node **source_expr)
 		return false;
 	arg = linitial_node(TargetEntry, agg->args);
 	expr = pg_batch_strip_relabel((Node *) arg->expr);
-	if (!IsA(expr, Var) || castNode(Var, expr)->vartype != INT4OID ||
-		castNode(Var, expr)->varattno <= 0 ||
-		castNode(Var, expr)->varlevelsup != 0 ||
-		castNode(Var, expr)->varreturningtype != VAR_RETURNING_DEFAULT)
+	if (!pg_batch_expr_supports_int4(expr, 0))
 		return false;
 	*source_expr = expr;
 
@@ -992,6 +953,7 @@ create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	CustomPath *path;
 	List	   *agg_specs;
 	const char *producer_name;
+	bool		needs_project = false;
 
 	if (previous_create_upper_paths_hook != NULL)
 		previous_create_upper_paths_hook(root, stage, input_rel, output_rel,
@@ -1004,6 +966,57 @@ create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	child = find_batch_path(input_rel, &producer_name);
 	if (child == NULL)
 		return;
+	foreach_ptr(List, spec, agg_specs)
+	{
+		Node	   *expr = lsecond(spec);
+
+		if (expr != NULL && !IsA(pg_batch_strip_relabel(expr), Var))
+		{
+			needs_project = true;
+			break;
+		}
+	}
+	if (needs_project)
+	{
+		CustomPath *project = makeNode(CustomPath);
+		PathTarget *target = create_empty_pathtarget();
+
+		foreach_ptr(List, spec, agg_specs)
+		{
+			Node	   *expr = lsecond(spec);
+			bool		found = false;
+
+			if (expr == NULL)
+				continue;
+			foreach_ptr(Node, existing, target->exprs)
+			{
+				if (equal(pg_batch_strip_relabel(existing),
+						  pg_batch_strip_relabel(expr)))
+				{
+					found = true;
+					break;
+				}
+			}
+			if (!found)
+				add_column_to_pathtarget(target, (Expr *) copyObject(expr), 0);
+		}
+		set_pathtarget_cost_width(root, target);
+		project->path.pathtype = T_CustomScan;
+		project->path.parent = input_rel;
+		project->path.pathtarget = target;
+		project->path.rows = child->rows;
+		project->path.startup_cost = child->startup_cost;
+		project->path.total_cost = child->total_cost + target->cost.startup +
+			target->cost.per_tuple * child->rows;
+		project->path.disabled_nodes = child->disabled_nodes;
+		project->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+		project->custom_paths = list_make1(child);
+		project->custom_private =
+			list_make1(makeString(pstrdup(producer_name)));
+		project->methods = &pg_batch_project_path_methods;
+		child = &project->path;
+		producer_name = PG_BATCH_PRODUCER_NAME;
+	}
 
 	path = makeNode(CustomPath);
 	path->path.pathtype = T_CustomScan;
@@ -1021,21 +1034,24 @@ create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 }
 
 static SourceLayout
-build_source_layout(PlannerInfo *root, RelOptInfo *rel, List *quals,
-					List *exact_quals, List *targetlist)
+build_source_layout(PlannerInfo *root, RelOptInfo *rel, List *local_quals,
+					List *source_exprs, List *exact_quals, List *targetlist)
 {
 	SourceLayout layout = {0};
 	RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
 	Relation	relation = table_open(rte->relid, NoLock);
 	TupleDesc	desc = RelationGetDescr(relation);
 	bool	   *filter_attrs = palloc0_array(bool, desc->natts + 1);
+	bool	   *source_attrs = palloc0_array(bool, desc->natts + 1);
 	bool	   *exact_filter_attrs = palloc0_array(bool, desc->natts + 1);
 	bool	   *survivor_attrs = palloc0_array(bool, desc->natts + 1);
 	int		   *positions = palloc0_array(int, desc->natts + 1);
 	int			resno = 1;
 
-	if (!collect_relation_attrs((Node *) quals, rel->relid,
+	if (!collect_relation_attrs((Node *) local_quals, rel->relid,
 								desc->natts, filter_attrs) ||
+		!collect_relation_attrs((Node *) source_exprs, rel->relid,
+								desc->natts, source_attrs) ||
 		!collect_relation_attrs((Node *) exact_quals, rel->relid,
 								desc->natts, exact_filter_attrs) ||
 		!collect_relation_attrs((Node *) targetlist, rel->relid,
@@ -1085,6 +1101,25 @@ build_source_layout(PlannerInfo *root, RelOptInfo *rel, List *quals,
 			positions[attnum] = resno++;
 		}
 	}
+	/*
+	 * An exact source filter may need a column that no executor expression
+	 * uses. Keep such private inputs after visible columns so getsomeattrs()
+	 * cannot materialize them as part of a local filter or projection prefix.
+	 */
+	for (int attnum = 1; attnum <= desc->natts; attnum++)
+	{
+		if (source_attrs[attnum] && positions[attnum] == 0)
+		{
+			Form_pg_attribute attr = TupleDescAttr(desc, attnum - 1);
+			Var		   *var = makeVar(rel->relid, attnum, attr->atttypid,
+									  attr->atttypmod, attr->attcollation, 0);
+
+			layout.targetlist = lappend(layout.targetlist,
+									makeTargetEntry((Expr *) var, resno, NULL, false));
+			layout.source_attnums = lappend_int(layout.source_attnums, attnum);
+			positions[attnum] = resno++;
+		}
+	}
 	for (int attnum = 1; attnum <= desc->natts; attnum++)
 	{
 		if (survivor_attrs[attnum])
@@ -1093,6 +1128,7 @@ build_source_layout(PlannerInfo *root, RelOptInfo *rel, List *quals,
 	}
 
 	pfree(filter_attrs);
+	pfree(source_attrs);
 	pfree(exact_filter_attrs);
 	pfree(survivor_attrs);
 	pfree(positions);
@@ -1192,7 +1228,6 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	}
 	foreach_ptr(Node, qual, quals)
 	{
-		uint8		var_argno;
 		bool		recheck_only = false;
 
 		if (source_result.qual_support != NULL &&
@@ -1205,7 +1240,8 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		if (heap_scan_mode == PG_BATCH_HEAP_BITMAP &&
 			list_member(bitmapqualorig, qual))
 			recheck_only = true;
-		if (dense_prefix && pg_batch_match_qual(qual, &var_argno) != NULL)
+		if (dense_prefix &&
+			pg_batch_expr_supports_filter(qual, rel->relid))
 		{
 			batch_quals = lappend(batch_quals, qual);
 			batch_recheck_flags =
@@ -1222,7 +1258,9 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		}
 		qualno++;
 	}
-	layout = build_source_layout(root, rel, local_quals, exact_quals, tlist);
+	/* Exact source filters also need their input columns in the compact batch. */
+	layout = build_source_layout(root, rel, local_quals, source_exprs,
+								 exact_quals, tlist);
 
 	scan = make_custom_scan(&pg_batch_scan_plan_methods);
 	scan->scan.scanrelid = rel->relid;
@@ -1283,6 +1321,49 @@ plan_pack(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	pack->custom_scan_tlist = copyObject(child->targetlist);
 	pack->custom_relids = bms_copy(rel->relids);
 	return &pack->scan.plan;
+}
+
+static Plan *
+plan_project(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
+			 List *tlist, List *clauses, List *custom_plans)
+{
+	CustomScan *project;
+	Plan	   *child;
+	const char *producer_name = strVal(linitial(best_path->custom_private));
+	const PgBatchBridgeProducerOps *producer;
+	PgBatchBridgeOutputLayout layout;
+	List	   *input_columns = NIL;
+	List	   *expressions = NIL;
+
+	Assert(list_length(custom_plans) == 1);
+	Assert(clauses == NIL);
+	child = linitial(custom_plans);
+	producer = pg_batch_bridge->get_producer(producer_name);
+	if (producer == NULL)
+		elog(ERROR, "pg_batch producer \"%s\" is not registered",
+			 producer_name);
+	MemSet(&layout, 0, sizeof(layout));
+	producer->get_output_layout(child, &layout);
+	if (layout.ncolumns != list_length(child->targetlist) ||
+		(layout.ncolumns > 0 && layout.batch_columns == NULL))
+		elog(ERROR, "pg_batch producer \"%s\" returned an invalid output layout",
+			 producer_name);
+	for (int position = 0; position < layout.ncolumns; position++)
+		input_columns = lappend_int(input_columns,
+									layout.batch_columns[position]);
+	foreach_ptr(TargetEntry, tle, tlist)
+		expressions = lappend(expressions, copyObject(tle->expr));
+
+	project = make_custom_scan(&pg_batch_project_plan_methods);
+	project->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+	project->scan.plan.targetlist = tlist;
+	project->custom_plans = custom_plans;
+	project->custom_exprs = expressions;
+	project->custom_private =
+		list_make2(makeString(pstrdup(producer_name)), input_columns);
+	project->custom_scan_tlist = copyObject(child->targetlist);
+	project->custom_relids = bms_copy(rel->relids);
+	return &project->scan.plan;
 }
 
 static int
@@ -1490,6 +1571,7 @@ pg_batch_planner_init(void)
 	RegisterCustomScanMethods(&pg_batch_scan_plan_methods);
 	RegisterCustomScanMethods(&pg_batch_filter_plan_methods);
 	RegisterCustomScanMethods(&pg_batch_pack_plan_methods);
+	RegisterCustomScanMethods(&pg_batch_project_plan_methods);
 	RegisterCustomScanMethods(&pg_batch_hash_join_plan_methods);
 	RegisterCustomScanMethods(&pg_batch_agg_plan_methods);
 	previous_set_rel_pathlist_hook = set_rel_pathlist_hook;

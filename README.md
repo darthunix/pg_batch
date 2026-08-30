@@ -5,7 +5,7 @@ whether independent extensions can exchange batches through ordinary tuple
 slots, keep source-native columns between plan nodes, and postpone conversion
 to PostgreSQL `Datum` values.
 
-The repository is split into four extensions and two reusable C libraries:
+The repository is split into four extensions and three reusable C libraries:
 
 ```text
 nodes/  ----->  bridge/  <-----  tam/
@@ -30,13 +30,15 @@ nodes/  ----->  bridge/  <-----  tam/
 - `runtime/` provides common batch traversal, lazy Datum/native adapters,
   borrowed vector views, an owned Datum buffer for collecting scalar slots,
   and an opaque input object for consuming any registered batch producer.
-  `kernels/` provides type-specific operations over those views. Both are
+  `kernels/` provides type-specific operations over those views. `expr/`
+  compiles a deliberately small class of PostgreSQL expressions into reusable
+  vector operations and provides lazy projected batches. All three are
   statically linked into consumers, so they add no loaded module or
   cross-extension function-call ABI.
 
-`nodes`, `tam`, and `fdw` all consume the same runtime and kernel libraries.
-The bridge remains their only shared runtime service; the static libraries
-only remove duplicated C implementation from the extensions.
+`nodes`, `tam`, and `fdw` consume the same runtime, kernel, and expression
+libraries. The bridge remains their only shared runtime service; the static
+libraries only remove duplicated C implementation from the extensions.
 
 The `.control` and extension SQL files retain their full extension names
 because PostgreSQL looks them up by those names. Public bridge headers are
@@ -63,8 +65,10 @@ such a callback, including an FDW, may instead return a batch from the optional
 provider `next_batch` operation; `PgBatchScan` publishes it on the same slot.
 Every batch must provide lazy `Datum` materialization, which is the
 format-neutral fallback for ordinary PostgreSQL consumers. A batch may also
-publish optional named native interfaces. The test columnar sources publish
-Arrow C Data views; filters and aggregates consume those buffers directly.
+publish optional named native interfaces. The test columnar sources and
+computed projections publish a common `int4` vector view in addition to Arrow
+C Data where applicable. Filters and aggregates therefore consume packed
+values directly without depending on one source format.
 
 The attachment lookup is only for boundaries that receive an ordinary
 `TupleTableSlot *`, such as a table access method callback. It returns an
@@ -102,11 +106,19 @@ this conservative guard. BRIN-only bitmaps use the table's average rows per
 page because BRIN publishes complete lossy pages.
 
 `PgBatchFilterProject` checks residual expressions, updates the selection
-bitmap, and requests projection columns only for survivors. `PgBatchAgg`
-consumes full batches for `count(*)`, `count(column)`, `sum(int4)`,
-`min(int4)`, and `max(int4)` without turning them into a row stream. Its
-planner asks the registered producer for the output-column layout, so it is
-not tied to a private node or slot type.
+bitmap, and requests projection columns only for survivors. Supported filters
+contain one `int4` column, constants or execution parameters, `+`, `-`, `*`,
+`/`, `%`, unary minus, and one comparison. Conditions are still applied in
+planner order. Unsupported conditions remain in PostgreSQL's scalar executor.
+
+`PgBatchProject` computes the same restricted `int4` expressions only when a
+batch-aware parent asks for them. Direct columns keep their source-native
+representation, duplicate expressions are computed once, and conversion to
+Datum stays lazy. `PgBatchAgg` consumes full batches for `count(*)`,
+`count(expression)`, `sum(expression)`, `min(expression)`, and
+`max(expression)` without turning them into a row stream. Its planner asks the
+registered producer for the output-column layout, so it is not tied to a
+private node or slot type.
 
 `PgBatchHashJoin` is a deliberately narrow `int4` experiment. It supports a
 serial, unparameterized inner join with one or more direct `int4 = int4` hash
@@ -156,7 +168,9 @@ exact small value set until it overflows. `pg_batch_tam.scan_mode` selects:
 - `batch`: return native batches without source filtering;
 - `prune`: use group metadata, then keep all restrictions in executor nodes;
 - `filter`: prune groups and apply supported `int4` comparisons exactly in the
-  source.
+  source. Arithmetic filters supported by the common expression library can
+  run exactly in `filter` mode; group pruning remains limited to direct column
+  comparisons.
 
 The snapshot is not durable and is not kept in sync with the heap storage. It
 exists only to test the contract between a source and unrelated batch nodes.
@@ -165,8 +179,8 @@ exists only to test the contract between a source and unrelated batch nodes.
 
 `pg_batch_fdw` checks the same bridge contract without a table access method.
 It reads an Arrow IPC Stream through the vendored nanoarrow 0.9.0 library. Its
-planner recognizes secure built-in `int4` comparisons against constants and
-parameters. Supported restrictions run over native Arrow values before a
+planner recognizes securely promotable expressions from the restricted
+`int4` language. Supported restrictions run over native Arrow values before a
 batch is returned; other expressions stay in `PgBatchFilterProject`.
 
 The reader first decodes columns needed by filters. Projection-only columns
@@ -217,6 +231,14 @@ pkg-config --cflags --libs --static pg_batch-kernels
 `pg_batch-kernels` includes the public dependency on `pg_batch-runtime`.
 Consumers do not need paths into this source tree.
 
+Extensions that also need the expression compiler can use:
+
+```sh
+pkg-config --cflags --libs --static pg_batch-expr
+```
+
+`pg_batch-expr` includes the kernel and runtime dependencies.
+
 Create and load them in dependency order:
 
 ```sql
@@ -251,13 +273,14 @@ PGPORT=5432 make \
 ```
 
 The suite also builds separate C modules through the installed `pkg-config`
-metadata, without private node headers. They check the reusable kernels, the
-public batch-input symbols, and a 70-row owned Datum buffer containing
-by-value, copied by-reference, and NULL values. The SQL tests cover heap,
-bitmap-index, table-AM, and FDW batches;
+metadata, without private node headers. They check the reusable expression
+analyzer, kernels, public batch-input symbols, and a 70-row owned Datum buffer
+containing by-value, copied by-reference, and NULL values. The SQL tests cover
+heap, bitmap-index, table-AM, and FDW batches;
 native Arrow consumption; lazy `Datum` fallback; exact and pruning-only
-predicates; parameters; joins; rescans; early stop; disabled-source fallback;
-ABI rejection; and duplicate provider rejection.
+predicates; arithmetic filters and projections; parameters; NULL and error
+semantics; joins; rescans; early stop; disabled-source fallback; ABI rejection;
+and duplicate provider rejection.
 
 ## Source layout
 
@@ -269,12 +292,14 @@ ABI rejection; and duplicate provider rejection.
   reusable scalar-to-Datum batch buffer used by `PgBatchPack`. Its opaque
   `PgBatchInput` also implements the common child-producer lifecycle.
 - `kernels/` builds `libpg_batch_kernels.a` and provides direct `int4`
-  comparisons, reductions, and hashing, with optional SIMD for dense
-  comparisons.
+  comparisons, scalar arithmetic, reductions, and hashing, with optional SIMD
+  for dense comparisons.
+- `expr/` builds `libpg_batch_expr.a`, analyzes and executes restricted `int4`
+  expressions, and exposes a reusable lazy projection batch.
 - `nodes/planner.c` builds sequential and bitmap-backed custom plans.
 - `nodes/slot.c` implements the custom slot and heap batch source.
-- `nodes/scan.c`, `filter.c`, `hash_join.c`, and `aggregate.c` implement the
-  executor nodes.
+- `nodes/scan.c`, `filter.c`, `project.c`, `hash_join.c`, and `aggregate.c`
+  implement the executor nodes.
 - `tam/provider.c` classifies source predicates and manages scans.
 - `tam/compressed.c` owns snapshots, native columns, group pruning, and source
   filtering.
@@ -298,6 +323,7 @@ psql -f benchmark/run_reductions.sql
 psql -f benchmark/run_hash_kernel.sql
 psql -f benchmark/run_pack.sql
 psql -f benchmark/run_input.sql
+psql -f benchmark/run_expr.sql
 psql -f benchmark/run_mixed.sql
 psql -f benchmark/run_groups.sql
 psql -f benchmark/run_brin.sql
@@ -325,6 +351,8 @@ two `Datum` columns from a large scalar `generate_series` input.
 `run_input.sql` isolates the shared producer-input lifecycle with empty and
 dense filters, a late projection, and fused aggregates. It accepts the same
 `batch_library`, `variant`, and `repetitions` variables.
+`run_expr.sql` alternates ordinary and batch execution for arithmetic filters,
+computed aggregate inputs, and a late column in a wide heap tuple.
 
 ```sh
 psql -v variant=before -v batch_library=/path/to/before/pg_batch \

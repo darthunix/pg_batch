@@ -9,6 +9,7 @@
 #include "arrow.h"
 #include "kernels.h"
 #include "runtime.h"
+#include "expr.h"
 
 #define PG_BATCH_TAM_PROVIDER_NAME "pg_batch_compressed_tam"
 #define PG_BATCH_SIZE 64
@@ -21,20 +22,14 @@ typedef enum SourceScanMode
 	PG_BATCH_TAM_FILTER
 } SourceScanMode;
 
-typedef enum SourceOperator
-{
-	PG_BATCH_TAM_SOURCE_EQ,
-	PG_BATCH_TAM_SOURCE_NE,
-	PG_BATCH_TAM_SOURCE_LT,
-	PG_BATCH_TAM_SOURCE_LE,
-	PG_BATCH_TAM_SOURCE_GT,
-	PG_BATCH_TAM_SOURCE_GE
-} SourceOperator;
-
 typedef struct SourceQual
 {
+	PgBatchExpr *expr;
+	Bitmapset  *column_mask;
+	int			column;
+	bool		prunable;
 	AttrNumber	attnum;
-	SourceOperator op;
+	PgBatchInt4Op op;
 	ExprState  *scalar_expr;
 	NullableDatum scalar;
 } SourceQual;
@@ -70,7 +65,7 @@ typedef struct CompressedScan
 	int			group_index;
 	int			batch_index;
 	bool		group_ready;
-	bool		quals_ready;
+	bool		prune_quals_ready;
 	bool		relation_acquired;
 	ActiveBatch *active;
 	CompressedStats stats;

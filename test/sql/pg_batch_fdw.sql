@@ -62,6 +62,17 @@ SELECT count(*) AS n, count(c2) AS nn, sum(c8) AS total,
        min(c8) AS projected_minimum, max(c8) AS projected_maximum
 FROM pg_batch_fdw_foreign
 WHERE c2 < 100;
+CREATE TEMP TABLE pg_batch_fdw_batch_expr AS
+SELECT sum(c8 + 1) AS total, min(c8 + 1) AS minimum
+FROM pg_batch_fdw_foreign
+WHERE c2 + 1 < 50;
+
+SET pg_batch.enable = off;
+CREATE TEMP TABLE pg_batch_fdw_plain_expr AS
+SELECT sum(c8 + 1) AS total, min(c8 + 1) AS minimum
+FROM pg_batch_fdw_foreign
+WHERE c2 + 1 < 50;
+SET pg_batch.enable = on;
 
 SELECT NOT EXISTS (
            (TABLE pg_batch_fdw_batch_rows
@@ -76,7 +87,14 @@ SELECT NOT EXISTS (
            UNION ALL
            (TABLE pg_batch_fdw_plain_agg
             EXCEPT ALL TABLE pg_batch_fdw_batch_agg)
-       ) AS aggregates_match;
+       ) AS aggregates_match,
+       NOT EXISTS (
+           (TABLE pg_batch_fdw_batch_expr
+            EXCEPT ALL TABLE pg_batch_fdw_plain_expr)
+           UNION ALL
+           (TABLE pg_batch_fdw_plain_expr
+            EXCEPT ALL TABLE pg_batch_fdw_batch_expr)
+       ) AS expressions_match;
 
 -- Exercise every comparison recognized by the source, including a Var on
 -- the right side of the operator.
@@ -136,7 +154,7 @@ SET pg_batch.enable = on;
 RESET pg_batch.enable_simd;
 RESET pg_batch_fdw.pushdown;
 
--- c2 is decoded for both record batches.  Projection columns are decoded
+-- c2 is decoded for both record batches. Projection columns are decoded
 -- only in the first record batch, which contains the surviving rows.
 EXPLAIN (ANALYZE, BUFFERS OFF, COSTS OFF, TIMING OFF, SUMMARY OFF)
 SELECT c8

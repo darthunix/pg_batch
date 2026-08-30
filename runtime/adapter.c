@@ -46,7 +46,21 @@ pg_batch_get_int4_vector(PgBatchBridgeBatch *batch, int column,
 						 PgBatchBridgeMaterializePhase phase,
 						 PgBatchInt4Vector *result)
 {
+	const PgBatchInt4VectorInterface *native = NULL;
 	PgBatchBridgeArrowView arrow;
+
+	if (unlikely(batch->ops->get_native_interface != NULL))
+		native = batch->ops->get_native_interface(
+			batch, PG_BATCH_INT4_VECTOR_INTERFACE_NAME,
+			PG_BATCH_INT4_VECTOR_INTERFACE_VERSION);
+	if (native != NULL)
+	{
+		if (native->abi_version != PG_BATCH_INT4_VECTOR_INTERFACE_VERSION ||
+			native->struct_size < sizeof(PgBatchInt4VectorInterface))
+			elog(ERROR, "pg_batch source returned an incompatible int4 vector interface");
+		if (native->get_column(batch, column, result))
+			return;
+	}
 
 	if (unlikely(batch->ops->get_native_interface != NULL) &&
 		pg_batch_get_arrow_column(batch, column, &arrow))

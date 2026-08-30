@@ -31,9 +31,11 @@ postgres_dep = declare_dependency(compile_args: pg_compile_args)
 bridge_inc = include_directories('bridge/include')
 runtime_inc = include_directories('runtime/include')
 kernels_inc = include_directories('kernels/include')
+expr_inc = include_directories('expr/include')
 
 subdir('runtime')
 subdir('kernels')
+subdir('expr')
 
 pc_data = configuration_data()
 pc_data.set('PG_BATCH_VERSION', meson.project_version())
@@ -50,6 +52,13 @@ configure_file(
 configure_file(
   input: 'pkgconfig/pg_batch-kernels.pc.in',
   output: 'pg_batch-kernels.pc',
+  configuration: pc_data,
+  install: true,
+  install_dir: pg_pkglibdir / 'pkgconfig',
+)
+configure_file(
+  input: 'pkgconfig/pg_batch-expr.pc.in',
+  output: 'pg_batch-expr.pc',
   configuration: pc_data,
   install: true,
   install_dir: pg_pkglibdir / 'pkgconfig',

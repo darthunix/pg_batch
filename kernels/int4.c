@@ -1,6 +1,8 @@
 #include "postgres.h"
 
+#include "common/int.h"
 #include "port/pg_bitutils.h"
+#include "utils/errcodes.h"
 #include "utils/fmgroids.h"
 
 #include "internal.h"
@@ -175,6 +177,95 @@ pg_batch_filter_int4(const PgBatchInt4Vector *column, int nrows, int nwords,
 		else
 			selection[word] = scalar_compare(column, first_row, rows,
 										 op, scalar);
+	}
+}
+
+static inline int32
+int4_arithmetic(int32 left, int32 right, PgBatchInt4ArithmeticOp op)
+{
+	int32		result;
+
+	switch (op)
+	{
+		case PG_BATCH_INT4_ADD:
+			if (unlikely(pg_add_s32_overflow(left, right, &result)))
+				goto overflow;
+			return result;
+		case PG_BATCH_INT4_SUBTRACT:
+			if (unlikely(pg_sub_s32_overflow(left, right, &result)))
+				goto overflow;
+			return result;
+		case PG_BATCH_INT4_MULTIPLY:
+			if (unlikely(pg_mul_s32_overflow(left, right, &result)))
+				goto overflow;
+			return result;
+		case PG_BATCH_INT4_DIVIDE:
+			if (unlikely(right == 0))
+				ereport(ERROR,
+						(errcode(ERRCODE_DIVISION_BY_ZERO),
+						 errmsg("division by zero")));
+			if (unlikely(right == -1 && left == PG_INT32_MIN))
+				goto overflow;
+			return left / right;
+		case PG_BATCH_INT4_MODULO:
+			if (unlikely(right == 0))
+				ereport(ERROR,
+						(errcode(ERRCODE_DIVISION_BY_ZERO),
+						 errmsg("division by zero")));
+			return right == -1 ? 0 : left % right;
+		case PG_BATCH_INT4_NEGATE:
+			if (unlikely(left == PG_INT32_MIN))
+				goto overflow;
+			return -left;
+	}
+	pg_unreachable();
+
+overflow:
+	ereport(ERROR,
+			(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+			 errmsg("integer out of range")));
+	pg_unreachable();
+}
+
+void
+pg_batch_int4_arithmetic_scalar(const PgBatchInt4Vector *input,
+								int nrows, int nwords,
+								const uint64 *selection,
+								PgBatchInt4ArithmeticOp op, int32 scalar,
+								bool scalar_on_left,
+								int32 *output_values,
+								uint8 *output_validity)
+{
+	Assert(nrows > 0);
+	Assert(nwords == (nrows + 63) / 64);
+	MemSet(output_validity, 0, (nrows + 7) / 8);
+
+	for (int word = 0; word < nwords; word++)
+	{
+		uint64		rows = selection[word] & word_mask(nrows, word);
+
+		if (input->layout == PG_BATCH_INT4_DATUM && rows != 0 &&
+			(word >= input->data.datum.nwords ||
+			 (input->data.datum.available[word] & rows) != rows))
+			elog(ERROR, "pg_batch int4 kernel received unavailable Datum rows");
+
+		while (rows != 0)
+		{
+			int			bitno = pg_rightmost_one_pos64(rows);
+			int			row = word * 64 + bitno;
+			int32		value;
+			int32		left;
+			int32		right;
+
+			rows &= rows - 1;
+			if (pg_batch_int4_row_is_null(input, row))
+				continue;
+			value = pg_batch_int4_row_value(input, row);
+			left = scalar_on_left ? scalar : value;
+			right = scalar_on_left ? value : scalar;
+			output_values[row] = int4_arithmetic(left, right, op);
+			output_validity[row / 8] |= (uint8) 1 << (row % 8);
+		}
 	}
 }
 

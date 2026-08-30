@@ -6,12 +6,10 @@
 #include "commands/explain_format.h"
 #include "executor/executor.h"
 #include "executor/nodeCustom.h"
-#include "fmgr.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/tidbitmap.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
-#include "utils/fmgroids.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -19,15 +17,12 @@
 
 typedef struct BatchQualState
 {
-	FmgrInfo	func;
-	FunctionCallInfo fcinfo;
-	ExprState  *other_expr;
-	NullableDatum constant;
+	PgBatchExpr *expr;
 	int			column;
-	uint8		var_argno;
+	Bitmapset  *provider_column;
+	Bitmapset  *heap_columns;
+	Bitmapset  *exact_heap_columns;
 	bool		recheck_only;
-	bool		has_int4_kernel;
-	PgBatchInt4Op int4_op;
 } BatchQualState;
 
 typedef struct BatchScanState
@@ -37,7 +32,6 @@ typedef struct BatchScanState
 	TupleTableSlot *heap_slot;
 	PlanState  *bitmap_plan;
 	TIDBitmap  *tbm;
-	MemoryContext operator_context;
 	Bitmapset  *exact_filter_columns;
 	BatchQualState *quals;
 	int			nquals;
@@ -60,32 +54,11 @@ typedef struct BatchScanState
 
 static const CustomExecMethods pg_batch_scan_exec_methods;
 
-static void
-init_qual(BatchQualState *qual, OpExpr *op, uint8 var_argno,
-		  bool recheck_only, PlanState *parent)
+static int
+resolve_scan_var(const Var *var, void *context)
 {
-	Node	   *varnode = pg_batch_strip_relabel(list_nth(op->args, var_argno));
-	Node	   *other = pg_batch_strip_relabel(list_nth(op->args, 1 - var_argno));
-	Var		   *var = castNode(Var, varnode);
-
-	fmgr_info(op->opfuncid, &qual->func);
-	fmgr_info_set_expr((Node *) op, &qual->func);
-	qual->fcinfo = palloc0(SizeForFunctionCallInfo(2));
-	InitFunctionCallInfoData(*qual->fcinfo, &qual->func, 2,
-							 op->inputcollid, NULL, NULL);
-	qual->column = var->varattno - 1;
-	qual->var_argno = var_argno;
-	qual->recheck_only = recheck_only;
-	qual->has_int4_kernel =
-		var->vartype == INT4OID && exprType(other) == INT4OID &&
-		pg_batch_int4_compare_op(op->opfuncid, var_argno, &qual->int4_op);
-	if (IsA(other, Const))
-	{
-		qual->constant.value = castNode(Const, other)->constvalue;
-		qual->constant.isnull = castNode(Const, other)->constisnull;
-	}
-	else
-		qual->other_expr = ExecInitExpr((Expr *) other, parent);
+	(void) context;
+	return var->varattno - 1;
 }
 
 Node *
@@ -201,23 +174,50 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 	state->nquals = list_length(local_quals);
 	Assert(list_length(batch_recheck_flags) == state->nquals);
 	state->quals = palloc0_array(BatchQualState, state->nquals);
-	foreach_ptr(OpExpr, op, local_quals)
+	foreach_ptr(Node, qual_expr, local_quals)
 	{
-		uint8		var_argno = 0;
 		bool		recheck_only =
 			list_nth_int(batch_recheck_flags, i) != 0;
+		BatchQualState *qual = &state->quals[i++];
 
-		if (pg_batch_match_qual((Node *) op, &var_argno) == NULL)
+		if (!pg_batch_expr_supports_filter(qual_expr, 0))
 			elog(ERROR, "pg_batch received an invalid batch condition");
-		init_qual(&state->quals[i++], op, var_argno, recheck_only,
-				  &node->ss.ps);
+		qual->expr = pg_batch_expr_compile_filter(qual_expr, &node->ss.ps,
+											 resolve_scan_var, NULL);
+		qual->column = pg_batch_expr_input_column(qual->expr);
+		qual->provider_column = bms_make_singleton(qual->column);
+		qual->recheck_only = recheck_only;
 	}
 	foreach_int(column, exact_filter_items)
 		state->exact_filter_columns =
 			bms_add_member(state->exact_filter_columns, column);
-	state->operator_context =
-		AllocSetContextCreate(node->ss.ps.ps_ExprContext->ecxt_per_query_memory,
-							  "pg_batch operator", ALLOCSET_START_SMALL_SIZES);
+
+	/*
+	 * A heap deform cursor cannot move backwards. Prepare a later filter early
+	 * only when its physical attribute is at or before the current one. Native
+	 * column sources instead prepare exactly the expression being evaluated.
+	 */
+	for (int q = 0; q < state->nquals; q++)
+	{
+		AttrNumber current_attnum = state->request->source_attnums[
+			state->quals[q].column];
+
+		for (int future = q; future < state->nquals; future++)
+		{
+			int			column = state->quals[future].column;
+			AttrNumber attnum = state->request->source_attnums[column];
+
+			if (future == q || attnum <= current_attnum)
+			{
+				state->quals[q].heap_columns =
+					bms_add_member(state->quals[q].heap_columns, column);
+				if (bms_is_member(column, state->exact_filter_columns))
+					state->quals[q].exact_heap_columns =
+						bms_add_member(state->quals[q].exact_heap_columns,
+									   column);
+			}
+		}
+	}
 }
 
 static void
@@ -356,24 +356,6 @@ next_batch(BatchScanState *state, PgBatchSlot *bslot)
 	}
 }
 
-static inline bool
-eval_qual(BatchQualState *qual, Datum value, bool track_function)
-{
-	FunctionCallInfo fcinfo = qual->fcinfo;
-	PgStat_FunctionCallUsage usage;
-	Datum		result;
-
-	fcinfo->args[qual->var_argno].value = value;
-	fcinfo->args[qual->var_argno].isnull = false;
-	fcinfo->isnull = false;
-	if (track_function)
-		pgstat_init_function_usage(fcinfo, &usage);
-	result = FunctionCallInvoke(fcinfo);
-	if (track_function)
-		pgstat_end_function_usage(&usage, true);
-	return !fcinfo->isnull && DatumGetBool(result);
-}
-
 static int
 filter_batch(BatchScanState *state, PgBatchSlot *bslot)
 {
@@ -381,124 +363,31 @@ filter_batch(BatchScanState *state, PgBatchSlot *bslot)
 	PgBatchBridgeBatch *batch = pg_batch_get_batch(&bslot->base);
 	MemoryContext oldcontext;
 	int			initial = pg_batch_row_count(batch);
-	const Bitmapset *filter_columns = state->request->filter_columns;
-
-	if (state->heap_scan_mode == PG_BATCH_HEAP_BITMAP &&
-		!state->page_recheck)
-		filter_columns = state->exact_filter_columns;
-	pg_batch_prepare_columns(batch, filter_columns,
-							 batch->selection, PG_BATCH_FILTER_PHASE);
 	ResetExprContext(econtext);
 	oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 	for (int q = 0; q < state->nquals && pg_batch_has_rows(batch); q++)
 	{
 		BatchQualState *qual = &state->quals[q];
-		NullableDatum *other = &qual->fcinfo->args[1 - qual->var_argno];
+		const Bitmapset *columns;
 
 		if (qual->recheck_only && !state->page_recheck)
 		{
 			state->exact_rechecks_skipped += pg_batch_row_count(batch);
 			continue;
 		}
-
-		if (qual->other_expr != NULL)
-			other->value = ExecEvalExpr(qual->other_expr, econtext,
-										&other->isnull);
+		if (state->provider != NULL)
+			columns = qual->provider_column;
+		else if (state->heap_scan_mode == PG_BATCH_HEAP_BITMAP &&
+				 !state->page_recheck)
+			columns = qual->exact_heap_columns;
 		else
-			*other = qual->constant;
-		if (other->isnull)
-			MemSet(batch->selection, 0, sizeof(uint64) * batch->nwords);
-		else if (qual->has_int4_kernel)
-		{
-			PgBatchInt4Vector column;
-
-			pg_batch_get_int4_vector(batch, qual->column, batch->selection,
-									 PG_BATCH_FILTER_PHASE, &column);
-			pg_batch_filter_int4(&column, batch->nrows, batch->nwords,
-								 batch->selection, qual->int4_op,
-								 DatumGetInt32(other->value),
-								 pg_batch_enable_simd);
-		}
-		else
-		{
-			MemoryContext oldoperator;
-			bool		track_function =
-				pgstat_track_functions > qual->fcinfo->flinfo->fn_stats;
-
-			oldoperator = MemoryContextSwitchTo(state->operator_context);
-
-			/*
-			 * Keep the planner's qual order, but run each qual over the
-			 * batch.
-			 */
-			{
-				PgBatchArrowView column;
-
-				if (unlikely(batch->ops->get_native_interface != NULL) &&
-					pg_batch_get_arrow_column(batch, qual->column, &column))
-				{
-					const struct ArrowArray *array = column.array;
-					const int32 *values = array->buffers[1];
-
-					Assert(strcmp(column.schema->format, "i") == 0);
-					for (int word = 0; word < batch->nwords; word++)
-					{
-						uint64		rows = pg_batch_selection_word(batch, word);
-
-						while (rows != 0)
-						{
-							int			bitno = pg_rightmost_one_pos64(rows);
-							uint64		bit = UINT64CONST(1) << bitno;
-							int			row = word * 64 + bitno;
-
-							if (!pg_batch_arrow_row_is_valid(array, row) ||
-								!eval_qual(qual,
-										   Int32GetDatum(values[array->offset + row]),
-										   track_function))
-								batch->selection[word] &= ~bit;
-							rows &= ~bit;
-						}
-					}
-					MemoryContextSwitchTo(oldoperator);
-					goto generic_done;
-				}
-			}
-			{
-				PgBatchBridgeDatumColumn column;
-
-				pg_batch_get_datum_column(batch, qual->column,
-										  batch->selection,
-										  PG_BATCH_FILTER_PHASE, &column);
-				for (int word = 0; word < batch->nwords; word++)
-				{
-					uint64		rows = pg_batch_selection_word(batch, word);
-
-					if (word >= column.nwords ||
-						(column.valid_rows[word] & rows) != rows)
-						elog(ERROR, "pg_batch source did not materialize filter column %d",
-							 qual->column + 1);
-					while (rows != 0)
-					{
-						int			bitno = pg_rightmost_one_pos64(rows);
-						uint64		bit = UINT64CONST(1) << bitno;
-						int			row = word * 64 + bitno;
-
-						if (column.isnull[row] ||
-							!eval_qual(qual, column.values[row], track_function))
-							batch->selection[word] &= ~bit;
-						rows &= ~bit;
-					}
-				}
-			}
-			MemoryContextSwitchTo(oldoperator);
-		}
-generic_done:
-		if (qual->other_expr != NULL)
-		{
-			other->value = (Datum) 0;
-			other->isnull = true;
-		}
-		MemoryContextReset(state->operator_context);
+			columns = qual->heap_columns;
+		pg_batch_prepare_columns(batch, columns, batch->selection,
+								 PG_BATCH_FILTER_PHASE);
+		pg_batch_expr_bind(qual->expr, batch, econtext,
+						   PG_BATCH_FILTER_PHASE);
+		/* Keep the planner's qual order, but run each qual over the batch. */
+		pg_batch_expr_apply_filter(qual->expr, pg_batch_enable_simd);
 	}
 	MemoryContextSwitchTo(oldcontext);
 	{
