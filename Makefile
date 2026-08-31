@@ -98,6 +98,7 @@ uninstall:
 		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/abi.h" \
 		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/batch.h" \
 		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/bridge.h" \
+		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/layout.h" \
 		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/node.h" \
 		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/source.h" \
 		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/arrow.h"

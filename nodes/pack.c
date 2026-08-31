@@ -59,33 +59,36 @@ pack_begin(CustomScanState *node, EState *estate, int eflags)
 {
 	BatchPackState *state = (BatchPackState *) node;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
-	AttrNumber *source_attnums;
+	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
 
 	pg_batch_init_children(node, estate, eflags);
 	state->child = linitial(node->custom_ps);
 	state->ncolumns = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts;
 	state->buffer = pg_batch_datum_buffer_create(estate->es_query_cxt,
 		ExecGetResultType(state->child), state->ncolumns, PG_BATCH_SIZE);
-	source_attnums = palloc_array(AttrNumber, state->ncolumns);
-	for (int column = 0; column < state->ncolumns; column++)
-		source_attnums[column] = column + 1;
+	layout.ncolumns = state->ncolumns;
+	layout.ntargets = state->ncolumns;
 	state->output = pg_batch_output_create(estate->es_query_cxt,
-		pg_batch_api, slot, source_attnums, state->ncolumns);
-	pfree(source_attnums);
+		slot, &layout);
 	state->request = pg_batch_output_request(state->output);
 }
 
 static PgBatch *
 fill_batch(BatchPackState *state)
 {
+	int			limit = state->request->max_rows > 0 ?
+		Min(state->request->max_rows, PG_BATCH_SIZE) : PG_BATCH_SIZE;
+	int			nrows = 0;
+
 	pg_batch_datum_buffer_reset(state->buffer);
-	while (!pg_batch_datum_buffer_is_full(state->buffer))
+	while (nrows < limit && !pg_batch_datum_buffer_is_full(state->buffer))
 	{
 		TupleTableSlot *slot = ExecProcNode(state->child);
 
 		if (TupIsNull(slot))
 			break;
 		pg_batch_datum_buffer_append_slot(state->buffer, slot);
+		nrows++;
 	}
 	return pg_batch_datum_buffer_finish(state->buffer, InvalidOid);
 }

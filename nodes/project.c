@@ -17,6 +17,7 @@ typedef struct BatchProjectState
 	const PgBatchRequest *request;
 	List	   *input_columns;
 	bool		published;
+	bool		request_forwarded;
 	uint64	batches;
 	uint64	rows;
 } BatchProjectState;
@@ -52,36 +53,32 @@ project_begin(CustomScanState *node, EState *estate, int eflags)
 	CustomScan *cscan = castNode(CustomScan, node->ss.ps.plan);
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	const char *producer_name = strVal(linitial(cscan->custom_private));
-	PgBatchBinding *child_binding;
 	const PgBatchRequest *child_request;
 	Bitmapset  *survivors;
-	AttrNumber *source_attnums;
+	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
 	int			ncolumns;
 
 	pg_batch_init_children(node, estate, eflags);
 	state->child = linitial(node->custom_ps);
 	state->input_columns = lsecond_node(List, cscan->custom_private);
 	state->input = pg_batch_input_create(estate->es_query_cxt,
-		pg_batch_api, state->child, producer_name);
+		state->child, producer_name);
 	state->projection = pg_batch_expr_projection_create(
 		estate->es_query_cxt, cscan->custom_exprs, &node->ss.ps,
 		resolve_project_var, state->input_columns);
 
 	ncolumns = list_length(cscan->custom_exprs);
-	source_attnums = palloc_array(AttrNumber, ncolumns);
-	for (int column = 0; column < ncolumns; column++)
-		source_attnums[column] = column + 1;
+	layout.ncolumns = ncolumns;
+	layout.ntargets = ncolumns;
 	state->output = pg_batch_output_create(estate->es_query_cxt,
-		pg_batch_api, slot, source_attnums, ncolumns);
-	pfree(source_attnums);
+		slot, &layout);
 	state->request = pg_batch_output_request(state->output);
 
-	child_binding = pg_batch_input_request_binding(state->input);
-	child_request = pg_batch_api->get_request(child_binding);
+	child_request = pg_batch_input_request(state->input);
 	survivors = bms_union(child_request->project_columns,
 		pg_batch_expr_projection_input_columns(state->projection));
-	pg_batch_api->set_request(child_binding, child_request->filter_columns,
-							 survivors, true);
+	pg_batch_input_set_request(state->input, child_request->filter_columns,
+		survivors, true, child_request->max_rows);
 	bms_free(survivors);
 }
 
@@ -94,12 +91,26 @@ project_exec(CustomScanState *node)
 	PgBatch *batch;
 	int			first_row;
 
+	if (!state->request_forwarded)
+	{
+		const PgBatchRequest *child_request =
+			pg_batch_input_request(state->input);
+		int			max_rows = child_request->max_rows == 0 ?
+			state->request->max_rows :
+			state->request->max_rows == 0 ? child_request->max_rows :
+			Min(child_request->max_rows, state->request->max_rows);
+
+		pg_batch_input_set_request(state->input,
+			child_request->filter_columns, child_request->project_columns,
+			true, max_rows);
+		state->request_forwarded = true;
+	}
+
 	if (!state->request->return_batch)
 		elog(ERROR, "pg_batch project requires a batch-aware parent");
 	if (state->published)
 	{
-		if (!pg_batch_api->batch_finished(
-				pg_batch_output_binding(state->output)))
+		if (!pg_batch_output_batch_finished(state->output))
 			elog(ERROR, "pg_batch parent requested a new projected batch too early");
 		pg_batch_output_reset(state->output);
 		pg_batch_input_finish(state->input);

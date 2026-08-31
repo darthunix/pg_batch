@@ -93,7 +93,8 @@ request_side_columns(PgBatchBinding *binding,
 		if (!key_columns[column])
 			survivors = bms_add_member(survivors, columns[column]);
 	}
-	pg_batch_api->set_request(binding, filters, survivors, true);
+	pg_batch_api->set_request(binding, filters, survivors, true,
+		PG_BATCH_SIZE);
 	bms_free(filters);
 	bms_free(survivors);
 	pfree(key_columns);
@@ -682,13 +683,20 @@ load_probe_window(BatchHashJoinState *state)
 	return count > 0;
 }
 
+static inline int
+output_capacity(BatchHashJoinState *state)
+{
+	return state->output_request->max_rows > 0 ?
+		Min(state->output_request->max_rows, PG_BATCH_SIZE) : PG_BATCH_SIZE;
+}
+
 /* Avoid a second pass over each probe window when every build key is unique. */
 static bool
 probe_unique_rows(BatchHashJoinState *state)
 {
 	int			row = state->next_probe_row;
 
-	while (state->output_count < PG_BATCH_SIZE &&
+	while (state->output_count < output_capacity(state) &&
 		   (row = pg_batch_next_selected(state->probe_batch, row)) >= 0)
 	{
 		uint32		hash;
@@ -706,7 +714,7 @@ probe_unique_rows(BatchHashJoinState *state)
 			state->output_build_rows[output] = link - 1;
 		}
 	}
-	return state->output_count == PG_BATCH_SIZE;
+	return state->output_count == output_capacity(state);
 }
 
 static bool
@@ -811,7 +819,7 @@ probe_round(BatchHashJoinState *state)
 		if (state->probe_build_rows[lane] != 0)
 			remaining++;
 		processed++;
-		if (state->output_count == PG_BATCH_SIZE)
+		if (state->output_count == output_capacity(state))
 			break;
 	}
 
@@ -1222,13 +1230,12 @@ static const PgBatchArrowInterface output_arrow_interface = {
 	.get_column = get_output_arrow_column,
 };
 
-static const void *
-get_output_native_interface(PgBatch *batch, const char *name,
-							uint32 version)
+static const PgBatchNativeInterface *
+get_output_native_interface(const PgBatchNativeType *type)
 {
-	if (version == PG_BATCH_ARROW_INTERFACE_VERSION &&
-		strcmp(name, PG_BATCH_ARROW_INTERFACE_NAME) == 0)
-		return &output_arrow_interface;
+	if (type->abi_version == PG_BATCH_ARROW_INTERFACE_VERSION &&
+		strcmp(type->name, PG_BATCH_ARROW_INTERFACE_NAME) == 0)
+		return (const PgBatchNativeInterface *) &output_arrow_interface;
 	return NULL;
 }
 
@@ -1294,10 +1301,10 @@ produce_output(BatchHashJoinState *state)
 		if (state->probe_active > 0)
 		{
 			probe_round(state);
-			if (state->output_count == PG_BATCH_SIZE)
+			if (state->output_count == output_capacity(state))
 			{
 				qualify_output(state);
-				if (state->output_count == PG_BATCH_SIZE)
+				if (state->output_count == output_capacity(state))
 					return true;
 			}
 			continue;
@@ -1309,7 +1316,7 @@ produce_output(BatchHashJoinState *state)
 			if (probe_unique_rows(state))
 			{
 				qualify_output(state);
-				if (state->output_count == PG_BATCH_SIZE)
+				if (state->output_count == output_capacity(state))
 					return true;
 				continue;
 			}
@@ -1420,7 +1427,7 @@ init_output_columns(BatchHashJoinState *state, CustomScan *cscan)
 static void
 configure_output_slot(BatchHashJoinState *state, EState *estate)
 {
-	AttrNumber *source_attnums;
+	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
 	Bitmapset  *survivors = NULL;
 	TupleDesc	desc = state->css.ss.ps.ps_ResultTupleDesc;
 	MemoryContext oldcontext;
@@ -1435,18 +1442,17 @@ configure_output_slot(BatchHashJoinState *state, EState *estate)
 	state->css.ss.ps.resultopsfixed = true;
 	state->css.ss.ps.resultopsset = true;
 	state->css.ss.ps.ps_ProjInfo = NULL;
-	source_attnums = palloc_array(AttrNumber, state->noutput_columns);
 	for (int column = 0; column < state->noutput_columns; column++)
 	{
-		source_attnums[column] = column + 1;
 		survivors = bms_add_member(survivors, column);
 	}
-	state->output = pg_batch_output_create(estate->es_query_cxt, pg_batch_api,
-		state->output_slot, source_attnums, state->noutput_columns);
-	pg_batch_api->set_request(pg_batch_output_binding(state->output), NULL,
-						 survivors, false);
+	layout.ncolumns = state->noutput_columns;
+	layout.ntargets = state->noutput_columns;
+	state->output = pg_batch_output_create(estate->es_query_cxt,
+		state->output_slot, &layout);
+	pg_batch_output_set_request(state->output, NULL, survivors, false,
+		PG_BATCH_SIZE);
 	state->output_request = pg_batch_output_request(state->output);
-	pfree(source_attnums);
 	bms_free(survivors);
 }
 
@@ -1538,9 +1544,9 @@ hash_join_begin(CustomScanState *node, EState *estate, int eflags)
 	state->outer_plan = linitial(node->custom_ps);
 	state->inner_plan = lsecond(node->custom_ps);
 	state->outer_input = pg_batch_input_create(state->join_context,
-		pg_batch_api, state->outer_plan, outer_producer_name);
+		state->outer_plan, outer_producer_name);
 	state->inner_input = pg_batch_input_create(state->join_context,
-		pg_batch_api, state->inner_plan, inner_producer_name);
+		state->inner_plan, inner_producer_name);
 	for (int key = 0; key < state->nkeys; key++)
 	{
 		state->outer_key_columns = bms_add_member(state->outer_key_columns,

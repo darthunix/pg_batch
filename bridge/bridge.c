@@ -29,15 +29,20 @@ struct PgBatchBinding
 	MemoryContext owner;
 	MemoryContextCallback cleanup;
 	PgBatchRequest request;
+	PgBatchLayout *layout;
 	const PgBatchConsumerOps *consumer_ops;
+	const char *provider_name;
+	void	   *provider_state;
 	PgBatch *batch;
 	const PgBatchOps *validated_ops;
+	bool		request_sealed;
 	bool		batch_finished;
 };
 
 static HTAB *slot_entries;
 static List *providers;
 static List *producers;
+static uint64 next_batch_generation = 1;
 
 static void register_provider(const PgBatchProviderOps *provider);
 static void unregister_provider(const char *provider_name);
@@ -49,16 +54,19 @@ static const PgBatchProducerOps *find_producer(const Path *path);
 static const PgBatchProducerOps *get_producer(const char *producer_name);
 static PgBatchBinding *find_binding(TupleTableSlot *slot);
 static PgBatchBinding *attach_slot(TupleTableSlot *slot,
-										 const AttrNumber *source_attnums,
-										 int ncolumns,
-										 const PgBatchConsumerOps *consumer_ops);
+									 const PgBatchLayout *layout,
+									 const PgBatchConsumerOps *consumer_ops);
 static void set_request(PgBatchBinding *binding,
 						const Bitmapset *filter_columns,
 						const Bitmapset *project_columns,
-						bool return_batch);
+						bool return_batch,
+						int max_rows);
 static void set_provider(PgBatchBinding *binding,
 						 const char *provider_name,
 						 void *provider_state);
+static void *get_bound_provider(PgBatchBinding *binding,
+								const char **provider_name);
+static const PgBatchRequest *seal_request(PgBatchBinding *binding);
 static const PgBatchRequest *get_request(PgBatchBinding *binding);
 static void publish_batch(PgBatchBinding *binding,
 						  PgBatch *batch);
@@ -84,6 +92,8 @@ static const PgBatchAPI bridge_api = {
 	.attach_slot = attach_slot,
 	.set_request = set_request,
 	.set_provider = set_provider,
+	.get_bound_provider = get_bound_provider,
+	.seal_request = seal_request,
 	.get_request = get_request,
 	.publish_batch = publish_batch,
 	.get_batch = get_batch,
@@ -122,6 +132,7 @@ release_batch(PgBatchBinding *binding)
 		return;
 	binding->batch = NULL;
 	binding->batch_finished = false;
+	batch->generation = 0;
 	if (PG_BATCH_ABI_HAS_FIELD(batch->ops, PgBatchOps, release) &&
 		batch->ops->release != NULL)
 		batch->ops->release(batch);
@@ -255,7 +266,7 @@ register_producer(const PgBatchProducerOps *producer)
 				 "producer", PG_BATCH_PRODUCER_OPS_MIN_SIZE);
 	if (producer->producer_name == NULL || producer->producer_name[0] == '\0' ||
 		producer->supports_path == NULL ||
-		producer->get_output_layout == NULL ||
+		producer->get_layout == NULL ||
 		producer->get_request_binding == NULL)
 		elog(ERROR, "invalid pg_batch producer registration");
 	foreach_ptr(const PgBatchProducerOps, existing, producers)
@@ -327,18 +338,18 @@ find_binding(TupleTableSlot *slot)
 
 static PgBatchBinding *
 attach_slot(TupleTableSlot *slot,
-			const AttrNumber *source_attnums, int ncolumns,
+			const PgBatchLayout *layout,
 			const PgBatchConsumerOps *consumer_ops)
 {
 	SlotKey		key = {slot};
 	SlotEntry  *entry;
 	PgBatchBinding *binding;
-	AttrNumber *attnums = NULL;
+	int		   *target_columns = NULL;
 	bool		found;
 
-	if (slot == NULL || ncolumns < 0 ||
-		(ncolumns > 0 && source_attnums == NULL))
+	if (slot == NULL)
 		elog(ERROR, "invalid pg_batch slot configuration");
+	pg_batch_check_layout(layout);
 	if (consumer_ops == NULL)
 		elog(ERROR, "pg_batch slot requires consumer operations");
 	validate_abi(consumer_ops->abi_version,
@@ -355,15 +366,20 @@ attach_slot(TupleTableSlot *slot,
 	binding->slot = slot;
 	binding->owner = slot->tts_mcxt;
 	entry->binding = binding;
-	if (ncolumns > 0)
+	binding->layout = MemoryContextAlloc(slot->tts_mcxt,
+										 sizeof(*binding->layout));
+	*binding->layout = *layout;
+	binding->layout->struct_size = sizeof(*binding->layout);
+	if (layout->target_columns != NULL)
 	{
-		attnums = MemoryContextAlloc(slot->tts_mcxt,
-									 sizeof(AttrNumber) * ncolumns);
-		memcpy(attnums, source_attnums, sizeof(AttrNumber) * ncolumns);
+		target_columns = MemoryContextAlloc(slot->tts_mcxt,
+										  sizeof(int) * layout->ntargets);
+		memcpy(target_columns, layout->target_columns,
+			   sizeof(int) * layout->ntargets);
 	}
-	binding->request.source_attnums = attnums;
+	binding->layout->target_columns = target_columns;
 	binding->request.struct_size = sizeof(PgBatchRequest);
-	binding->request.ncolumns = ncolumns;
+	binding->request.layout = binding->layout;
 	binding->consumer_ops = consumer_ops;
 	binding->cleanup.func = slot_reset;
 	binding->cleanup.arg = binding;
@@ -376,7 +392,8 @@ static void
 set_request(PgBatchBinding *binding,
 			const Bitmapset *filter_columns,
 			const Bitmapset *project_columns,
-			bool return_batch)
+			bool return_batch,
+			int max_rows)
 {
 	MemoryContext oldcontext;
 	Bitmapset  *new_filter;
@@ -385,10 +402,16 @@ set_request(PgBatchBinding *binding,
 
 	if (binding == NULL)
 		elog(ERROR, "pg_batch cannot configure a null binding");
-	column = bms_next_member(filter_columns, binding->request.ncolumns - 1);
+	if (binding->request_sealed)
+		elog(ERROR, "pg_batch request is already sealed");
+	if (max_rows < 0)
+		elog(ERROR, "pg_batch maximum row count cannot be negative");
+	column = bms_next_member(filter_columns,
+							 binding->layout->ncolumns - 1);
 	if (column >= 0)
 		elog(ERROR, "pg_batch filter column %d is out of range", column);
-	column = bms_next_member(project_columns, binding->request.ncolumns - 1);
+	column = bms_next_member(project_columns,
+							 binding->layout->ncolumns - 1);
 	if (column >= 0)
 		elog(ERROR, "pg_batch project column %d is out of range", column);
 
@@ -402,14 +425,34 @@ set_request(PgBatchBinding *binding,
 	binding->request.filter_columns = new_filter;
 	binding->request.project_columns = new_survivor;
 	binding->request.return_batch = return_batch;
+	binding->request.max_rows = max_rows;
 }
 
 static void
 set_provider(PgBatchBinding *binding,
 			 const char *provider_name, void *provider_state)
 {
-	binding->request.provider_name = provider_name;
-	binding->request.provider_state = provider_state;
+	if (binding == NULL)
+		elog(ERROR, "pg_batch cannot configure a null binding");
+	binding->provider_name = provider_name;
+	binding->provider_state = provider_state;
+}
+
+static void *
+get_bound_provider(PgBatchBinding *binding, const char **provider_name)
+{
+	if (provider_name != NULL)
+		*provider_name = binding == NULL ? NULL : binding->provider_name;
+	return binding == NULL ? NULL : binding->provider_state;
+}
+
+static const PgBatchRequest *
+seal_request(PgBatchBinding *binding)
+{
+	if (binding == NULL)
+		return NULL;
+	binding->request_sealed = true;
+	return &binding->request;
 }
 
 static const PgBatchRequest *
@@ -422,6 +465,8 @@ static void
 publish_batch(PgBatchBinding *binding,
 			  PgBatch *batch)
 {
+	uint64		generation;
+
 	if (binding->batch != NULL)
 		elog(ERROR, "pg_batch source published a new batch before clearing the previous one");
 	if (batch == NULL)
@@ -431,6 +476,11 @@ publish_batch(PgBatchBinding *binding,
 	if (batch->ops == NULL || batch->selection == NULL ||
 		batch->nrows <= 0 || batch->nwords != (batch->nrows + 63) / 64)
 		elog(ERROR, "pg_batch source published an invalid batch");
+	if (batch->generation != 0)
+		elog(ERROR, "pg_batch source published a batch that is already active");
+	if (binding->request.max_rows > 0 &&
+		batch->nrows > binding->request.max_rows)
+		elog(ERROR, "pg_batch source exceeded the requested batch size");
 	if (batch->nrows % 64 != 0 &&
 		(batch->selection[batch->nwords - 1] &
 		 (UINT64_MAX << (batch->nrows % 64))) != 0)
@@ -445,6 +495,15 @@ publish_batch(PgBatchBinding *binding,
 			elog(ERROR, "pg_batch source must provide Datum materialization");
 		binding->validated_ops = batch->ops;
 	}
+	binding->request_sealed = true;
+	generation = next_batch_generation++;
+	if (generation == 0)
+	{
+		generation = next_batch_generation++;
+		if (generation == 0)
+			elog(ERROR, "pg_batch generation counter wrapped around");
+	}
+	batch->generation = generation;
 	binding->batch = batch;
 	binding->batch_finished = false;
 	binding->consumer_ops->accept_batch(binding->slot, batch);
@@ -471,6 +530,7 @@ finish_batch(PgBatchBinding *binding)
 {
 	if (binding->batch == NULL || binding->batch_finished)
 		elog(ERROR, "pg_batch cannot finish a slot without an active batch");
+	binding->batch->generation = 0;
 	binding->batch_finished = true;
 }
 
@@ -502,8 +562,9 @@ detach_binding(PgBatchBinding *binding)
 										 &binding->cleanup);
 	bms_free((Bitmapset *) binding->request.filter_columns);
 	bms_free((Bitmapset *) binding->request.project_columns);
-	if (binding->request.source_attnums != NULL)
-		pfree((void *) binding->request.source_attnums);
+	if (binding->layout->target_columns != NULL)
+		pfree((void *) binding->layout->target_columns);
+	pfree(binding->layout);
 	hash_search(slot_entries, &key, HASH_REMOVE, NULL);
 	pfree(binding);
 }
@@ -517,7 +578,7 @@ get_row_view(PgBatchBinding *binding, PgBatchRowView *result)
 		elog(ERROR, "pg_batch binding has no active batch");
 	result->slot = binding->slot;
 	result->batch = binding->batch;
-	result->finished = &binding->batch_finished;
+	result->generation = binding->batch->generation;
 	result->select_row = binding->consumer_ops->select_row;
 }
 

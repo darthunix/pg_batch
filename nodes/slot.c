@@ -544,6 +544,7 @@ void
 pg_batch_configure_slot(PgBatchSlot *bslot, TupleDesc source_desc,
 						List *source_attnums, int nfilter_columns)
 {
+	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
 	ListCell   *lc;
 	int			column = 0;
 
@@ -556,9 +557,10 @@ pg_batch_configure_slot(PgBatchSlot *bslot, TupleDesc source_desc,
 	foreach(lc, source_attnums)
 		bslot->source_attnums[column++] = lfirst_int(lc);
 	Assert(column == bslot->ncolumns);
+	layout.ncolumns = bslot->ncolumns;
+	layout.ntargets = bslot->ncolumns;
 	bslot->binding = pg_batch_api->attach_slot(&bslot->base,
-												  bslot->source_attnums,
-												  bslot->ncolumns,
+												  &layout,
 												  &pg_batch_slot_consumer_ops);
 }
 
@@ -569,7 +571,7 @@ pg_batch_set_request(TupleTableSlot *slot, const Bitmapset *filter_columns,
 	PgBatchSlot *bslot = pg_batch_slot_cast(slot);
 
 	pg_batch_api->set_request(bslot->binding, filter_columns,
-								 project_columns, return_batch);
+								 project_columns, return_batch, 0);
 }
 
 void

@@ -62,6 +62,7 @@ extern void pg_batch_fdw_validate_relation(Relation relation);
 extern PgBatchFdwScan *pg_batch_fdw_scan_begin(
 	Relation relation, PlanState *parent, Node *source_private,
 	List *source_exprs, const PgBatchRequest *request,
+	const AttrNumber *source_attnums, int nsource_columns,
 	MemoryContext query_context);
 extern PgBatch *pg_batch_fdw_scan_next(PgBatchFdwScan *scan);
 extern void pg_batch_fdw_scan_rescan(PgBatchFdwScan *scan);

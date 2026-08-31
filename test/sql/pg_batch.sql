@@ -50,6 +50,10 @@ CREATE FUNCTION pg_batch_output_test()
 RETURNS boolean
 AS :'runtime_test', 'pg_batch_output_test'
 LANGUAGE C;
+CREATE FUNCTION pg_batch_output_over_max_test()
+RETURNS void
+AS :'runtime_test', 'pg_batch_output_over_max_test'
+LANGUAGE C;
 CREATE FUNCTION pg_batch_output_double_finish_test()
 RETURNS void
 AS :'runtime_test', 'pg_batch_output_double_finish_test'
@@ -62,9 +66,13 @@ CREATE FUNCTION pg_batch_output_fast_select_after_finish_test()
 RETURNS void
 AS :'runtime_test', 'pg_batch_output_fast_select_after_finish_test'
 LANGUAGE C;
-CREATE FUNCTION pg_batch_request_port_test()
+CREATE FUNCTION pg_batch_binding_request_test()
 RETURNS boolean
-AS :'runtime_test', 'pg_batch_request_port_test'
+AS :'runtime_test', 'pg_batch_binding_request_test'
+LANGUAGE C;
+CREATE FUNCTION pg_batch_request_after_seal_test()
+RETURNS void
+AS :'runtime_test', 'pg_batch_request_after_seal_test'
 LANGUAGE C;
 CREATE FUNCTION pg_batch_spill_test()
 RETURNS boolean
@@ -79,7 +87,9 @@ SELECT pg_batch_expr_api_test() AS installed_expr_api_ok;
 SELECT pg_batch_datum_buffer_test() AS installed_datum_buffer_ok;
 SELECT pg_batch_input_api_test() AS installed_input_api_ok;
 SELECT pg_batch_output_test() AS installed_output_ok;
-SELECT pg_batch_request_port_test() AS installed_request_port_ok;
+SELECT pg_batch_output_over_max_test();
+SELECT pg_batch_binding_request_test() AS installed_binding_request_ok;
+SELECT pg_batch_request_after_seal_test();
 SELECT pg_batch_output_double_finish_test();
 SELECT pg_batch_output_select_after_finish_test();
 SELECT pg_batch_output_fast_select_after_finish_test();

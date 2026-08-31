@@ -71,23 +71,31 @@ static const PgBatchConsumerOps virtual_consumer_ops = {
 };
 
 PgBatchOutput *
-pg_batch_output_create(MemoryContext parent_context, const PgBatchAPI *api,
-					   TupleTableSlot *slot,
-					   const AttrNumber *source_attnums, int ncolumns)
+pg_batch_output_create(MemoryContext parent_context, TupleTableSlot *slot,
+					   const PgBatchLayout *layout)
 {
 	PgBatchOutput *output;
+	const PgBatchAPI *api = pg_batch_api_get();
 
-	if (parent_context == NULL || api == NULL || slot == NULL)
-		elog(ERROR, "pg_batch output requires a context, API, and slot");
+	if (parent_context == NULL || slot == NULL || layout == NULL)
+		elog(ERROR, "pg_batch output requires a context, slot, and layout");
+	pg_batch_check_layout(layout);
 	if (slot->tts_ops != &TTSOpsVirtual)
 		elog(ERROR, "pg_batch output requires a virtual slot");
-	if (ncolumns < slot->tts_tupleDescriptor->natts)
+	if (layout->ncolumns < slot->tts_tupleDescriptor->natts ||
+		layout->ntargets < slot->tts_tupleDescriptor->natts)
 		elog(ERROR, "pg_batch output has %d columns but its slot needs %d",
-			 ncolumns, slot->tts_tupleDescriptor->natts);
+			 layout->ncolumns, slot->tts_tupleDescriptor->natts);
+	for (int attribute = 0; attribute < slot->tts_tupleDescriptor->natts;
+		 attribute++)
+	{
+		if (pg_batch_layout_column(layout, attribute) != attribute)
+			elog(ERROR, "pg_batch virtual output requires an identity slot layout");
+	}
 	output = MemoryContextAllocZero(parent_context, sizeof(*output));
 	output->api = api;
 	output->slot = slot;
-	output->binding = api->attach_slot(slot, source_attnums, ncolumns,
+	output->binding = api->attach_slot(slot, layout,
 									  &virtual_consumer_ops);
 	return output;
 }
@@ -102,6 +110,22 @@ const PgBatchRequest *
 pg_batch_output_request(PgBatchOutput *output)
 {
 	return output->api->get_request(output->binding);
+}
+
+void
+pg_batch_output_set_request(PgBatchOutput *output,
+							const Bitmapset *filter_columns,
+							const Bitmapset *project_columns,
+							bool return_batch, int max_rows)
+{
+	output->api->set_request(output->binding, filter_columns, project_columns,
+		return_batch, max_rows);
+}
+
+bool
+pg_batch_output_batch_finished(PgBatchOutput *output)
+{
+	return output->api->batch_finished(output->binding);
 }
 
 static void

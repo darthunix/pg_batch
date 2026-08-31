@@ -67,9 +67,15 @@ pg_batch_arrow_row_is_valid(const struct ArrowArray *array, int row)
 
 typedef struct PgBatchArrowView
 {
+	Size		struct_size;
 	const struct ArrowArray *array;
 	const struct ArrowSchema *schema;
 } PgBatchArrowView;
+
+#define PG_BATCH_ARROW_VIEW_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchArrowView, schema)
+
+extern const PgBatchNativeType pg_batch_arrow_type;
 
 typedef struct PgBatchArrowInterface
 {

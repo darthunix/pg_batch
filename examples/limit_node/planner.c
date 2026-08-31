@@ -30,27 +30,28 @@ supports_path(const Path *path)
 }
 
 static void
-get_output_layout(const Plan *plan, PgBatchOutputLayout *result)
+get_layout(const Plan *plan, PgBatchLayout *result)
 {
 	const CustomScan *scan;
 	List	   *items;
 	int		   *columns;
 	int			position = 0;
 
-	if (result == NULL || result->struct_size < PG_BATCH_OUTPUT_LAYOUT_MIN_SIZE)
+	if (result == NULL || result->struct_size < PG_BATCH_LAYOUT_MIN_SIZE)
 		elog(ERROR, "pg_batch_limit received an incompatible output layout");
 	if (!IsA(plan, CustomScan))
 		elog(ERROR, "pg_batch_limit expected a custom plan");
 	scan = castNode(CustomScan, plan);
 	if (scan->methods != &limit_plan_methods ||
-		list_length(scan->custom_private) != 2)
+		list_length(scan->custom_private) != 3)
 		elog(ERROR, "pg_batch_limit received an invalid plan");
 	items = lsecond_node(List, scan->custom_private);
 	columns = palloc_array(int, list_length(items));
 	foreach_int(column, items)
 		columns[position++] = column;
-	result->ncolumns = position;
-	result->batch_columns = columns;
+	result->ncolumns = intVal(lthird(scan->custom_private));
+	result->ntargets = position;
+	result->target_columns = columns;
 }
 
 const PgBatchProducerOps pg_batch_limit_producer_ops = {
@@ -58,7 +59,7 @@ const PgBatchProducerOps pg_batch_limit_producer_ops = {
 		PgBatchProducerOps),
 	.producer_name = PG_BATCH_LIMIT_PRODUCER_NAME,
 	.supports_path = supports_path,
-	.get_output_layout = get_output_layout,
+	.get_layout = get_layout,
 	.get_request_binding = pg_batch_limit_request_binding,
 };
 
@@ -117,8 +118,7 @@ plan_limit(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 {
 	const char *producer_name;
 	const PgBatchProducerOps *producer;
-	PgBatchOutputLayout layout =
-		PG_BATCH_STRUCT_INITIALIZER(PgBatchOutputLayout);
+	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
 	CustomScan *scan;
 	Plan	   *child;
 	List	   *columns = NIL;
@@ -132,20 +132,22 @@ plan_limit(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		elog(ERROR, "pg_batch producer \"%s\" is not registered",
 			 producer_name);
 	child = linitial(custom_plans);
-	producer->get_output_layout(child, &layout);
-	if (layout.ncolumns != list_length(child->targetlist) ||
-		(layout.ncolumns > 0 && layout.batch_columns == NULL))
+	producer->get_layout(child, &layout);
+	pg_batch_check_layout(&layout);
+	if (layout.ntargets != list_length(child->targetlist))
 		elog(ERROR, "pg_batch producer \"%s\" returned an invalid output layout",
 			 producer_name);
-	for (int position = 0; position < layout.ncolumns; position++)
-		columns = lappend_int(columns, layout.batch_columns[position]);
+	for (int position = 0; position < layout.ntargets; position++)
+		columns = lappend_int(columns,
+			pg_batch_layout_column(&layout, position));
 
 	scan = makeNode(CustomScan);
 	scan->methods = &limit_plan_methods;
 	scan->scan.plan.targetlist = copyObject(tlist);
 	scan->custom_plans = custom_plans;
 	scan->custom_private =
-		list_make2(makeString(pstrdup(producer_name)), columns);
+		list_make3(makeString(pstrdup(producer_name)), columns,
+			makeInteger(layout.ncolumns));
 	scan->custom_exprs =
 		list_make2(copyObject(lsecond(best_path->custom_private)),
 				   copyObject(lthird(best_path->custom_private)));

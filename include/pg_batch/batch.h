@@ -19,7 +19,7 @@
 #define PG_BATCH_CONSUMER_OPS_ABI_VERSION 1
 
 #define PG_BATCH_MIN_SIZE \
-	PG_BATCH_ABI_SIZE_THROUGH(PgBatch, private_data)
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatch, generation)
 #define PG_BATCH_OPS_MIN_SIZE \
 	PG_BATCH_ABI_SIZE_THROUGH(PgBatchOps, get_datum_column)
 #define PG_BATCH_CONSUMER_OPS_MIN_SIZE \
@@ -33,6 +33,21 @@ typedef enum PgBatchColumnPhase
 } PgBatchColumnPhase;
 
 typedef struct PgBatch PgBatch;
+
+/* Common header of a typed source-native column interface. */
+typedef struct PgBatchNativeInterface
+{
+	uint32		abi_version;
+	Size		struct_size;
+} PgBatchNativeInterface;
+
+/* Stable descriptor used to discover one typed native interface. */
+typedef struct PgBatchNativeType
+{
+	const char *name;
+	uint32		abi_version;
+	Size		min_size;
+} PgBatchNativeType;
 
 /* Borrowed Datum view indexed by physical row number in the batch. */
 typedef struct PgBatchDatumVector
@@ -70,9 +85,9 @@ typedef struct PgBatchOps
 									const Bitmapset *columns,
 									const uint64 *rows,
 									PgBatchColumnPhase phase);
-	const void *(*get_native_interface) (PgBatch *batch,
-										const char *name,
-										uint32 version);
+	/* The returned interface depends only on this operations table. */
+	const PgBatchNativeInterface *(*get_native_interface) (
+										const PgBatchNativeType *type);
 	void		(*release) (PgBatch *batch);
 } PgBatchOps;
 
@@ -99,6 +114,8 @@ struct PgBatch
 	Oid			table_oid;
 	const PgBatchOps *ops;
 	void	   *private_data;
+	/* Set by the bridge while this batch is active, zero otherwise. */
+	uint64		generation;
 };
 
 /* Operations used to expose a published batch through a tuple slot. */
@@ -119,7 +136,7 @@ typedef struct PgBatchRowView
 	Size		struct_size;
 	TupleTableSlot *slot;
 	PgBatch    *batch;
-	const bool *finished;
+	uint64		generation;
 	void		(*select_row) (TupleTableSlot *slot, PgBatch *batch, int row);
 } PgBatchRowView;
 
@@ -150,7 +167,8 @@ static inline TupleTableSlot *
 pg_batch_row_view_select(const PgBatchRowView *view, int row)
 {
 	if (view == NULL || view->struct_size < PG_BATCH_ROW_VIEW_MIN_SIZE ||
-		view->batch == NULL || view->finished == NULL || *view->finished ||
+		view->batch == NULL || view->generation == 0 ||
+		view->batch->generation != view->generation ||
 		view->select_row == NULL ||
 		row < 0 || row >= view->batch->nrows ||
 		!pg_batch_row_selected(view->batch, row))

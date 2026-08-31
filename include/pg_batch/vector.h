@@ -9,6 +9,8 @@
 
 #include "postgres.h"
 
+#include "batch.h"
+
 struct PgBatch;
 
 typedef enum PgBatchInt4Layout
@@ -29,6 +31,7 @@ typedef enum PgBatchInt4Layout
  */
 typedef struct PgBatchInt4Vector
 {
+	Size		struct_size;
 	PgBatchInt4Layout layout;
 	union
 	{
@@ -48,6 +51,9 @@ typedef struct PgBatchInt4Vector
 	} data;
 } PgBatchInt4Vector;
 
+#define PG_BATCH_INT4_VECTOR_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchInt4Vector, data)
+
 /*
  * Optional native batch interface for sources that already store int4
  * columns in one of the layouts above. Consumers discover it through
@@ -56,6 +62,8 @@ typedef struct PgBatchInt4Vector
  */
 #define PG_BATCH_INT4_VECTOR_INTERFACE_NAME "pg_batch.int4_vector.v1"
 #define PG_BATCH_INT4_VECTOR_INTERFACE_VERSION 1
+
+extern const PgBatchNativeType pg_batch_int4_vector_type;
 
 typedef struct PgBatchInt4VectorInterface
 {
@@ -74,6 +82,7 @@ pg_batch_int4_vector_init_datum(PgBatchInt4Vector *column,
 								const Datum *values, const bool *isnull,
 								const uint64 *available, int nwords)
 {
+	column->struct_size = sizeof(*column);
 	column->layout = PG_BATCH_INT4_DATUM;
 	column->data.datum.values = values;
 	column->data.datum.isnull = isnull;
@@ -87,6 +96,7 @@ pg_batch_int4_vector_init_packed(PgBatchInt4Vector *column,
 								 const int32 *values, const uint8 *validity,
 								 int64 offset)
 {
+	column->struct_size = sizeof(*column);
 	column->layout = PG_BATCH_INT4_PACKED;
 	column->data.packed.values = values;
 	column->data.packed.validity = validity;

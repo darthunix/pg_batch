@@ -66,6 +66,8 @@ struct PgBatchFdwScan
 	Relation	relation;
 	ExprContext *econtext;
 	const PgBatchRequest *request;
+	const AttrNumber *source_attnums;
+	int			ncolumns;
 	IpcReader	reader;
 	ArrowArray *record_columns;
 	bool	   *record_decoded;
@@ -339,12 +341,12 @@ request_phase_for_attnum(PgBatchFdwScan *scan, AttrNumber attnum)
 	{
 		int			column = scan->quals[i].column;
 
-		if (scan->request->source_attnums[column] == attnum)
+		if (scan->source_attnums[column] == attnum)
 			return PG_BATCH_COLUMN_FILTER;
 	}
-	for (int column = 0; column < scan->request->ncolumns; column++)
+	for (int column = 0; column < scan->ncolumns; column++)
 	{
-		if (scan->request->source_attnums[column] == attnum)
+		if (scan->source_attnums[column] == attnum)
 			return bms_is_member(column, scan->request->filter_columns) ?
 				PG_BATCH_COLUMN_FILTER :
 				PG_BATCH_COLUMN_PROJECT;
@@ -362,10 +364,10 @@ load_record(PgBatchFdwScan *scan)
 	if (!reader_next_record(scan))
 		return false;
 	if (scan->nquals > 0)
-		length_attnum = scan->request->source_attnums[
+		length_attnum = scan->source_attnums[
 			scan->quals[0].column];
-	else if (scan->request->ncolumns > 0)
-		length_attnum = scan->request->source_attnums[0];
+	else if (scan->ncolumns > 0)
+		length_attnum = scan->source_attnums[0];
 	else
 		length_attnum = 1;
 	length_column = decode_column(scan, length_attnum,
@@ -407,13 +409,13 @@ apply_source_quals(ActiveBatch *active)
 static int
 resolve_source_var(const Var *var, void *context)
 {
-	const PgBatchRequest *request = context;
+	const PgBatchFdwScan *scan = context;
 
-	if (var->varno == INDEX_VAR && var->varattno <= request->ncolumns)
+	if (var->varno == INDEX_VAR && var->varattno <= scan->ncolumns)
 		return var->varattno - 1;
-	for (int column = 0; column < request->ncolumns; column++)
+	for (int column = 0; column < scan->ncolumns; column++)
 	{
-		if (request->source_attnums[column] == var->varattno)
+		if (scan->source_attnums[column] == var->varattno)
 			return column;
 	}
 	return -1;
@@ -428,11 +430,11 @@ prepare_column(ActiveBatch *active, int column,
 	ArrowArray *source;
 	ArrowArray *window;
 
-	if (column < 0 || column >= scan->request->ncolumns)
+	if (column < 0 || column >= scan->ncolumns)
 		elog(ERROR, "pg_batch_fdw compact column %d is out of range", column + 1);
 	if (active->prepared[column])
 		return;
-	attnum = scan->request->source_attnums[column];
+	attnum = scan->source_attnums[column];
 	source = decode_column(scan, attnum, phase);
 	window = &active->columns[column];
 	*window = *source;
@@ -465,10 +467,10 @@ get_arrow_column(PgBatch *bridge_batch, int column,
 	PgBatchFdwScan *scan = active->scan;
 	AttrNumber	attnum;
 
-	if (column < 0 || column >= scan->request->ncolumns ||
+	if (column < 0 || column >= scan->ncolumns ||
 		!active->prepared[column])
 		elog(ERROR, "pg_batch_fdw column %d has not been prepared", column + 1);
-	attnum = scan->request->source_attnums[column];
+	attnum = scan->source_attnums[column];
 	view->array = &active->columns[column];
 	view->schema = scan->reader.schema.children[attnum - 1];
 }
@@ -498,16 +500,15 @@ static const PgBatchInt4VectorInterface int4_interface = {
 	.get_column = get_int4_column,
 };
 
-static const void *
-get_native_interface(PgBatch *batch, const char *name,
-					 uint32 version)
+static const PgBatchNativeInterface *
+get_native_interface(const PgBatchNativeType *type)
 {
-	if (version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
-		strcmp(name, PG_BATCH_INT4_VECTOR_INTERFACE_NAME) == 0)
-		return &int4_interface;
-	if (version == PG_BATCH_ARROW_INTERFACE_VERSION &&
-		strcmp(name, PG_BATCH_ARROW_INTERFACE_NAME) == 0)
-		return &arrow_interface;
+	if (type->abi_version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
+		strcmp(type->name, PG_BATCH_INT4_VECTOR_INTERFACE_NAME) == 0)
+		return (const PgBatchNativeInterface *) &int4_interface;
+	if (type->abi_version == PG_BATCH_ARROW_INTERFACE_VERSION &&
+		strcmp(type->name, PG_BATCH_ARROW_INTERFACE_NAME) == 0)
+		return (const PgBatchNativeInterface *) &arrow_interface;
 	return NULL;
 }
 
@@ -601,6 +602,8 @@ PgBatchFdwScan *
 pg_batch_fdw_scan_begin(Relation relation, PlanState *parent,
 						Node *source_private, List *source_exprs,
 						const PgBatchRequest *request,
+						const AttrNumber *source_attnums,
+						int nsource_columns,
 						MemoryContext query_context)
 {
 	MemoryContext context;
@@ -627,6 +630,8 @@ pg_batch_fdw_scan_begin(Relation relation, PlanState *parent,
 	scan->relation = relation;
 	scan->econtext = parent->ps_ExprContext;
 	scan->request = request;
+	scan->source_attnums = source_attnums;
+	scan->ncolumns = nsource_columns;
 	scan->record_columns = palloc0_array(ArrowArray, natts);
 	scan->record_decoded = palloc0_array(bool, natts);
 	scan->nquals = list_length(specs);
@@ -637,7 +642,7 @@ pg_batch_fdw_scan_begin(Relation relation, PlanState *parent,
 
 		qual->expr = pg_batch_expr_compile_filter(
 			list_nth(source_exprs, exprno), parent, resolve_source_var,
-			(void *) request);
+			scan);
 		qual->column = pg_batch_expr_input_column(qual->expr);
 		qual->column_mask = bms_make_singleton(qual->column);
 	}
@@ -656,7 +661,7 @@ pg_batch_fdw_scan_next(PgBatchFdwScan *scan)
 {
 	ActiveBatch *active;
 	int			nrows;
-	int			ncolumns = scan->request->ncolumns;
+	int			ncolumns = scan->ncolumns;
 
 	if (scan->active != NULL)
 		elog(ERROR, "pg_batch_fdw batch was not released by its consumer");
@@ -673,7 +678,9 @@ pg_batch_fdw_scan_next(PgBatchFdwScan *scan)
 		active = MemoryContextAllocZero(scan->batch_context, sizeof(*active));
 		active->scan = scan;
 		active->start = scan->record_offset;
-		nrows = Min(PG_BATCH_FDW_BATCH_SIZE,
+		nrows = Min(scan->request->max_rows > 0 ?
+					Min(scan->request->max_rows, PG_BATCH_FDW_BATCH_SIZE) :
+					PG_BATCH_FDW_BATCH_SIZE,
 					scan->record_length - scan->record_offset);
 		if (ncolumns > 0)
 		{
@@ -762,6 +769,7 @@ pg_batch_fdw_begin_foreign_scan(ForeignScanState *node, int eflags)
 	ForeignScan *plan = castNode(ForeignScan, node->ss.ps.plan);
 	MemoryContext oldcontext;
 	PgBatchRequest *request;
+	PgBatchLayout *layout;
 	AttrNumber *attnums;
 	int			natts;
 
@@ -770,15 +778,20 @@ pg_batch_fdw_begin_foreign_scan(ForeignScanState *node, int eflags)
 	natts = RelationGetNumberOfAttributes(node->ss.ss_currentRelation);
 	oldcontext = MemoryContextSwitchTo(node->ss.ps.state->es_query_cxt);
 	request = palloc0_object(PgBatchRequest);
+	request->struct_size = sizeof(*request);
+	layout = palloc0_object(PgBatchLayout);
+	layout->struct_size = sizeof(*layout);
+	layout->ncolumns = natts;
+	layout->ntargets = natts;
+	request->layout = layout;
 	attnums = palloc_array(AttrNumber, natts);
 	for (int i = 0; i < natts; i++)
 		attnums[i] = i + 1;
-	request->source_attnums = attnums;
-	request->ncolumns = natts;
 	node->fdw_state = pg_batch_fdw_scan_begin(node->ss.ss_currentRelation,
 										  &node->ss.ps,
 										  (Node *) plan->fdw_private,
 										  plan->fdw_exprs, request,
+										  attnums, natts,
 										  node->ss.ps.state->es_query_cxt);
 	MemoryContextSwitchTo(oldcontext);
 }

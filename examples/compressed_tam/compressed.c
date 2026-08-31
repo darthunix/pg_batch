@@ -96,6 +96,7 @@ struct ActiveBatch
 	PgBatch bridge_batch;
 	CompressedScan *scan;
 	CompressedBatch *batch;
+	int			start;
 	uint64		selection;
 	ArrowColumn *arrow_columns;
 	DatumColumn *datum_columns;
@@ -608,9 +609,9 @@ column_values(ActiveBatch *active, CompressedColumn *stored)
 	if (stored->encoding == PG_BATCH_COMPRESS_PLAIN)
 		return (const int32 *) data;
 	decoded = MemoryContextAlloc(scan->batch_context,
-								 sizeof(int32) * active->bridge_batch.nrows);
+								 sizeof(int32) * active->batch->nrows);
 	decoded[0] = stored->base;
-	for (int row = 1; row < active->bridge_batch.nrows; row++)
+	for (int row = 1; row < active->batch->nrows; row++)
 	{
 		int32		delta = stored->encoding == PG_BATCH_COMPRESS_DELTA8 ?
 			((const int8 *) data)[row - 1] :
@@ -618,7 +619,7 @@ column_values(ActiveBatch *active, CompressedColumn *stored)
 
 		decoded[row] = decoded[row - 1] + delta;
 	}
-	scan->stats.arrow_decoded_values += active->bridge_batch.nrows;
+	scan->stats.arrow_decoded_values += active->batch->nrows;
 	return decoded;
 }
 
@@ -632,16 +633,16 @@ prepare_column(ActiveBatch *active, int column,
 	CompressedColumn *stored;
 	ArrowColumn *arrow;
 
-	if (column < 0 || column >= scan->request->ncolumns)
+	if (column < 0 || column >= scan->ncolumns)
 		elog(ERROR, "pg_batch column %d is out of range", column + 1);
 	arrow = &active->arrow_columns[column];
 	if (arrow->array.release != NULL)
 		return;
-	source_attnum = scan->request->source_attnums[column];
+	source_attnum = scan->source_attnums[column];
 	stored = &active->batch->columns[source_attnum - 1];
 	arrow->array.length = bridge_batch->nrows;
-	arrow->array.null_count = stored->null_count;
-	arrow->array.offset = 0;
+	arrow->array.null_count = stored->null_count == 0 ? 0 : -1;
+	arrow->array.offset = active->start;
 	arrow->array.n_buffers = 2;
 	arrow->array.buffers = arrow->buffers;
 	arrow->array.release = arrow_array_release;
@@ -681,7 +682,7 @@ get_arrow_column(PgBatch *bridge_batch,
 	CompressedScan *scan = active->scan;
 	ArrowColumn *arrow;
 
-	if (column < 0 || column >= scan->request->ncolumns)
+	if (column < 0 || column >= scan->ncolumns)
 		elog(ERROR, "pg_batch column %d is out of range", column + 1);
 	arrow = &active->arrow_columns[column];
 	if (arrow->array.release == NULL)
@@ -699,7 +700,7 @@ release_batch(PgBatch *bridge_batch)
 	if (active == NULL)
 		return;
 	scan = active->scan;
-	for (int column = 0; column < scan->request->ncolumns; column++)
+	for (int column = 0; column < scan->ncolumns; column++)
 	{
 		ArrowColumn *arrow = &active->arrow_columns[column];
 
@@ -750,7 +751,7 @@ get_datum_column(PgBatch *bridge_batch,
 	uint64		missing;
 
 	pg_batch_check_datum_vector(result);
-	if (column < 0 || column >= scan->request->ncolumns)
+	if (column < 0 || column >= scan->ncolumns)
 		elog(ERROR, "pg_batch column %d is out of range", column + 1);
 	prepare_column(active, column, phase);
 	get_arrow_column(bridge_batch, column, &view);
@@ -786,16 +787,15 @@ get_datum_column(PgBatch *bridge_batch,
 	result->nwords = 1;
 }
 
-static const void *
-get_native_interface(PgBatch *batch,
-					 const char *name, uint32 version)
+static const PgBatchNativeInterface *
+get_native_interface(const PgBatchNativeType *type)
 {
-	if (version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
-		strcmp(name, PG_BATCH_INT4_VECTOR_INTERFACE_NAME) == 0)
-		return &pg_batch_compressed_int4;
-	if (version == PG_BATCH_ARROW_INTERFACE_VERSION &&
-		strcmp(name, PG_BATCH_ARROW_INTERFACE_NAME) == 0)
-		return &pg_batch_compressed_arrow;
+	if (type->abi_version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
+		strcmp(type->name, PG_BATCH_INT4_VECTOR_INTERFACE_NAME) == 0)
+		return (const PgBatchNativeInterface *) &pg_batch_compressed_int4;
+	if (type->abi_version == PG_BATCH_ARROW_INTERFACE_VERSION &&
+		strcmp(type->name, PG_BATCH_ARROW_INTERFACE_NAME) == 0)
+		return (const PgBatchNativeInterface *) &pg_batch_compressed_arrow;
 	return NULL;
 }
 
@@ -809,7 +809,7 @@ static const PgBatchOps pg_batch_compressed_batch_ops = {
 
 static void
 load_batch(CompressedScan *scan,
-		   CompressedBatch *batch)
+		   CompressedBatch *batch, int start, int nrows)
 {
 	ActiveBatch *active;
 
@@ -818,16 +818,17 @@ load_batch(CompressedScan *scan,
 	active = MemoryContextAllocZero(scan->batch_context, sizeof(*active));
 	active->scan = scan;
 	active->batch = batch;
+	active->start = start;
 	active->arrow_columns = MemoryContextAllocZero(scan->batch_context,
 												   sizeof(ArrowColumn) *
-												   scan->request->ncolumns);
+												   scan->ncolumns);
 	active->datum_columns = MemoryContextAllocZero(scan->batch_context,
 												   sizeof(DatumColumn) *
-												   scan->request->ncolumns);
-	active->selection = PG_BATCH_ALL_ROWS >> (PG_BATCH_SIZE - batch->nrows);
+												   scan->ncolumns);
+	active->selection = PG_BATCH_ALL_ROWS >> (PG_BATCH_SIZE - nrows);
 	active->bridge_batch.abi_version = PG_BATCH_ABI_VERSION;
 	active->bridge_batch.struct_size = sizeof(PgBatch);
-	active->bridge_batch.nrows = batch->nrows;
+	active->bridge_batch.nrows = nrows;
 	active->bridge_batch.nwords = 1;
 	active->bridge_batch.selection = &active->selection;
 	active->bridge_batch.table_oid = scan->relation->relid;
@@ -909,15 +910,28 @@ pg_batch_compressed_scan_next(PgBatchBinding *binding,
 				else
 					scan->stats.groups_skipped_membership++;
 				scan->batch_index = end_batch;
+				scan->batch_row = 0;
 			}
 		}
 		if (scan->batch_index < end_batch)
 		{
 			CompressedBatch *stored_batch =
-				compressed->batches[scan->batch_index++];
+				compressed->batches[scan->batch_index];
+			int			start = scan->batch_row;
+			int			nrows = Min(scan->request->max_rows > 0 ?
+								Min(scan->request->max_rows, PG_BATCH_SIZE) :
+								PG_BATCH_SIZE,
+							stored_batch->nrows - start);
 
-			load_batch(scan, stored_batch);
-			scan->stats.encoded_bytes_touched += stored_batch->bytes;
+			load_batch(scan, stored_batch, start, nrows);
+			if (start == 0)
+				scan->stats.encoded_bytes_touched += stored_batch->bytes;
+			scan->batch_row += nrows;
+			if (scan->batch_row == stored_batch->nrows)
+			{
+				scan->batch_index++;
+				scan->batch_row = 0;
+			}
 			if (scan->mode == PG_BATCH_TAM_FILTER)
 			{
 				ResetExprContext(scan->econtext);

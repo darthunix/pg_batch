@@ -16,19 +16,43 @@ PG_FUNCTION_INFO_V1(pg_batch_input_api_test);
 PG_FUNCTION_INFO_V1(pg_batch_output_test);
 PG_FUNCTION_INFO_V1(pg_batch_output_double_finish_test);
 PG_FUNCTION_INFO_V1(pg_batch_output_fast_select_after_finish_test);
+PG_FUNCTION_INFO_V1(pg_batch_output_over_max_test);
 PG_FUNCTION_INFO_V1(pg_batch_output_select_after_finish_test);
-PG_FUNCTION_INFO_V1(pg_batch_request_port_test);
+PG_FUNCTION_INFO_V1(pg_batch_binding_request_test);
+PG_FUNCTION_INFO_V1(pg_batch_request_after_seal_test);
+
+static void
+accept_nothing(TupleTableSlot *slot, PgBatch *batch)
+{
+	(void) slot;
+	(void) batch;
+}
+
+static void
+select_nothing(TupleTableSlot *slot, PgBatch *batch, int row)
+{
+	(void) slot;
+	(void) batch;
+	(void) row;
+}
+
+static const PgBatchConsumerOps test_consumer_ops = {
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_CONSUMER_OPS_ABI_VERSION,
+		PgBatchConsumerOps),
+	.accept_batch = accept_nothing,
+	.select_row = select_nothing,
+};
 
 Datum
 pg_batch_input_api_test(PG_FUNCTION_ARGS)
 {
 	PgBatchInput *(*volatile create_fn) (MemoryContext,
-		const PgBatchAPI *, struct PlanState *, const char *) =
+		struct PlanState *, const char *) =
 		pg_batch_input_create;
 	PgBatchBinding *(*volatile binding_fn) (PgBatchInput *) =
 		pg_batch_input_request_binding;
-	void		(*volatile request_fn) (PgBatchInput *, const PgBatchRequest *,
-		bool) = pg_batch_input_forward_request;
+	void		(*volatile request_fn) (PgBatchInput *, const Bitmapset *,
+		const Bitmapset *, bool, int) = pg_batch_input_set_request;
 	bool		(*volatile next_fn) (PgBatchInput *, PgBatchInputBatch *) =
 		pg_batch_input_next;
 	TupleTableSlot *(*volatile select_fn) (PgBatchInput *, int) =
@@ -181,22 +205,23 @@ pg_batch_datum_buffer_test(PG_FUNCTION_ARGS)
 }
 
 Datum
-pg_batch_request_port_test(PG_FUNCTION_ARGS)
+pg_batch_binding_request_test(PG_FUNCTION_ARGS)
 {
 	MemoryContext context;
 	MemoryContext oldcontext;
 	TupleDesc	desc;
 	TupleTableSlot *slot;
-	PgBatchRequestPort *port;
+	PgBatchBinding *binding;
 	const PgBatchRequest *request;
 	const PgBatchAPI *api = pg_batch_api_get();
-	AttrNumber	attnums[2] = {3, 7};
+	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
+	int			target_columns[2] = {0, 2};
 	Bitmapset  *filters = bms_make_singleton(0);
-	Bitmapset  *projects = bms_make_singleton(1);
+	Bitmapset  *projects = bms_make_singleton(2);
 	bool		ok;
 
 	context = AllocSetContextCreate(CurrentMemoryContext,
-		"pg_batch request port test", ALLOCSET_DEFAULT_SIZES);
+		"pg_batch binding request test", ALLOCSET_DEFAULT_SIZES);
 	oldcontext = MemoryContextSwitchTo(context);
 	desc = CreateTemplateTupleDesc(2);
 	TupleDescInitEntry(desc, 1, "one", INT4OID, -1, 0);
@@ -204,22 +229,49 @@ pg_batch_request_port_test(PG_FUNCTION_ARGS)
 	TupleDescFinalize(desc);
 	desc = BlessTupleDesc(desc);
 	slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
-	port = pg_batch_request_port_create(context, api, slot, attnums, 2);
-	pg_batch_request_port_set_request(port, filters, projects, true);
-	request = pg_batch_request_port_request(port);
-	ok = pg_batch_request_port_binding(port) == api->find_binding(slot) &&
+	layout.ncolumns = 3;
+	layout.ntargets = 2;
+	layout.target_columns = target_columns;
+	binding = api->attach_slot(slot, &layout, &test_consumer_ops);
+	/* The binding owns its copy of the target mapping. */
+	target_columns[1] = 1;
+	api->set_request(binding, filters, projects, true, 17);
+	request = api->seal_request(binding);
+	ok = binding == api->find_binding(slot) &&
 		request->struct_size >= PG_BATCH_REQUEST_MIN_SIZE &&
-		request->ncolumns == 2 && request->source_attnums[0] == 3 &&
-		request->source_attnums[1] == 7 && request->return_batch &&
+		request->layout->ncolumns == 3 && request->layout->ntargets == 2 &&
+		pg_batch_layout_column(request->layout, 1) == 2 &&
+		request->return_batch && request->max_rows == 17 &&
 		bms_equal(request->filter_columns, filters) &&
 		bms_equal(request->project_columns, projects) &&
-		api->get_batch(pg_batch_request_port_binding(port)) == NULL;
+		api->get_batch(binding) == NULL;
 	bms_free(filters);
 	bms_free(projects);
 	ExecDropSingleTupleTableSlot(slot);
 	MemoryContextSwitchTo(oldcontext);
 	MemoryContextDelete(context);
 	PG_RETURN_BOOL(ok);
+}
+
+Datum
+pg_batch_request_after_seal_test(PG_FUNCTION_ARGS)
+{
+	TupleDesc	desc = CreateTemplateTupleDesc(1);
+	TupleTableSlot *slot;
+	const PgBatchAPI *api = pg_batch_api_get();
+	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
+	PgBatchBinding *binding;
+
+	TupleDescInitEntry(desc, 1, "one", INT4OID, -1, 0);
+	TupleDescFinalize(desc);
+	desc = BlessTupleDesc(desc);
+	slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	layout.ncolumns = 1;
+	layout.ntargets = 1;
+	binding = api->attach_slot(slot, &layout, &test_consumer_ops);
+	api->seal_request(binding);
+	api->set_request(binding, NULL, NULL, false, 0);
+	PG_RETURN_VOID();
 }
 
 Datum
@@ -236,7 +288,7 @@ pg_batch_output_test(PG_FUNCTION_ARGS)
 	PgBatch *batch;
 	PgBatchRowView view = PG_BATCH_STRUCT_INITIALIZER(PgBatchRowView);
 	const PgBatchAPI *api = pg_batch_api_get();
-	AttrNumber	attnums[2] = {1, 2};
+	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
 	bool		ok = true;
 
 	context = AllocSetContextCreate(CurrentMemoryContext,
@@ -256,9 +308,11 @@ pg_batch_output_test(PG_FUNCTION_ARGS)
 		pg_batch_datum_buffer_append_slot(buffer, input_slot);
 	}
 	batch = pg_batch_datum_buffer_finish(buffer, 42);
-	output = pg_batch_output_create(context, api, output_slot, attnums, 2);
+	layout.ncolumns = 2;
+	layout.ntargets = 2;
+	output = pg_batch_output_create(context, output_slot, &layout);
 	binding = pg_batch_output_binding(output);
-	api->set_request(binding, NULL, NULL, false);
+	pg_batch_output_set_request(output, NULL, NULL, false, 3);
 	if (pg_batch_output_publish(output, batch) != output_slot ||
 		DatumGetInt32(output_slot->tts_values[0]) != 1 ||
 		!output_slot->tts_isnull[1])
@@ -287,8 +341,41 @@ pg_batch_output_test(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(ok);
 }
 
+Datum
+pg_batch_output_over_max_test(PG_FUNCTION_ARGS)
+{
+	MemoryContext context = AllocSetContextCreate(CurrentMemoryContext,
+		"pg_batch output maximum test", ALLOCSET_DEFAULT_SIZES);
+	TupleDesc	desc = CreateTemplateTupleDesc(2);
+	TupleTableSlot *input_slot;
+	TupleTableSlot *output_slot;
+	PgBatchDatumBuffer *buffer;
+	PgBatchOutput *output;
+	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
+
+	TupleDescInitEntry(desc, 1, "number", INT4OID, -1, 0);
+	TupleDescInitEntry(desc, 2, "label", TEXTOID, -1, 0);
+	TupleDescFinalize(desc);
+	desc = BlessTupleDesc(desc);
+	input_slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	output_slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
+	buffer = pg_batch_datum_buffer_create(context, desc, 2, 2);
+	for (int row = 0; row < 2; row++)
+	{
+		store_test_row(input_slot, row);
+		pg_batch_datum_buffer_append_slot(buffer, input_slot);
+	}
+	layout.ncolumns = 2;
+	layout.ntargets = 2;
+	output = pg_batch_output_create(context, output_slot, &layout);
+	pg_batch_output_set_request(output, NULL, NULL, true, 1);
+	pg_batch_output_publish(output,
+		pg_batch_datum_buffer_finish(buffer, InvalidOid));
+	PG_RETURN_VOID();
+}
+
 static PgBatchOutput *
-make_active_output(MemoryContext context, const PgBatchAPI *api)
+make_active_output(MemoryContext context)
 {
 	TupleDesc	desc;
 	TupleTableSlot *input_slot;
@@ -296,7 +383,7 @@ make_active_output(MemoryContext context, const PgBatchAPI *api)
 	PgBatchDatumBuffer *buffer;
 	PgBatchOutput *output;
 	PgBatch *batch;
-	AttrNumber	attnums[2] = {1, 2};
+	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
 
 	desc = CreateTemplateTupleDesc(2);
 	TupleDescInitEntry(desc, 1, "number", INT4OID, -1, 0);
@@ -309,15 +396,17 @@ make_active_output(MemoryContext context, const PgBatchAPI *api)
 	store_test_row(input_slot, 0);
 	pg_batch_datum_buffer_append_slot(buffer, input_slot);
 	batch = pg_batch_datum_buffer_finish(buffer, InvalidOid);
-	output = pg_batch_output_create(context, api, output_slot, attnums, 2);
+	layout.ncolumns = 2;
+	layout.ntargets = 2;
+	output = pg_batch_output_create(context, output_slot, &layout);
 	pg_batch_output_publish(output, batch);
 	return output;
 }
 
 static PgBatchOutput *
-make_finished_output(MemoryContext context, const PgBatchAPI *api)
+make_finished_output(MemoryContext context)
 {
-	PgBatchOutput *output = make_active_output(context, api);
+	PgBatchOutput *output = make_active_output(context);
 
 	pg_batch_output_finish(output);
 	return output;
@@ -326,10 +415,9 @@ make_finished_output(MemoryContext context, const PgBatchAPI *api)
 Datum
 pg_batch_output_double_finish_test(PG_FUNCTION_ARGS)
 {
-	const PgBatchAPI *api = pg_batch_api_get();
 	MemoryContext context = AllocSetContextCreate(CurrentMemoryContext,
 		"pg_batch double finish test", ALLOCSET_DEFAULT_SIZES);
-	PgBatchOutput *output = make_finished_output(context, api);
+	PgBatchOutput *output = make_finished_output(context);
 
 	pg_batch_output_finish(output);
 	PG_RETURN_VOID();
@@ -338,10 +426,9 @@ pg_batch_output_double_finish_test(PG_FUNCTION_ARGS)
 Datum
 pg_batch_output_select_after_finish_test(PG_FUNCTION_ARGS)
 {
-	const PgBatchAPI *api = pg_batch_api_get();
 	MemoryContext context = AllocSetContextCreate(CurrentMemoryContext,
 		"pg_batch select after finish test", ALLOCSET_DEFAULT_SIZES);
-	PgBatchOutput *output = make_finished_output(context, api);
+	PgBatchOutput *output = make_finished_output(context);
 
 	pg_batch_output_select(output, 0);
 	PG_RETURN_VOID();
@@ -353,7 +440,7 @@ pg_batch_output_fast_select_after_finish_test(PG_FUNCTION_ARGS)
 	const PgBatchAPI *api = pg_batch_api_get();
 	MemoryContext context = AllocSetContextCreate(CurrentMemoryContext,
 		"pg_batch fast select after finish test", ALLOCSET_DEFAULT_SIZES);
-	PgBatchOutput *output = make_active_output(context, api);
+	PgBatchOutput *output = make_active_output(context);
 	PgBatchRowView view = PG_BATCH_STRUCT_INITIALIZER(PgBatchRowView);
 
 	api->get_row_view(pg_batch_output_binding(output), &view);

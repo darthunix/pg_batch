@@ -86,6 +86,8 @@ provider_begin_scan(const PgBatchSourceExecRequest *request)
 								   request->source_private,
 								   request->source_exprs,
 								   request->slot_request,
+								   request->source_attnums,
+								   request->nsource_columns,
 								   request->query_context);
 }
 

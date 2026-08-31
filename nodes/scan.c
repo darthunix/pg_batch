@@ -145,6 +145,8 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 		request.source_exprs = source_exprs;
 		request.query_context = estate->es_query_cxt;
 		request.slot_request = state->request;
+		request.source_attnums = bslot->source_attnums;
+		request.nsource_columns = bslot->ncolumns;
 		state->provider_state = state->provider->begin_scan(&request);
 		pg_batch_api->set_provider(binding, provider_name,
 									  state->provider_state);
@@ -201,13 +203,13 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 	 */
 	for (int q = 0; q < state->nquals; q++)
 	{
-		AttrNumber current_attnum = state->request->source_attnums[
+		AttrNumber current_attnum = bslot->source_attnums[
 			state->quals[q].column];
 
 		for (int future = q; future < state->nquals; future++)
 		{
 			int			column = state->quals[future].column;
-			AttrNumber attnum = state->request->source_attnums[column];
+			AttrNumber attnum = bslot->source_attnums[column];
 
 			if (future == q || attnum <= current_attnum)
 			{
@@ -338,7 +340,9 @@ next_batch(BatchScanState *state, PgBatchSlot *bslot)
 				continue;
 		}
 
-		nrows = Min(PG_BATCH_SIZE,
+		nrows = Min(state->request->max_rows > 0 ?
+					Min(state->request->max_rows, PG_BATCH_SIZE) :
+					PG_BATCH_SIZE,
 					(int) hscan->rs_ntuples - state->next_page_row);
 		/* The core callback counted the first row of the first batch. */
 		for (int i = state->first_batch_on_page ? 1 : 0; i < nrows; i++)

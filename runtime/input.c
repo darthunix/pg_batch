@@ -10,6 +10,7 @@ struct PgBatchInput
 	const PgBatchAPI *api;
 	PlanState  *child;
 	PgBatchBinding *request_binding;
+	const PgBatchRequest *request;
 	TupleTableSlot *cached_slot;
 	PgBatchBinding *cached_binding;
 	TupleTableSlot *active_slot;
@@ -21,26 +22,38 @@ struct PgBatchInput
 
 PgBatchInput *
 pg_batch_input_create(MemoryContext parent_context,
-					  const PgBatchAPI *api,
 					  PlanState *child, const char *producer_name)
 {
 	PgBatchInput *input;
 	const PgBatchProducerOps *producer;
+	const PgBatchRequest *request;
 
-	if (parent_context == NULL || api == NULL || child == NULL ||
+	if (parent_context == NULL || child == NULL ||
 		producer_name == NULL || producer_name[0] == '\0')
-		elog(ERROR, "pg_batch input requires a context, API, child, and producer");
+		elog(ERROR, "pg_batch input requires a context, child, and producer");
 	input = MemoryContextAllocZero(parent_context, sizeof(*input));
-	input->api = api;
+	input->api = pg_batch_api_get();
 	input->child = child;
-	producer = api->get_producer(producer_name);
+	producer = input->api->get_producer(producer_name);
 	if (producer == NULL)
 		elog(ERROR, "pg_batch producer \"%s\" is not registered", producer_name);
 	input->request_binding = producer->get_request_binding(child);
 	if (input->request_binding == NULL)
 		elog(ERROR, "pg_batch producer \"%s\" has no request binding",
 			 producer_name);
+	input->request = input->api->get_request(input->request_binding);
+	request = input->request;
+	if (request == NULL || request->struct_size < PG_BATCH_REQUEST_MIN_SIZE)
+		elog(ERROR, "pg_batch producer \"%s\" returned an invalid request",
+			 producer_name);
+	pg_batch_check_layout(request->layout);
 	return input;
+}
+
+const PgBatchLayout *
+pg_batch_input_layout(PgBatchInput *input)
+{
+	return input->request->layout;
 }
 
 PgBatchBinding *
@@ -49,29 +62,20 @@ pg_batch_input_request_binding(PgBatchInput *input)
 	return input->request_binding;
 }
 
-void
-pg_batch_input_forward_request(PgBatchInput *input,
-							   const PgBatchRequest *request,
-							   bool return_batch)
+const PgBatchRequest *
+pg_batch_input_request(PgBatchInput *input)
 {
-	const PgBatchRequest *child_request;
-	Bitmapset  *filter_columns;
-	Bitmapset  *project_columns;
+	return input->request;
+}
 
-	if (request == NULL || request->struct_size < PG_BATCH_REQUEST_MIN_SIZE)
-		elog(ERROR, "pg_batch input received an incompatible request");
-	child_request = input->api->get_request(input->request_binding);
-	if (child_request == NULL ||
-		child_request->struct_size < PG_BATCH_REQUEST_MIN_SIZE)
-		elog(ERROR, "pg_batch producer returned an incompatible request");
-	filter_columns = bms_union(child_request->filter_columns,
-		request->filter_columns);
-	project_columns = bms_union(child_request->project_columns,
-		request->project_columns);
+void
+pg_batch_input_set_request(PgBatchInput *input,
+						   const Bitmapset *filter_columns,
+						   const Bitmapset *project_columns,
+						   bool return_batch, int max_rows)
+{
 	input->api->set_request(input->request_binding, filter_columns,
-		project_columns, return_batch);
-	bms_free(filter_columns);
-	bms_free(project_columns);
+		project_columns, return_batch, max_rows);
 }
 
 static bool

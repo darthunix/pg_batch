@@ -87,11 +87,12 @@ done:
 static int
 resolve_source_var(const Var *var, void *context)
 {
-	const PgBatchRequest *request = context;
+	const PgBatchSourceExecRequest *request = context;
 
-	if (var->varno == INDEX_VAR && var->varattno <= request->ncolumns)
+	if (var->varno == INDEX_VAR &&
+		var->varattno <= request->nsource_columns)
 		return var->varattno - 1;
-	for (int column = 0; column < request->ncolumns; column++)
+	for (int column = 0; column < request->nsource_columns; column++)
 	{
 		if (request->source_attnums[column] == var->varattno)
 			return column;
@@ -144,6 +145,8 @@ begin_scan(const PgBatchSourceExecRequest *request)
 	scan->cleanup.arg = scan;
 	MemoryContextRegisterResetCallback(context, &scan->cleanup);
 	scan->request = request->slot_request;
+	scan->source_attnums = request->source_attnums;
+	scan->ncolumns = request->nsource_columns;
 	scan->econtext = request->parent->ps_ExprContext;
 	scan->mode = intVal(linitial(private));
 	scan->nquals = list_length(specs);
@@ -161,7 +164,7 @@ begin_scan(const PgBatchSourceExecRequest *request)
 		{
 			qual->expr = pg_batch_expr_compile_filter(
 				list_nth(request->source_exprs, filter_exprno), request->parent,
-				resolve_source_var, (void *) request->slot_request);
+				resolve_source_var, (void *) request);
 			qual->column = pg_batch_expr_input_column(qual->expr);
 			qual->column_mask = bms_make_singleton(qual->column);
 		}
@@ -180,6 +183,7 @@ rescan(void *provider_state)
 
 	scan->group_index = 0;
 	scan->batch_index = 0;
+	scan->batch_row = 0;
 	scan->group_ready = false;
 	scan->prune_quals_ready = false;
 }

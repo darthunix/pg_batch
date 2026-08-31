@@ -25,19 +25,20 @@ compressed_getnextslot(TableScanDesc scan, ScanDirection direction,
 					   TupleTableSlot *slot)
 {
 	PgBatchBinding *binding = pg_batch_tam_api->find_binding(slot);
-	const PgBatchRequest *request =
-		pg_batch_tam_api->get_request(binding);
+	const char *provider_name = NULL;
+	void	   *provider_state =
+		pg_batch_tam_api->get_bound_provider(binding, &provider_name);
 
-	if (request == NULL || request->provider_name == NULL ||
-		strcmp(request->provider_name, PG_BATCH_TAM_PROVIDER_NAME) != 0)
+	if (provider_name == NULL ||
+		strcmp(provider_name, PG_BATCH_TAM_PROVIDER_NAME) != 0)
 		return heap_getnextslot(scan, direction, slot);
 	if (direction != ForwardScanDirection)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("pg_batch compressed scans support only forward scans")));
-	if (request->provider_state == NULL)
+	if (provider_state == NULL)
 		elog(ERROR, "pg_batch TAM request has no provider state");
-	return pg_batch_compressed_scan_next(binding, request->provider_state);
+	return pg_batch_compressed_scan_next(binding, provider_state);
 }
 
 static void

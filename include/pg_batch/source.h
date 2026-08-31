@@ -76,10 +76,13 @@ typedef struct PgBatchSourceExecRequest
 	List	   *source_exprs;
 	MemoryContext query_context;
 	const PgBatchRequest *slot_request;
+	/* Source-specific mapping from compact columns to physical attributes. */
+	const AttrNumber *source_attnums;
+	int			nsource_columns;
 } PgBatchSourceExecRequest;
 
 #define PG_BATCH_SOURCE_EXEC_REQUEST_MIN_SIZE \
-	PG_BATCH_ABI_SIZE_THROUGH(PgBatchSourceExecRequest, slot_request)
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchSourceExecRequest, nsource_columns)
 
 /*
  * Operations implemented by an independently built batch source.

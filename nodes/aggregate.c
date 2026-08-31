@@ -164,7 +164,7 @@ agg_begin(CustomScanState *node, EState *estate, int eflags)
 	pg_batch_init_children(node, estate, eflags);
 	state->child = linitial(node->custom_ps);
 	state->input = pg_batch_input_create(estate->es_query_cxt,
-		pg_batch_api, state->child, producer_name);
+		state->child, producer_name);
 	request_binding = pg_batch_input_request_binding(state->input);
 	request = pg_batch_api->get_request(request_binding);
 	project_columns = bms_copy(request->project_columns);
@@ -218,7 +218,7 @@ agg_begin(CustomScanState *node, EState *estate, int eflags)
 			state->inputs[agg->input].flags |= aggregate_flag(agg->kind);
 	}
 	pg_batch_api->set_request(request_binding, request->filter_columns,
-						 project_columns, true);
+						 project_columns, true, PG_BATCH_SIZE);
 	bms_free(project_columns);
 	if (state->grouped)
 	{

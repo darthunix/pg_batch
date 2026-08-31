@@ -83,13 +83,12 @@ static const PgBatchInt4VectorInterface projection_int4_interface = {
 	.get_column = projection_get_int4,
 };
 
-static const void *
-projection_get_native_interface(PgBatch *batch,
-								const char *name, uint32 version)
+static const PgBatchNativeInterface *
+projection_get_native_interface(const PgBatchNativeType *type)
 {
-	if (version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
-		strcmp(name, PG_BATCH_INT4_VECTOR_INTERFACE_NAME) == 0)
-		return &projection_int4_interface;
+	if (type->abi_version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
+		strcmp(type->name, PG_BATCH_INT4_VECTOR_INTERFACE_NAME) == 0)
+		return (const PgBatchNativeInterface *) &projection_int4_interface;
 	return NULL;
 }
 

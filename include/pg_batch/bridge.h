@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "batch.h"
+#include "layout.h"
 #include "nodes/pathnodes.h"
 #include "utils/rel.h"
 
@@ -42,33 +43,26 @@ struct PlanState;
 /*
  * Runtime request attached to one batch-aware TupleTableSlot.
  *
- * source_attnums maps each zero-based compact batch column to a one-based
- * physical relation attribute. filter_columns and project_columns use
- * compact column numbers; the latter are needed only for rows that survive
- * filtering. The bridge owns copies of the mapping and both bitmaps for the
- * lifetime of the binding.
- *
- * This differs from PgBatchSourcePlanRequest: this structure describes the
- * final slot layout and execution demand, not the planner's proposed clauses
- * and physical relation columns.
+ * layout describes logical columns shared by plan nodes. filter_columns and
+ * project_columns use these compact column numbers; projected columns are
+ * needed only for rows that survive filtering. max_rows is zero when the
+ * consumer has no batch-size limit.
  */
 typedef struct PgBatchRequest
 {
 	/* Actual size owned by the bridge; new fields are appended at the end. */
 	Size		struct_size;
-	const AttrNumber *source_attnums;
-	int			ncolumns;
+	const PgBatchLayout *layout;
 	const Bitmapset *filter_columns;
 	const Bitmapset *project_columns;
 	/* True when the parent consumes the slot as a batch, not as scalar rows. */
 	bool		return_batch;
-	/* Provider identity and opaque execution state, set after begin_scan(). */
-	const char *provider_name;
-	void	   *provider_state;
+	/* Maximum rows accepted in one batch, or zero for no explicit limit. */
+	int			max_rows;
 }			PgBatchRequest;
 
 #define PG_BATCH_REQUEST_MIN_SIZE \
-	PG_BATCH_ABI_SIZE_THROUGH(PgBatchRequest, provider_state)
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchRequest, max_rows)
 
 /*
  * Bridge entry points published through PG_BATCH_RENDEZVOUS. The table
@@ -106,23 +100,28 @@ typedef struct PgBatchAPI
 	 */
 	PgBatchBinding *(*find_binding) (TupleTableSlot *slot);
 	/*
-	 * Attach a new binding to slot and return it. The bridge copies
-	 * source_attnums into the slot's memory context and borrows consumer_ops.
-	 * Attaching the same slot twice is an error.
+	 * Attach a new binding to slot and return it. The bridge copies layout into
+	 * the slot's memory context and borrows consumer_ops. Attaching the same
+	 * slot twice is an error.
 	 */
 	PgBatchBinding *(*attach_slot) (TupleTableSlot *slot,
-									const AttrNumber *source_attnums,
-									int ncolumns,
+									const PgBatchLayout *layout,
 									const PgBatchConsumerOps *consumer_ops);
-	/* Replace the request masks with bridge-owned copies and set its mode. */
+	/* Replace the request before it is sealed; masks are copied by the bridge. */
 	void		(*set_request) (PgBatchBinding *binding,
 								 const Bitmapset *filter_columns,
 								 const Bitmapset *project_columns,
-								 bool return_batch);
-	/* Store the borrowed provider identity and scan state in the request. */
+								 bool return_batch,
+								 int max_rows);
+	/* Store borrowed provider identity and execution state on the binding. */
 	void		(*set_provider) (PgBatchBinding *binding,
 								  const char *provider_name,
 								  void *provider_state);
+	/* Return the bound provider state and optionally its stable name. */
+	void	   *(*get_bound_provider) (PgBatchBinding *binding,
+									 const char **provider_name);
+	/* Freeze the request and return its borrowed read-only representation. */
+	const PgBatchRequest *(*seal_request) (PgBatchBinding *binding);
 	/* Return the binding's borrowed, read-only runtime request, or NULL. */
 	const PgBatchRequest *(*get_request) (PgBatchBinding *binding);
 

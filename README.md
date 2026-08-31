@@ -37,7 +37,9 @@ examples/limit_node/ ----------/-----------------/
   borrowed vector views, an owned Datum buffer for collecting scalar slots,
   and opaque input/output objects for connecting batch producers and
   consumers.
-  `kernels/` provides type-specific operations over those views. `expr/`
+  It also provides `PgBatchPass` for selection-changing nodes that preserve a
+  child's batch. `kernels/` provides type-specific operations over those
+  views. `expr/`
   compiles a deliberately small class of PostgreSQL expressions into reusable
   vector operations and provides lazy projected batches. `spill/` provides
   bounded buffered partitions and dense 64-row blocks shared by stateful
@@ -78,7 +80,9 @@ format-neutral fallback for ordinary PostgreSQL consumers. A batch may also
 publish optional named native interfaces. The test columnar sources and
 computed projections publish a common `int4` vector view in addition to Arrow
 C Data where applicable. Filters and aggregates therefore consume packed
-values directly without depending on one source format.
+values directly without depending on one source format. Native capabilities
+belong to a batch operations table, so the runtime validates and caches each
+typed interface once instead of rediscovering it for every batch.
 
 The attachment lookup is only for boundaries that receive an ordinary
 `TupleTableSlot *`, such as a table access method callback. It returns an
@@ -95,8 +99,17 @@ For scalar expressions it can borrow one `PgBatchRowView` per batch and select
 rows through the consumer directly, avoiding a bridge call in the hot loop.
 `PgBatchOutput` publishes batches to another batch-aware node or exposes the
 selected rows through the same slot to an ordinary row-at-a-time parent.
-`PgBatchRequestPort` is the smaller alternative for a pass-through node: it
-receives a parent's request but never pretends to own an output batch.
+`PgBatchPass` implements the common case where a node keeps the child's batch
+representation and only changes its row selection. The node supplies one
+batch callback; the runtime forwards column and batch-size requests and owns
+the scalar/batch, finish, rescan, and instrumentation bookkeeping.
+
+`PgBatchLayout` separates compact batch columns from plan target-list
+positions. This preserves hidden filter columns across pass-through nodes
+without making them visible in the tuple descriptor. `PgBatchRequest` uses
+that logical layout, separate filter and lazy-projection masks, and an optional
+maximum batch size. The request becomes immutable before execution starts, so
+a source can safely retain it for the scan lifetime.
 
 A published `PgBatch` has one logical owner. That owner may only remove rows
 from `selection`; it cannot restore a bit cleared by an earlier node. Passing

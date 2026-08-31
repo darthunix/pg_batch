@@ -59,12 +59,15 @@ typedef struct CompressedScan
 	MemoryContext batch_context;
 	CompressedRelation *relation;
 	const PgBatchRequest *request;
+	const AttrNumber *source_attnums;
+	int			ncolumns;
 	ExprContext *econtext;
 	SourceQual *quals;
 	int			nquals;
 	SourceScanMode mode;
 	int			group_index;
 	int			batch_index;
+	int			batch_row;
 	bool		group_ready;
 	bool		prune_quals_ready;
 	bool		relation_acquired;

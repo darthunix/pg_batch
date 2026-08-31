@@ -139,22 +139,32 @@ source_attnum_column(List *source_attnums, AttrNumber attnum)
 }
 
 static void
-nodes_get_output_layout(const Plan *plan,
-						PgBatchOutputLayout *result)
+nodes_get_layout(const Plan *plan, PgBatchLayout *result)
 {
 	const CustomScan *scan;
 	int		   *columns;
 	int			column = 0;
 
-	if (result == NULL || result->struct_size < PG_BATCH_OUTPUT_LAYOUT_MIN_SIZE)
+	if (result == NULL || result->struct_size < PG_BATCH_LAYOUT_MIN_SIZE)
 		elog(ERROR, "pg_batch producer received an incompatible output layout");
 	if (!IsA(plan, CustomScan))
 		elog(ERROR, "pg_batch producer expected a custom plan");
 	scan = castNode(CustomScan, plan);
 	columns = palloc_array(int, list_length(plan->targetlist));
-	if (scan->methods == &pg_batch_filter_plan_methods)
+	if (scan->methods == &pg_batch_scan_plan_methods)
+	{
+		result->ncolumns = list_length(linitial(scan->custom_private));
+		while (column < list_length(plan->targetlist))
+		{
+			columns[column] = column;
+			column++;
+		}
+	}
+	else if (scan->methods == &pg_batch_filter_plan_methods)
 	{
 		List	   *source_attnums = linitial(scan->custom_private);
+
+		result->ncolumns = list_length(source_attnums);
 
 		foreach_ptr(TargetEntry, tle, plan->targetlist)
 		{
@@ -173,6 +183,7 @@ nodes_get_output_layout(const Plan *plan,
 			 scan->methods == &pg_batch_project_plan_methods ||
 			 scan->methods == &pg_batch_pack_plan_methods)
 	{
+		result->ncolumns = list_length(plan->targetlist);
 		while (column < list_length(plan->targetlist))
 		{
 			columns[column] = column;
@@ -181,8 +192,8 @@ nodes_get_output_layout(const Plan *plan,
 	}
 	else
 		elog(ERROR, "pg_batch producer received an unknown custom plan");
-	result->ncolumns = column;
-	result->batch_columns = columns;
+	result->ntargets = column;
+	result->target_columns = columns;
 }
 
 static PgBatchBinding *
@@ -201,7 +212,7 @@ const PgBatchProducerOps pg_batch_producer_ops = {
 		PgBatchProducerOps),
 	.producer_name = PG_BATCH_PRODUCER_NAME,
 	.supports_path = nodes_supports_batch_path,
-	.get_output_layout = nodes_get_output_layout,
+	.get_layout = nodes_get_layout,
 	.get_request_binding = nodes_get_request_binding,
 };
 
@@ -1393,8 +1404,7 @@ plan_project(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	Plan	   *child;
 	const char *producer_name = strVal(linitial(best_path->custom_private));
 	const PgBatchProducerOps *producer;
-	PgBatchOutputLayout layout =
-		PG_BATCH_STRUCT_INITIALIZER(PgBatchOutputLayout);
+	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
 	List	   *input_columns = NIL;
 	List	   *expressions = NIL;
 
@@ -1405,14 +1415,14 @@ plan_project(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	if (producer == NULL)
 		elog(ERROR, "pg_batch producer \"%s\" is not registered",
 			 producer_name);
-	producer->get_output_layout(child, &layout);
-	if (layout.ncolumns != list_length(child->targetlist) ||
-		(layout.ncolumns > 0 && layout.batch_columns == NULL))
+	producer->get_layout(child, &layout);
+	pg_batch_check_layout(&layout);
+	if (layout.ntargets != list_length(child->targetlist))
 		elog(ERROR, "pg_batch producer \"%s\" returned an invalid output layout",
 			 producer_name);
-	for (int position = 0; position < layout.ncolumns; position++)
+	for (int position = 0; position < layout.ntargets; position++)
 		input_columns = lappend_int(input_columns,
-									layout.batch_columns[position]);
+									pg_batch_layout_column(&layout, position));
 	foreach_ptr(TargetEntry, tle, tlist)
 		expressions = lappend(expressions, copyObject(tle->expr));
 
@@ -1448,17 +1458,16 @@ append_side_layout(Plan *child, const char *producer_name, List **raw_tlist)
 {
 	const PgBatchProducerOps *producer =
 		pg_batch_api->get_producer(producer_name);
-	PgBatchOutputLayout layout =
-		PG_BATCH_STRUCT_INITIALIZER(PgBatchOutputLayout);
+	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
 	List	   *batch_columns = NIL;
 	int			position = 0;
 
 	if (producer == NULL)
 		elog(ERROR, "pg_batch producer \"%s\" is not registered",
 			 producer_name);
-	producer->get_output_layout(child, &layout);
-	if (layout.ncolumns != list_length(child->targetlist) ||
-		(layout.ncolumns > 0 && layout.batch_columns == NULL))
+	producer->get_layout(child, &layout);
+	pg_batch_check_layout(&layout);
+	if (layout.ntargets != list_length(child->targetlist))
 		elog(ERROR, "pg_batch producer \"%s\" returned an invalid output layout",
 			 producer_name);
 	foreach_ptr(TargetEntry, tle, child->targetlist)
@@ -1468,7 +1477,7 @@ append_side_layout(Plan *child, const char *producer_name, List **raw_tlist)
 
 		if (exprType(expr) != INT4OID)
 			elog(ERROR, "pg_batch hash join child produced a non-int4 column");
-		if (layout.batch_columns[position] < 0)
+		if (pg_batch_layout_column(&layout, position) < 0)
 			elog(ERROR, "pg_batch producer \"%s\" omitted an output column",
 				 producer_name);
 		raw = makeTargetEntry((Expr *) copyObject(tle->expr),
@@ -1476,7 +1485,7 @@ append_side_layout(Plan *child, const char *producer_name, List **raw_tlist)
 							  NULL, false);
 		*raw_tlist = lappend(*raw_tlist, raw);
 		batch_columns = lappend_int(batch_columns,
-									layout.batch_columns[position]);
+									pg_batch_layout_column(&layout, position));
 		position++;
 	}
 	return batch_columns;
@@ -1581,8 +1590,7 @@ plan_aggregate(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	const char *producer_name = strVal(linitial(best_path->custom_private));
 	List	   *agg_specs = lsecond_node(List, best_path->custom_private);
 	const PgBatchProducerOps *producer;
-	PgBatchOutputLayout layout =
-		PG_BATCH_STRUCT_INITIALIZER(PgBatchOutputLayout);
+	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
 	List	   *runtime_specs = NIL;
 
 	Assert(list_length(custom_plans) == 1);
@@ -1593,9 +1601,9 @@ plan_aggregate(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	if (producer == NULL)
 		elog(ERROR, "pg_batch producer \"%s\" is not registered",
 			 producer_name);
-	producer->get_output_layout(child, &layout);
-	if (layout.ncolumns != list_length(child->targetlist) ||
-		(layout.ncolumns > 0 && layout.batch_columns == NULL))
+	producer->get_layout(child, &layout);
+	pg_batch_check_layout(&layout);
+	if (layout.ntargets != list_length(child->targetlist))
 		elog(ERROR, "pg_batch producer \"%s\" returned an invalid output layout",
 			 producer_name);
 	foreach_ptr(List, spec, agg_specs)
@@ -1610,7 +1618,7 @@ plan_aggregate(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 													 expr);
 
 			if (position >= 0)
-				column = layout.batch_columns[position];
+				column = pg_batch_layout_column(&layout, position);
 			if (column < 0)
 				elog(ERROR, "pg_batch aggregate input is missing from child target");
 		}

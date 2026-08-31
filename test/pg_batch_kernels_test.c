@@ -19,7 +19,6 @@ typedef struct TestDatumSource
 	int64		packed_offset;
 	int			datum_calls;
 	int			native_calls;
-	bool		use_native;
 } TestDatumSource;
 
 static void
@@ -60,20 +59,21 @@ static const PgBatchInt4VectorInterface test_int4_interface = {
 	.get_column = test_get_int4_column,
 };
 
-static const void *
-test_get_native_interface(PgBatch *batch, const char *name,
-						  uint32 version)
+static const PgBatchNativeInterface *
+test_get_native_interface(const PgBatchNativeType *type)
 {
-	TestDatumSource *source = batch->private_data;
-
-	if (source->use_native &&
-		version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
-		strcmp(name, PG_BATCH_INT4_VECTOR_INTERFACE_NAME) == 0)
-		return &test_int4_interface;
+	if (type->abi_version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
+		strcmp(type->name, PG_BATCH_INT4_VECTOR_INTERFACE_NAME) == 0)
+		return (const PgBatchNativeInterface *) &test_int4_interface;
 	return NULL;
 }
 
 static const PgBatchOps test_batch_ops = {
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_OPS_ABI_VERSION, PgBatchOps),
+	.get_datum_column = test_get_datum_column,
+};
+
+static const PgBatchOps test_native_batch_ops = {
 	PG_BATCH_ABI_INITIALIZER(PG_BATCH_OPS_ABI_VERSION, PgBatchOps),
 	.get_datum_column = test_get_datum_column,
 	.get_native_interface = test_get_native_interface,
@@ -133,7 +133,7 @@ pg_batch_kernels_test(PG_FUNCTION_ARGS)
 								  packed_validity, 1);
 	if (source.datum_calls != 1 || source.native_calls != 0)
 		PG_RETURN_BOOL(false);
-	source.use_native = true;
+	batch.ops = &test_native_batch_ops;
 	pg_batch_get_int4_vector(&batch, 0, &datum_selection,
 		PG_BATCH_COLUMN_FILTER, &packed);
 	if (source.datum_calls != 1 || source.native_calls != 1 ||

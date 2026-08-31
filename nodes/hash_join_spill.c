@@ -102,13 +102,12 @@ static const PgBatchArrowInterface spill_arrow_interface = {
 	.get_column = spill_get_arrow_column,
 };
 
-static const void *
-spill_get_native_interface(PgBatch *batch, const char *name,
-						   uint32 version)
+static const PgBatchNativeInterface *
+spill_get_native_interface(const PgBatchNativeType *type)
 {
-	if (version == PG_BATCH_ARROW_INTERFACE_VERSION &&
-		strcmp(name, PG_BATCH_ARROW_INTERFACE_NAME) == 0)
-		return &spill_arrow_interface;
+	if (type->abi_version == PG_BATCH_ARROW_INTERFACE_VERSION &&
+		strcmp(type->name, PG_BATCH_ARROW_INTERFACE_NAME) == 0)
+		return (const PgBatchNativeInterface *) &spill_arrow_interface;
 	return NULL;
 }
 

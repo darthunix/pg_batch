@@ -5,7 +5,7 @@ runtime_lib = static_library(
   'datum_buffer.c',
   'input.c',
   'output.c',
-  'request.c',
+  'pass.c',
   dependencies: postgres_dep,
   include_directories: public_inc,
   gnu_symbol_visibility: 'hidden',
