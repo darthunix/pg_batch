@@ -97,8 +97,8 @@ spill_get_arrow_column(PgBatch *batch, int column,
 }
 
 static const PgBatchArrowInterface spill_arrow_interface = {
-	.abi_version = PG_BATCH_ARROW_INTERFACE_VERSION,
-	.struct_size = sizeof(PgBatchArrowInterface),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_ARROW_INTERFACE_VERSION,
+		PgBatchArrowInterface),
 	.get_column = spill_get_arrow_column,
 };
 
@@ -113,8 +113,7 @@ spill_get_native_interface(PgBatch *batch, const char *name,
 }
 
 static const PgBatchOps spill_batch_ops = {
-	.abi_version = PG_BATCH_ABI_VERSION,
-	.struct_size = sizeof(PgBatchOps),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_OPS_ABI_VERSION, PgBatchOps),
 	.prepare_columns = spill_prepare_columns,
 	.get_datum_column = NULL,
 	.get_native_interface = spill_get_native_interface,

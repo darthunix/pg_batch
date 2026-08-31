@@ -5,11 +5,12 @@ whether independent extensions can exchange batches through ordinary tuple
 slots, keep source-native columns between plan nodes, and postpone conversion
 to PostgreSQL `Datum` values.
 
-The repository is split into four extensions and four reusable C libraries:
+The repository is split into five extensions and four reusable C libraries:
 
 ```text
 examples/compressed_tam/ -----> bridge/ <----- nodes/
 examples/arrow_fdw/ -----------/                 |
+examples/limit_node/ ----------/-----------------/
                                                   v
                          runtime/ kernels/ expr/ spill/
 ```
@@ -29,6 +30,9 @@ examples/arrow_fdw/ -----------/                 |
   an ordinary
   row-at-a-time FDW path and a direct bridge callback that returns native
   Arrow batches to the same nodes.
+- `examples/limit_node/` is an independently built pass-through node. It uses
+  only installed public headers and the runtime library, which keeps the
+  producer interface honest without depending on `nodes/` internals.
 - `runtime/` provides common batch traversal, lazy Datum/native adapters,
   borrowed vector views, an owned Datum buffer for collecting scalar slots,
   and opaque input/output objects for connecting batch producers and
@@ -87,8 +91,25 @@ actual returned slot binding together. This matters for pass-through nodes:
 the slot that receives a request need not be the slot that later publishes a
 batch. The input object caches that returned binding and provides explicit
 next, finish, and rescan transitions without exposing its state.
+For scalar expressions it can borrow one `PgBatchRowView` per batch and select
+rows through the consumer directly, avoiding a bridge call in the hot loop.
 `PgBatchOutput` publishes batches to another batch-aware node or exposes the
 selected rows through the same slot to an ordinary row-at-a-time parent.
+`PgBatchRequestPort` is the smaller alternative for a pass-through node: it
+receives a parent's request but never pretends to own an output batch.
+
+A published `PgBatch` has one logical owner. That owner may only remove rows
+from `selection`; it cannot restore a bit cleared by an earlier node. Passing
+the batch upward transfers this mutation right. Physical buffers may be
+shared by separate batch views, but the views and their selection masks remain
+separate. Native and Datum column views are borrowed and remain valid only
+until the owner next prepares columns or releases the batch.
+
+Every public operation table has its own ABI version and byte size. Version 1
+defines a required prefix; optional callbacks are appended and used only when
+the reported size includes them. Callback arguments and results that may grow
+also carry their byte size. This permits an older extension to run with a
+newer bridge when the required prefix is unchanged.
 
 The bridge does not contain table-access-method policy or expression logic. It
 only owns the common ABI, source registry, slot attachments, selection bitmap,
@@ -161,6 +182,13 @@ Set `pg_batch.enable_hash_join = off` to keep the other batch nodes enabled
 while comparing against PostgreSQL's Hash Join.
 Set `pg_batch.enable_simd = off` to use the direct scalar `int4` filter kernel
 on systems where a SIMD implementation is available.
+
+`PgBatchLimit` is kept in `examples/limit_node/` to demonstrate a node built
+against the public API alone. It narrows the input selection across batch
+boundaries for ordinary `LIMIT` and `OFFSET`, returns the input batch without
+copying to a batch-aware parent, and copies only the current row to its declared
+virtual slot for an ordinary parent. `WITH TIES` remains on PostgreSQL's core
+Limit path.
 
 For heap batches, the compact slot stores only columns used by the query.
 Filter columns precede projection-only columns. Every source row keeps a
@@ -265,9 +293,11 @@ CREATE EXTENSION pg_batch_api;
 CREATE EXTENSION pg_batch_tam;
 CREATE EXTENSION pg_batch_fdw;
 CREATE EXTENSION pg_batch;
+CREATE EXTENSION pg_batch_limit;
 LOAD 'pg_batch_tam';
 LOAD 'pg_batch_fdw';
 LOAD 'pg_batch';
+LOAD 'pg_batch_limit';
 ```
 
 For a columnar-source example:

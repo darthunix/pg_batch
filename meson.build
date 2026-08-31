@@ -36,6 +36,7 @@ subdir('expr')
 subdir('spill')
 
 install_headers(
+	'include/pg_batch/abi.h',
 	'include/pg_batch/batch.h',
   'include/pg_batch/bridge.h',
   'include/pg_batch/node.h',

@@ -474,8 +474,8 @@ get_arrow_column(PgBatch *bridge_batch, int column,
 }
 
 static const PgBatchArrowInterface arrow_interface = {
-	.abi_version = PG_BATCH_ARROW_INTERFACE_VERSION,
-	.struct_size = sizeof(PgBatchArrowInterface),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_ARROW_INTERFACE_VERSION,
+		PgBatchArrowInterface),
 	.get_column = get_arrow_column,
 };
 
@@ -493,8 +493,8 @@ get_int4_column(PgBatch *bridge_batch, int column,
 }
 
 static const PgBatchInt4VectorInterface int4_interface = {
-	.abi_version = PG_BATCH_INT4_VECTOR_INTERFACE_VERSION,
-	.struct_size = sizeof(PgBatchInt4VectorInterface),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_INT4_VECTOR_INTERFACE_VERSION,
+		PgBatchInt4VectorInterface),
 	.get_column = get_int4_column,
 };
 
@@ -524,6 +524,7 @@ get_datum_column(PgBatch *bridge_batch, int column,
 	const int32 *values;
 	uint64		missing;
 
+	pg_batch_check_datum_vector(result);
 	prepare_column(active, column, phase);
 	datum = &active->datums[column];
 	array = &active->columns[column];
@@ -568,8 +569,7 @@ release_batch(PgBatch *bridge_batch)
 }
 
 static const PgBatchOps batch_ops = {
-	.abi_version = PG_BATCH_ABI_VERSION,
-	.struct_size = sizeof(PgBatchOps),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_OPS_ABI_VERSION, PgBatchOps),
 	.prepare_columns = prepare_columns,
 	.get_datum_column = get_datum_column,
 	.get_native_interface = get_native_interface,
@@ -816,8 +816,8 @@ pg_batch_fdw_iterate_foreign_scan(ForeignScanState *node)
 			PgBatchDatumVector datum;
 			uint64		rows = UINT64CONST(1) << row;
 
-			get_datum_column(batch, column, &rows,
-							 PG_BATCH_COLUMN_PROJECT, &datum);
+			pg_batch_get_datum_column(batch, column, &rows,
+				PG_BATCH_COLUMN_PROJECT, &datum);
 			slot->tts_values[column] = datum.values[row];
 			slot->tts_isnull[column] = datum.isnull[row];
 		}

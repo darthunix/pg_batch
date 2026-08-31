@@ -13,8 +13,8 @@ pg_batch_api_get(void)
 	if (*rendezvous == NULL)
 		load_file("$libdir/pg_batch_api", false);
 	api = *rendezvous;
-	if (api == NULL || api->abi_version != PG_BATCH_ABI_VERSION ||
-		api->struct_size < sizeof(PgBatchAPI))
+	if (api == NULL || api->abi_version != PG_BATCH_API_ABI_VERSION ||
+		api->struct_size < PG_BATCH_API_MIN_SIZE)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("incompatible pg_batch_api library")));

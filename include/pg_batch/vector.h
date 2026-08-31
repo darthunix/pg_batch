@@ -65,6 +65,9 @@ typedef struct PgBatchInt4VectorInterface
 							 PgBatchInt4Vector *result);
 } PgBatchInt4VectorInterface;
 
+#define PG_BATCH_INT4_VECTOR_INTERFACE_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchInt4VectorInterface, get_column)
+
 /* Initialize a borrowed view over PostgreSQL Datum arrays. */
 static inline void
 pg_batch_int4_vector_init_datum(PgBatchInt4Vector *column,

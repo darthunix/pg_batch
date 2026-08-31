@@ -79,4 +79,7 @@ typedef struct PgBatchArrowInterface
 							   PgBatchArrowView *result);
 } PgBatchArrowInterface;
 
+#define PG_BATCH_ARROW_INTERFACE_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchArrowInterface, get_column)
+
 #endif							/* PG_BATCH_ARROW_INTERFACE */

@@ -32,6 +32,7 @@ datum_buffer_get_column(PgBatch *batch, int column,
 	PgBatchDatumBuffer *buffer = batch->private_data;
 	const uint64 *valid_rows;
 
+	pg_batch_check_datum_vector(result);
 	if (column < 0 || column >= buffer->ncolumns)
 		elog(ERROR, "pg_batch Datum buffer column is out of range");
 	valid_rows = &buffer->valid_rows[column * buffer->capacity_nwords];
@@ -47,8 +48,7 @@ datum_buffer_get_column(PgBatch *batch, int column,
 }
 
 static const PgBatchOps datum_buffer_ops = {
-	.abi_version = PG_BATCH_ABI_VERSION,
-	.struct_size = sizeof(PgBatchOps),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_OPS_ABI_VERSION, PgBatchOps),
 	.get_datum_column = datum_buffer_get_column,
 };
 

@@ -9,11 +9,21 @@
 
 #include "postgres.h"
 
+#include "abi.h"
 #include "executor/tuptable.h"
 #include "nodes/bitmapset.h"
 #include "port/pg_bitutils.h"
 
 #define PG_BATCH_ABI_VERSION 1
+#define PG_BATCH_OPS_ABI_VERSION 1
+#define PG_BATCH_CONSUMER_OPS_ABI_VERSION 1
+
+#define PG_BATCH_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatch, private_data)
+#define PG_BATCH_OPS_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchOps, get_datum_column)
+#define PG_BATCH_CONSUMER_OPS_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchConsumerOps, select_row)
 
 /* Why columns are being prepared or converted to Datum values. */
 typedef enum PgBatchColumnPhase
@@ -27,25 +37,39 @@ typedef struct PgBatch PgBatch;
 /* Borrowed Datum view indexed by physical row number in the batch. */
 typedef struct PgBatchDatumVector
 {
+	/* Capacity supplied by the caller; providers must preserve this field. */
+	Size		struct_size;
 	const Datum *values;
 	const bool *isnull;
 	const uint64 *valid_rows;
 	int			nwords;
 } PgBatchDatumVector;
 
+#define PG_BATCH_DATUM_VECTOR_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchDatumVector, nwords)
+
+static inline void
+pg_batch_check_datum_vector(const PgBatchDatumVector *result)
+{
+	if (result == NULL || result->struct_size < PG_BATCH_DATUM_VECTOR_MIN_SIZE)
+		elog(ERROR, "pg_batch source received an incompatible Datum vector");
+}
+
 /* Operations for the source-owned physical representation of a batch. */
 typedef struct PgBatchOps
 {
 	uint32		abi_version;
 	Size		struct_size;
-	void		(*prepare_columns) (PgBatch *batch,
-									const Bitmapset *columns,
-									const uint64 *rows,
-									PgBatchColumnPhase phase);
+	/* Required v1 fallback available for every physical representation. */
 	void		(*get_datum_column) (PgBatch *batch, int column,
 									 const uint64 *rows,
 									 PgBatchColumnPhase phase,
 									 PgBatchDatumVector *result);
+	/* Optional append-only operations. */
+	void		(*prepare_columns) (PgBatch *batch,
+									const Bitmapset *columns,
+									const uint64 *rows,
+									PgBatchColumnPhase phase);
 	const void *(*get_native_interface) (PgBatch *batch,
 										const char *name,
 										uint32 version);
@@ -55,8 +79,15 @@ typedef struct PgBatchOps
 /*
  * Format-neutral envelope for one active batch.
  *
- * The owner keeps this structure, selection, operations, and private_data
- * alive until the batch is released. Bits beyond nrows must be clear.
+ * Publishing transfers exclusive use of this structure to the consumer. The
+ * active consumer may prepare columns and may only remove rows from selection.
+ * Passing the batch to a parent transfers that right again; it is not shared
+ * ownership. The source keeps the referenced memory alive and serves calls
+ * made through PgBatchOps, but must not otherwise mutate or reuse the active
+ * batch until release() is called. Bits beyond nrows must be clear.
+ *
+ * Borrowed column views remain valid only until the owner next prepares or
+ * releases the batch, unless the physical interface promises more.
  */
 struct PgBatch
 {
@@ -79,6 +110,22 @@ typedef struct PgBatchConsumerOps
 	void		(*select_row) (TupleTableSlot *slot, PgBatch *batch, int row);
 } PgBatchConsumerOps;
 
+/*
+ * Borrowed fast path for selecting rows from one active binding. The view is
+ * valid only until that binding is finished, cleared, or given another batch.
+ */
+typedef struct PgBatchRowView
+{
+	Size		struct_size;
+	TupleTableSlot *slot;
+	PgBatch    *batch;
+	const bool *finished;
+	void		(*select_row) (TupleTableSlot *slot, PgBatch *batch, int row);
+} PgBatchRowView;
+
+#define PG_BATCH_ROW_VIEW_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchRowView, select_row)
+
 static inline int
 pg_batch_selection_count(const PgBatch *batch)
 {
@@ -99,12 +146,33 @@ pg_batch_row_selected(const PgBatch *batch, int row)
 			(UINT64CONST(1) << (row % 64))) != 0;
 }
 
+static inline TupleTableSlot *
+pg_batch_row_view_select(const PgBatchRowView *view, int row)
+{
+	if (view == NULL || view->struct_size < PG_BATCH_ROW_VIEW_MIN_SIZE ||
+		view->batch == NULL || view->finished == NULL || *view->finished ||
+		view->select_row == NULL ||
+		row < 0 || row >= view->batch->nrows ||
+		!pg_batch_row_selected(view->batch, row))
+		elog(ERROR, "pg_batch cannot select row %d", row);
+	view->select_row(view->slot, view->batch, row);
+	return view->slot;
+}
+
 static inline void
 pg_batch_clear_row(PgBatch *batch, int row)
 {
 	Assert(row >= 0 && row < batch->nrows);
 	batch->selection[row / 64] &=
 		~(UINT64CONST(1) << (row % 64));
+}
+
+/* Remove every row not present in rows; selected rows can never be restored. */
+static inline void
+pg_batch_intersect_selection(PgBatch *batch, const uint64 *rows)
+{
+	for (int word = 0; word < batch->nwords; word++)
+		batch->selection[word] &= rows[word];
 }
 
 /* Pass -1 to start; return -1 after the last selected row. */

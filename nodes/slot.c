@@ -304,6 +304,7 @@ heap_get_datum_column(PgBatch *batch, int column,
 	PgBatchColumn *bcolumn;
 	uint64		missing;
 
+	pg_batch_check_datum_vector(result);
 	if (column < 0 || column >= bslot->ncolumns)
 		elog(ERROR, "pg_batch column %d is out of range", column + 1);
 	bcolumn = &bslot->columns[column];
@@ -333,8 +334,7 @@ heap_release(PgBatch *batch)
 }
 
 static const PgBatchOps pg_batch_heap_batch_ops = {
-	.abi_version = PG_BATCH_ABI_VERSION,
-	.struct_size = sizeof(PgBatchOps),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_OPS_ABI_VERSION, PgBatchOps),
 	.prepare_columns = heap_prepare_columns,
 	.get_datum_column = heap_get_datum_column,
 	.get_native_interface = NULL,
@@ -378,8 +378,8 @@ consumer_select_row(TupleTableSlot *slot,
 }
 
 static const PgBatchConsumerOps pg_batch_slot_consumer_ops = {
-	.abi_version = PG_BATCH_ABI_VERSION,
-	.struct_size = sizeof(PgBatchConsumerOps),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_CONSUMER_OPS_ABI_VERSION,
+		PgBatchConsumerOps),
 	.accept_batch = accept_batch,
 	.select_row = consumer_select_row,
 };

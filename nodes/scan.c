@@ -124,7 +124,8 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 	state->heap_scan_mode = heap_scan_mode;
 	if (provider_name[0] != '\0')
 	{
-		PgBatchSourceExecRequest request;
+		PgBatchSourceExecRequest request =
+			PG_BATCH_STRUCT_INITIALIZER(PgBatchSourceExecRequest);
 
 		state->provider = pg_batch_api->get_provider(provider_name);
 		if (state->provider == NULL)
@@ -138,7 +139,6 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 					 errmsg("pg_batch provider \"%s\" no longer supports relation \"%s\"",
 							provider_name,
 							RelationGetRelationName(node->ss.ss_currentRelation))));
-		MemSet(&request, 0, sizeof(request));
 		request.relation = node->ss.ss_currentRelation;
 		request.parent = &node->ss.ps;
 		request.source_private = source_private;
@@ -162,7 +162,9 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 		state->scan = table_beginscan_bm(node->ss.ss_currentRelation,
 										 estate->es_snapshot, 0, NULL, flags);
 	}
-	else if (state->provider == NULL || state->provider->next_batch == NULL)
+	else if (state->provider == NULL ||
+			 !PG_BATCH_ABI_HAS_FIELD(state->provider, PgBatchProviderOps,
+				next_batch) || state->provider->next_batch == NULL)
 		state->scan = table_beginscan(node->ss.ss_currentRelation,
 									  estate->es_snapshot, 0, NULL, 0);
 	if (state->provider == NULL)
@@ -286,7 +288,8 @@ next_batch(BatchScanState *state, PgBatchSlot *bslot)
 	{
 		bool		found;
 
-		if (state->provider->next_batch != NULL)
+		if (PG_BATCH_ABI_HAS_FIELD(state->provider, PgBatchProviderOps,
+				next_batch) && state->provider->next_batch != NULL)
 		{
 			PgBatch *batch =
 				state->provider->next_batch(state->provider_state);
@@ -519,7 +522,9 @@ scan_explain(CustomScanState *node, List *ancestors,
 			ExplainPropertyInteger("Exact Rechecks Skipped", NULL,
 								   state->exact_rechecks_skipped, es);
 		}
-		if (state->provider != NULL && state->provider->explain != NULL)
+		if (state->provider != NULL &&
+			PG_BATCH_ABI_HAS_FIELD(state->provider, PgBatchProviderOps,
+				explain) && state->provider->explain != NULL)
 			state->provider->explain(state->provider_state, es);
 	}
 }

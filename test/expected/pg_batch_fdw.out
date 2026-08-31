@@ -1,8 +1,10 @@
 CREATE EXTENSION pg_batch_api;
 CREATE EXTENSION pg_batch_fdw;
 CREATE EXTENSION pg_batch;
+CREATE EXTENSION pg_batch_limit;
 LOAD 'pg_batch_fdw';
 LOAD 'pg_batch';
+LOAD 'pg_batch_limit';
 SET max_parallel_workers_per_gather = 0;
 SET jit = off;
 CREATE TABLE pg_batch_fdw_source AS
@@ -55,6 +57,36 @@ SELECT count(*) AS n, count(c2) AS nn, sum(c8) AS total,
 FROM pg_batch_fdw_foreign
 WHERE c2 < 100;
 SET pg_batch.enable = on;
+SET pg_batch_limit.enable = off;
+CREATE TEMP TABLE pg_batch_fdw_limit_plain AS
+SELECT c1, c8 FROM pg_batch_fdw_foreign WHERE c2 < 100 OFFSET 17 LIMIT 65;
+SET pg_batch_limit.enable = on;
+CREATE TEMP TABLE pg_batch_fdw_limit_batch AS
+SELECT c1, c8 FROM pg_batch_fdw_foreign WHERE c2 < 100 OFFSET 17 LIMIT 65;
+EXPLAIN (COSTS OFF)
+SELECT c1, c8 FROM pg_batch_fdw_foreign WHERE c2 < 100 OFFSET 17 LIMIT 65;
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Custom Scan (PgBatchLimit)
+   ->  Custom Scan (PgBatchFilterProject)
+         ->  Custom Scan (PgBatchScan) on pg_batch_fdw_foreign
+               Batch Size: 64
+               Batch Source: pg_batch_arrow_fdw
+               Batch Provider: pg_batch_arrow_fdw
+(6 rows)
+
+SELECT NOT EXISTS (
+           (TABLE pg_batch_fdw_limit_batch
+            EXCEPT ALL TABLE pg_batch_fdw_limit_plain)
+           UNION ALL
+           (TABLE pg_batch_fdw_limit_plain
+            EXCEPT ALL TABLE pg_batch_fdw_limit_batch)
+       ) AS limit_fdw_matches;
+ limit_fdw_matches 
+-------------------
+ t
+(1 row)
+
 CREATE TEMP TABLE pg_batch_fdw_batch_rows AS
 SELECT c1, c8
 FROM pg_batch_fdw_foreign
@@ -380,6 +412,7 @@ DROP TABLE pg_batch_fdw_join;
 DROP FOREIGN TABLE pg_batch_fdw_foreign;
 DROP SERVER pg_batch_fdw_server;
 DROP TABLE pg_batch_fdw_source;
+DROP EXTENSION pg_batch_limit;
 DROP EXTENSION pg_batch;
 DROP EXTENSION pg_batch_fdw;
 DROP EXTENSION pg_batch_api;

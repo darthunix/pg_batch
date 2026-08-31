@@ -29,7 +29,10 @@ plan_scan(const PgBatchSourcePlanRequest *request,
 	ListCell   *clause_cell;
 	ListCell   *rinfo_cell;
 
-	MemSet(result, 0, sizeof(*result));
+	if (request->struct_size < PG_BATCH_SOURCE_PLAN_REQUEST_MIN_SIZE ||
+		result->struct_size < PG_BATCH_SOURCE_PLAN_RESULT_MIN_SIZE)
+		elog(ERROR, "pg_batch TAM received an incompatible planning request");
+
 	result->nquals = nquals;
 	result->qual_support = palloc0_array(PgBatchQualSupport, nquals);
 	if (pg_batch_tam_scan_mode == PG_BATCH_TAM_BATCH)
@@ -117,6 +120,9 @@ begin_scan(const PgBatchSourceExecRequest *request)
 	MemoryContext oldcontext;
 	CompressedScan *scan;
 	int			qualno = 0;
+
+	if (request->struct_size < PG_BATCH_SOURCE_EXEC_REQUEST_MIN_SIZE)
+		elog(ERROR, "pg_batch TAM received an incompatible execution request");
 
 	context = AllocSetContextCreate(request->query_context,
 									"pg_batch TAM scan",
@@ -223,8 +229,8 @@ explain_scan(void *provider_state, ExplainState *es)
 }
 
 const PgBatchProviderOps pg_batch_tam_provider_ops = {
-	.abi_version = PG_BATCH_ABI_VERSION,
-	.struct_size = sizeof(PgBatchProviderOps),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_PROVIDER_OPS_ABI_VERSION,
+		PgBatchProviderOps),
 	.provider_name = PG_BATCH_TAM_PROVIDER_NAME,
 	.supports_relation = supports_relation,
 	.plan_scan = plan_scan,

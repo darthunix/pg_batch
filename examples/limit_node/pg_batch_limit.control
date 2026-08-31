@@ -1,0 +1,5 @@
+comment = 'Independent batch-aware Limit node example'
+default_version = '0.1'
+module_pathname = '$libdir/pg_batch_limit'
+requires = 'pg_batch_api'
+relocatable = true

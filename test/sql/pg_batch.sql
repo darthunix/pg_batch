@@ -1,6 +1,7 @@
 CREATE EXTENSION pg_batch_api;
 CREATE EXTENSION pg_batch_tam;
 CREATE EXTENSION pg_batch;
+CREATE EXTENSION pg_batch_limit;
 
 \getenv libdir PG_LIBDIR
 \getenv dlsuffix PG_DLSUFFIX
@@ -25,6 +26,10 @@ CREATE FUNCTION pg_batch_bridge_test_duplicate_provider()
 RETURNS void
 AS :'bridge_test', 'pg_batch_bridge_test_duplicate_provider'
 LANGUAGE C;
+CREATE FUNCTION pg_batch_bridge_test_compatible_sizes()
+RETURNS boolean
+AS :'bridge_test', 'pg_batch_bridge_test_compatible_sizes'
+LANGUAGE C;
 CREATE FUNCTION pg_batch_kernels_test()
 RETURNS boolean
 AS :'kernels_test', 'pg_batch_kernels_test'
@@ -45,6 +50,22 @@ CREATE FUNCTION pg_batch_output_test()
 RETURNS boolean
 AS :'runtime_test', 'pg_batch_output_test'
 LANGUAGE C;
+CREATE FUNCTION pg_batch_output_double_finish_test()
+RETURNS void
+AS :'runtime_test', 'pg_batch_output_double_finish_test'
+LANGUAGE C;
+CREATE FUNCTION pg_batch_output_select_after_finish_test()
+RETURNS void
+AS :'runtime_test', 'pg_batch_output_select_after_finish_test'
+LANGUAGE C;
+CREATE FUNCTION pg_batch_output_fast_select_after_finish_test()
+RETURNS void
+AS :'runtime_test', 'pg_batch_output_fast_select_after_finish_test'
+LANGUAGE C;
+CREATE FUNCTION pg_batch_request_port_test()
+RETURNS boolean
+AS :'runtime_test', 'pg_batch_request_port_test'
+LANGUAGE C;
 CREATE FUNCTION pg_batch_spill_test()
 RETURNS boolean
 AS :'spill_test', 'pg_batch_spill_test'
@@ -52,11 +73,16 @@ LANGUAGE C;
 
 SELECT pg_batch_bridge_test_bad_abi();
 SELECT pg_batch_bridge_test_duplicate_provider();
+SELECT pg_batch_bridge_test_compatible_sizes() AS compatible_abi_sizes_ok;
 SELECT pg_batch_kernels_test() AS installed_kernels_ok;
 SELECT pg_batch_expr_api_test() AS installed_expr_api_ok;
 SELECT pg_batch_datum_buffer_test() AS installed_datum_buffer_ok;
 SELECT pg_batch_input_api_test() AS installed_input_api_ok;
 SELECT pg_batch_output_test() AS installed_output_ok;
+SELECT pg_batch_request_port_test() AS installed_request_port_ok;
+SELECT pg_batch_output_double_finish_test();
+SELECT pg_batch_output_select_after_finish_test();
+SELECT pg_batch_output_fast_select_after_finish_test();
 SELECT pg_batch_spill_test() AS installed_spill_ok;
 
 SET max_parallel_workers_per_gather = 0;
@@ -985,6 +1011,60 @@ SELECT NOT EXISTS (
        ) AS join_repartition_match;
 
 RESET work_mem;
+
+-- A separately built pass-through node uses only the public bridge/runtime.
+LOAD 'pg_batch_limit';
+SET pg_batch.enable = on;
+SET pg_batch_limit.enable = on;
+EXPLAIN (COSTS OFF)
+SELECT c1, c6 FROM pg_batch_test WHERE c1 > 0 OFFSET 63 LIMIT 65;
+
+PREPARE pg_batch_limit_query(bigint, bigint) AS
+SELECT count(*) AS n, min(c1) AS first, max(c1) AS last
+FROM (
+    SELECT c1 FROM pg_batch_test WHERE c1 > 0 OFFSET $2 LIMIT $1
+) limited;
+EXECUTE pg_batch_limit_query(0, 0);
+EXECUTE pg_batch_limit_query(1, 0);
+EXECUTE pg_batch_limit_query(63, 0);
+EXECUTE pg_batch_limit_query(64, 0);
+EXECUTE pg_batch_limit_query(65, 0);
+EXECUTE pg_batch_limit_query(65, 15);
+EXECUTE pg_batch_limit_query(NULL, NULL);
+EXECUTE pg_batch_limit_query(NULL, 64);
+EXECUTE pg_batch_limit_query(9223372036854775807, 1);
+EXECUTE pg_batch_limit_query(-1, 0);
+EXECUTE pg_batch_limit_query(1, -1);
+DEALLOCATE pg_batch_limit_query;
+
+-- Correlated limits force rescans with new offset values.
+SELECT boundary, count(*) AS n, min(c1) AS first, max(c1) AS last
+FROM (VALUES (1), (63), (64), (65)) AS boundaries(boundary)
+CROSS JOIN LATERAL (
+    SELECT c1 FROM pg_batch_test WHERE c1 > 0
+    OFFSET boundary - 1 LIMIT 1
+) limited
+GROUP BY boundary
+ORDER BY boundary;
+
+-- WITH TIES is deliberately left to PostgreSQL's ordinary Limit.
+EXPLAIN (COSTS OFF)
+SELECT c1 FROM pg_batch_test ORDER BY c1 FETCH FIRST 1 ROW WITH TIES;
+
+SET pg_batch_limit.enable = off;
+CREATE TEMP TABLE pg_batch_limit_tam_plain AS
+SELECT c1, c3 FROM pg_batch_tam WHERE c2 IS NOT NULL OFFSET 17 LIMIT 65;
+SET pg_batch_limit.enable = on;
+CREATE TEMP TABLE pg_batch_limit_tam_batch AS
+SELECT c1, c3 FROM pg_batch_tam WHERE c2 IS NOT NULL OFFSET 17 LIMIT 65;
+SELECT NOT EXISTS (
+           (TABLE pg_batch_limit_tam_batch
+            EXCEPT ALL TABLE pg_batch_limit_tam_plain)
+           UNION ALL
+           (TABLE pg_batch_limit_tam_plain
+            EXCEPT ALL TABLE pg_batch_limit_tam_batch)
+       ) AS limit_tam_matches;
+
 RESET enable_mergejoin;
 RESET enable_nestloop;
 DROP TABLE pg_batch_join_spill_inner;
@@ -998,6 +1078,7 @@ DROP TABLE pg_batch_tam;
 DROP TABLE pg_batch_groups;
 DROP TABLE pg_batch_arrow;
 DROP TABLE pg_batch_test;
+DROP EXTENSION pg_batch_limit;
 DROP EXTENSION pg_batch;
 DROP EXTENSION pg_batch_tam;
 DROP EXTENSION pg_batch_api;

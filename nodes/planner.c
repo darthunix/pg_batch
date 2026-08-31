@@ -146,6 +146,8 @@ nodes_get_output_layout(const Plan *plan,
 	int		   *columns;
 	int			column = 0;
 
+	if (result == NULL || result->struct_size < PG_BATCH_OUTPUT_LAYOUT_MIN_SIZE)
+		elog(ERROR, "pg_batch producer received an incompatible output layout");
 	if (!IsA(plan, CustomScan))
 		elog(ERROR, "pg_batch producer expected a custom plan");
 	scan = castNode(CustomScan, plan);
@@ -195,8 +197,8 @@ nodes_get_request_binding(PlanState *planstate)
 }
 
 const PgBatchProducerOps pg_batch_producer_ops = {
-	.abi_version = PG_BATCH_ABI_VERSION,
-	.struct_size = sizeof(PgBatchProducerOps),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_PRODUCER_OPS_ABI_VERSION,
+		PgBatchProducerOps),
 	.producer_name = PG_BATCH_PRODUCER_NAME,
 	.supports_path = nodes_supports_batch_path,
 	.get_output_layout = nodes_get_output_layout,
@@ -322,7 +324,9 @@ relation_supported(PlannerInfo *root, RelOptInfo *rel,
 	relation = table_open(rte->relid, NoLock);
 	provider = pg_batch_api->find_provider(relation);
 	if (relation->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
-		result = provider != NULL && provider->next_batch != NULL;
+		result = provider != NULL &&
+			PG_BATCH_ABI_HAS_FIELD(provider, PgBatchProviderOps, next_batch) &&
+			provider->next_batch != NULL;
 	else if (relation->rd_rel->relkind != RELKIND_RELATION ||
 			 (relation->rd_rel->relam != HEAP_TABLE_AM_OID && provider == NULL))
 		result = false;
@@ -1208,7 +1212,8 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		  List *tlist, List *clauses, List *custom_plans)
 {
 	SourceLayout layout;
-	PgBatchSourcePlanResult source_result;
+	PgBatchSourcePlanResult source_result =
+		PG_BATCH_STRUCT_INITIALIZER(PgBatchSourcePlanResult);
 	PgBatchHeapScanMode heap_scan_mode =
 		intVal(linitial(best_path->custom_private));
 	CustomScan *scan;
@@ -1244,7 +1249,6 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	}
 	else
 		Assert(custom_plans == NIL);
-	MemSet(&source_result, 0, sizeof(source_result));
 	if (heap_scan_mode == PG_BATCH_HEAP_SEQ)
 	{
 		RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
@@ -1254,7 +1258,8 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 
 		if (provider != NULL)
 		{
-			PgBatchSourcePlanRequest request;
+			PgBatchSourcePlanRequest request =
+				PG_BATCH_STRUCT_INITIALIZER(PgBatchSourcePlanRequest);
 			List	   *restrictinfos =
 				restriction_infos_for_clauses(clauses, quals);
 			Bitmapset  *filter_attnums =
@@ -1263,7 +1268,6 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 				relation_attnums((Node *) tlist, rel->relid);
 
 			project_attnums = bms_del_members(project_attnums, filter_attnums);
-			MemSet(&request, 0, sizeof(request));
 			request.root = root;
 			request.rel = rel;
 			request.relation = relation;
@@ -1389,7 +1393,8 @@ plan_project(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	Plan	   *child;
 	const char *producer_name = strVal(linitial(best_path->custom_private));
 	const PgBatchProducerOps *producer;
-	PgBatchOutputLayout layout;
+	PgBatchOutputLayout layout =
+		PG_BATCH_STRUCT_INITIALIZER(PgBatchOutputLayout);
 	List	   *input_columns = NIL;
 	List	   *expressions = NIL;
 
@@ -1400,7 +1405,6 @@ plan_project(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	if (producer == NULL)
 		elog(ERROR, "pg_batch producer \"%s\" is not registered",
 			 producer_name);
-	MemSet(&layout, 0, sizeof(layout));
 	producer->get_output_layout(child, &layout);
 	if (layout.ncolumns != list_length(child->targetlist) ||
 		(layout.ncolumns > 0 && layout.batch_columns == NULL))
@@ -1444,14 +1448,14 @@ append_side_layout(Plan *child, const char *producer_name, List **raw_tlist)
 {
 	const PgBatchProducerOps *producer =
 		pg_batch_api->get_producer(producer_name);
-	PgBatchOutputLayout layout;
+	PgBatchOutputLayout layout =
+		PG_BATCH_STRUCT_INITIALIZER(PgBatchOutputLayout);
 	List	   *batch_columns = NIL;
 	int			position = 0;
 
 	if (producer == NULL)
 		elog(ERROR, "pg_batch producer \"%s\" is not registered",
 			 producer_name);
-	MemSet(&layout, 0, sizeof(layout));
 	producer->get_output_layout(child, &layout);
 	if (layout.ncolumns != list_length(child->targetlist) ||
 		(layout.ncolumns > 0 && layout.batch_columns == NULL))
@@ -1577,7 +1581,8 @@ plan_aggregate(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	const char *producer_name = strVal(linitial(best_path->custom_private));
 	List	   *agg_specs = lsecond_node(List, best_path->custom_private);
 	const PgBatchProducerOps *producer;
-	PgBatchOutputLayout layout;
+	PgBatchOutputLayout layout =
+		PG_BATCH_STRUCT_INITIALIZER(PgBatchOutputLayout);
 	List	   *runtime_specs = NIL;
 
 	Assert(list_length(custom_plans) == 1);
@@ -1588,7 +1593,6 @@ plan_aggregate(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	if (producer == NULL)
 		elog(ERROR, "pg_batch producer \"%s\" is not registered",
 			 producer_name);
-	MemSet(&layout, 0, sizeof(layout));
 	producer->get_output_layout(child, &layout);
 	if (layout.ncolumns != list_length(child->targetlist) ||
 		(layout.ncolumns > 0 && layout.batch_columns == NULL))

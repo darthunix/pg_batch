@@ -36,6 +36,7 @@ typedef enum PgBatchQualSupport
  */
 typedef struct PgBatchSourcePlanRequest
 {
+	Size		struct_size;
 	PlannerInfo *root;
 	RelOptInfo *rel;
 	Relation	relation;
@@ -45,9 +46,14 @@ typedef struct PgBatchSourcePlanRequest
 	const Bitmapset *project_attnums;
 } PgBatchSourcePlanRequest;
 
+#define PG_BATCH_SOURCE_PLAN_REQUEST_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchSourcePlanRequest, project_attnums)
+
 /* Copyable source plan returned from plan_scan() in the planner context. */
 typedef struct PgBatchSourcePlanResult
 {
+	/* Set by the caller. The provider fills fields without clearing it. */
+	Size		struct_size;
 	/* One classification for every input clause, in the same order. */
 	int			nquals;
 	PgBatchQualSupport *qual_support;
@@ -57,9 +63,13 @@ typedef struct PgBatchSourcePlanResult
 	Node	   *source_private;
 } PgBatchSourcePlanResult;
 
+#define PG_BATCH_SOURCE_PLAN_RESULT_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchSourcePlanResult, source_private)
+
 /* Borrowed input passed once to the selected source's begin_scan(). */
 typedef struct PgBatchSourceExecRequest
 {
+	Size		struct_size;
 	Relation	relation;
 	struct PlanState *parent;
 	Node	   *source_private;
@@ -67,6 +77,9 @@ typedef struct PgBatchSourceExecRequest
 	MemoryContext query_context;
 	const PgBatchRequest *slot_request;
 } PgBatchSourceExecRequest;
+
+#define PG_BATCH_SOURCE_EXEC_REQUEST_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchSourceExecRequest, slot_request)
 
 /*
  * Operations implemented by an independently built batch source.
@@ -87,16 +100,22 @@ struct PgBatchProviderOps
 								  PgBatchSourcePlanResult *result);
 	/* Start a scan and return opaque state for the remaining callbacks. */
 	void	   *(*begin_scan) (const PgBatchSourceExecRequest *request);
+	/* Required lifecycle operations. */
+	void		(*rescan) (void *provider_state);
+	void		(*end_scan) (void *provider_state);
+	/* Optional append-only operations. */
 	/*
 	 * Return the next source-owned batch, or NULL at end of scan. A NULL
 	 * callback keeps the table-AM path, where the source publishes through the
 	 * scan slot instead.
 	 */
 	PgBatch *(*next_batch) (void *provider_state);
-	void		(*rescan) (void *provider_state);
-	void		(*end_scan) (void *provider_state);
 	/* Add source-specific EXPLAIN properties; this callback is optional. */
 	void		(*explain) (void *provider_state, ExplainState *es);
 };
+
+#define PG_BATCH_PROVIDER_OPS_ABI_VERSION 1
+#define PG_BATCH_PROVIDER_OPS_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchProviderOps, end_scan)
 
 #endif /* PG_BATCH_SOURCE_H */

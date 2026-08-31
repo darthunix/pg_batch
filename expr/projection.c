@@ -78,8 +78,8 @@ projection_get_int4(PgBatch *batch, int column,
 }
 
 static const PgBatchInt4VectorInterface projection_int4_interface = {
-	.abi_version = PG_BATCH_INT4_VECTOR_INTERFACE_VERSION,
-	.struct_size = sizeof(PgBatchInt4VectorInterface),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_INT4_VECTOR_INTERFACE_VERSION,
+		PgBatchInt4VectorInterface),
 	.get_column = projection_get_int4,
 };
 
@@ -134,6 +134,7 @@ projection_get_datum_column(PgBatch *batch, int column,
 	PgBatchExprProjection *projection = batch->private_data;
 	ProjectionColumn *output;
 
+	pg_batch_check_datum_vector(result);
 	prepare_one(projection, column, rows, phase);
 	output = &projection->columns[column];
 	ensure_datum_capacity(projection, output);
@@ -162,8 +163,7 @@ projection_get_datum_column(PgBatch *batch, int column,
 }
 
 static const PgBatchOps projection_batch_ops = {
-	.abi_version = PG_BATCH_ABI_VERSION,
-	.struct_size = sizeof(PgBatchOps),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_OPS_ABI_VERSION, PgBatchOps),
 	.prepare_columns = projection_prepare_columns,
 	.get_datum_column = projection_get_datum_column,
 	.get_native_interface = projection_get_native_interface,

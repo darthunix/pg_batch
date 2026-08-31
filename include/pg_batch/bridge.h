@@ -25,7 +25,10 @@
  * ABI version and their actual size so the bridge can reject incompatible
  * objects before calling through them.
  */
-#define PG_BATCH_RENDEZVOUS "pg_batch_bridge_api_v1"
+#define PG_BATCH_RENDEZVOUS "pg_batch_api_v1"
+#define PG_BATCH_API_ABI_VERSION 1
+#define PG_BATCH_API_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchAPI, detach_binding)
 
 /*
  * Opaque bridge-owned association between a TupleTableSlot, its batch
@@ -51,6 +54,8 @@ struct PlanState;
  */
 typedef struct PgBatchRequest
 {
+	/* Actual size owned by the bridge; new fields are appended at the end. */
+	Size		struct_size;
 	const AttrNumber *source_attnums;
 	int			ncolumns;
 	const Bitmapset *filter_columns;
@@ -62,13 +67,16 @@ typedef struct PgBatchRequest
 	void	   *provider_state;
 }			PgBatchRequest;
 
+#define PG_BATCH_REQUEST_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchRequest, provider_state)
+
 /*
  * Bridge entry points published through PG_BATCH_RENDEZVOUS. The table
  * is owned by the bridge and remains valid for the lifetime of the backend.
  */
 typedef struct PgBatchAPI
 {
-	/* Set to PG_BATCH_ABI_VERSION and sizeof(this structure). */
+	/* Set to PG_BATCH_API_ABI_VERSION and sizeof(this structure). */
 	uint32		abi_version;
 	Size		struct_size;
 
@@ -136,6 +144,13 @@ typedef struct PgBatchAPI
 	void		(*clear_batch) (PgBatchBinding *binding);
 	/* Release any batch, remove the slot attachment, and free the binding. */
 	void		(*detach_binding) (PgBatchBinding *binding);
+
+	/*
+	 * Optionally return a fast row-selection view. The caller initializes
+	 * struct_size; the binding and its consumer own the returned pointers.
+	 */
+	void		(*get_row_view) (PgBatchBinding *binding,
+							 PgBatchRowView *result);
 }			PgBatchAPI;
 
 #endif							/* PG_BATCH_BRIDGE_H */

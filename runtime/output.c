@@ -64,8 +64,8 @@ virtual_select_row(TupleTableSlot *slot, PgBatch *batch, int row)
 }
 
 static const PgBatchConsumerOps virtual_consumer_ops = {
-	.abi_version = PG_BATCH_ABI_VERSION,
-	.struct_size = sizeof(PgBatchConsumerOps),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_CONSUMER_OPS_ABI_VERSION,
+		PgBatchConsumerOps),
 	.accept_batch = virtual_accept_batch,
 	.select_row = virtual_select_row,
 };

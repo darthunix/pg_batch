@@ -10,10 +10,15 @@
 /* Stable mapping from a Plan target list to compact batch columns. */
 typedef struct PgBatchOutputLayout
 {
+	/* Set by the caller. The producer fills fields without clearing it. */
+	Size		struct_size;
 	int			ncolumns;
 	/* One zero-based batch column for every target entry in the Plan. */
 	const int  *batch_columns;
 } PgBatchOutputLayout;
+
+#define PG_BATCH_OUTPUT_LAYOUT_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchOutputLayout, batch_columns)
 
 /*
  * Operations implemented by an extension whose plan nodes publish batches.
@@ -36,5 +41,9 @@ struct PgBatchProducerOps
 	/* Return the binding through which a parent configures this node. */
 	PgBatchBinding *(*get_request_binding) (struct PlanState *planstate);
 };
+
+#define PG_BATCH_PRODUCER_OPS_ABI_VERSION 1
+#define PG_BATCH_PRODUCER_OPS_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchProducerOps, get_request_binding)
 
 #endif /* PG_BATCH_NODE_H */

@@ -30,6 +30,7 @@ test_get_datum_column(PgBatch *batch, int column,
 {
 	TestDatumSource *source = batch->private_data;
 
+	pg_batch_check_datum_vector(result);
 	Assert(column == 0);
 	Assert(rows != NULL);
 	Assert(phase == PG_BATCH_COLUMN_FILTER);
@@ -54,8 +55,8 @@ test_get_int4_column(PgBatch *batch, int column,
 }
 
 static const PgBatchInt4VectorInterface test_int4_interface = {
-	.abi_version = PG_BATCH_INT4_VECTOR_INTERFACE_VERSION,
-	.struct_size = sizeof(PgBatchInt4VectorInterface),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_INT4_VECTOR_INTERFACE_VERSION,
+		PgBatchInt4VectorInterface),
 	.get_column = test_get_int4_column,
 };
 
@@ -73,8 +74,7 @@ test_get_native_interface(PgBatch *batch, const char *name,
 }
 
 static const PgBatchOps test_batch_ops = {
-	.abi_version = PG_BATCH_ABI_VERSION,
-	.struct_size = sizeof(PgBatchOps),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_OPS_ABI_VERSION, PgBatchOps),
 	.get_datum_column = test_get_datum_column,
 	.get_native_interface = test_get_native_interface,
 };

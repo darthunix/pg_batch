@@ -1,4 +1,4 @@
-EXAMPLE_DIRS = examples/compressed_tam examples/arrow_fdw
+EXAMPLE_DIRS = examples/compressed_tam examples/arrow_fdw examples/limit_node
 SUBDIRS = bridge nodes $(EXAMPLE_DIRS)
 PG_CONFIG ?= pg_config
 MESON_BUILD_DIR = $(CURDIR)/build/meson-libs
@@ -77,7 +77,8 @@ install: nanoarrow libraries
 	done
 
 uninstall:
-	@for dir in examples/arrow_fdw examples/compressed_tam nodes bridge; do \
+	@for dir in examples/limit_node examples/arrow_fdw \
+		examples/compressed_tam nodes bridge; do \
 		$(MAKE) -C $$dir PG_CONFIG="$(PG_CONFIG)" uninstall || exit; \
 	done
 	rm -f \
@@ -94,6 +95,7 @@ uninstall:
 		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/kernels.h" \
 		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/expr.h" \
 		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/spill.h" \
+		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/abi.h" \
 		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/batch.h" \
 		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/bridge.h" \
 		"$(DESTDIR)$(PG_INCLUDEDIR_SERVER)/extension/pg_batch/node.h" \

@@ -21,6 +21,8 @@ typedef struct PgBatchDatumBuffer PgBatchDatumBuffer;
 /* Cached execution state for consuming batches from one plan child. */
 typedef struct PgBatchInput PgBatchInput;
 typedef struct PgBatchOutput PgBatchOutput;
+/* Request-only binding for a pass-through node that publishes no own batch. */
+typedef struct PgBatchRequestPort PgBatchRequestPort;
 
 /*
  * Load the bridge extension when necessary and return its validated API.
@@ -74,7 +76,9 @@ pg_batch_prepare_columns(PgBatch *batch, const Bitmapset *columns,
 						 const uint64 *selected_rows,
 						 PgBatchColumnPhase phase)
 {
-	if (columns != NULL && batch->ops->prepare_columns != NULL)
+	if (columns != NULL &&
+		PG_BATCH_ABI_HAS_FIELD(batch->ops, PgBatchOps, prepare_columns) &&
+		batch->ops->prepare_columns != NULL)
 		batch->ops->prepare_columns(batch, columns, selected_rows, phase);
 }
 
@@ -84,8 +88,8 @@ pg_batch_get_datum_column(PgBatch *batch, int column,
 						  PgBatchColumnPhase phase,
 						  PgBatchDatumVector *result)
 {
-	if (batch->ops->get_datum_column == NULL)
-		elog(ERROR, "pg_batch source cannot materialize Datum columns");
+	*result = (PgBatchDatumVector) PG_BATCH_STRUCT_INITIALIZER(
+		PgBatchDatumVector);
 	batch->ops->get_datum_column(batch, column, selected_rows, phase, result);
 }
 
@@ -155,12 +159,36 @@ extern PgBatchBinding *pg_batch_input_request_binding(
 	PgBatchInput *input);
 
 /*
+ * Merge a pass-through node's request with its producer's existing request.
+ * Both nodes must use the same compact batch-column layout.
+ */
+extern void pg_batch_input_forward_request(PgBatchInput *input,
+	const PgBatchRequest *request, bool return_batch);
+
+/*
  * Fetch the next child result and resolve its active batch. A pass-through
  * producer may return a slot different from its request binding's slot.
  * The returned pointers remain owned by the child and bridge.
  */
 extern bool pg_batch_input_next(PgBatchInput *input,
 	PgBatchInputBatch *result);
+
+/* Select one row of the active input and return its scalar slot view. */
+extern TupleTableSlot *pg_batch_input_select_row(PgBatchInput *input,
+	int row);
+
+/* Return the active borrowed fast row view, or NULL with an older bridge. */
+extern const PgBatchRowView *pg_batch_input_row_view(PgBatchInput *input);
+
+/*
+ * Select one active row and expose mapped batch columns in a virtual slot.
+ * batch_columns has one entry for every destination attribute.
+ */
+extern TupleTableSlot *pg_batch_input_copy_row(PgBatchInput *input,
+	int row, TupleTableSlot *destination, const int *batch_columns);
+
+/* Report whether the consumer of a forwarded active batch has finished it. */
+extern bool pg_batch_input_batch_finished(PgBatchInput *input);
 
 /* Mark the current batch consumed before a later next() call. */
 extern void pg_batch_input_finish(PgBatchInput *input);
@@ -170,6 +198,28 @@ extern void pg_batch_input_finish(PgBatchInput *input);
  * The child is responsible for releasing any batch that was still active.
  */
 extern void pg_batch_input_rescan(PgBatchInput *input);
+
+/*
+ * Attach a request to slot without making it a batch output. This is useful
+ * for pass-through nodes: parents configure the port, while the node forwards
+ * that request to its input and returns the input's batch binding unchanged.
+ */
+extern PgBatchRequestPort *pg_batch_request_port_create(
+	MemoryContext parent_context, const PgBatchAPI *api,
+	TupleTableSlot *slot, const AttrNumber *source_attnums, int ncolumns);
+
+/* Return the binding advertised to a pass-through node's parent. */
+extern PgBatchBinding *pg_batch_request_port_binding(
+	PgBatchRequestPort *port);
+
+/* Return the current bridge-owned request. */
+extern const PgBatchRequest *pg_batch_request_port_request(
+	PgBatchRequestPort *port);
+
+/* Replace the request stored in the port. */
+extern void pg_batch_request_port_set_request(PgBatchRequestPort *port,
+	const Bitmapset *filter_columns, const Bitmapset *project_columns,
+	bool return_batch);
 
 /*
  * Attach a bridge binding and a Datum scalar adapter to a virtual output

@@ -1,0 +1,1 @@
+-- pg_batch_limit is initialized when its shared library is loaded.

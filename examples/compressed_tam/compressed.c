@@ -712,8 +712,8 @@ release_batch(PgBatch *bridge_batch)
 }
 
 static const PgBatchArrowInterface pg_batch_compressed_arrow = {
-	.abi_version = PG_BATCH_ARROW_INTERFACE_VERSION,
-	.struct_size = sizeof(PgBatchArrowInterface),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_ARROW_INTERFACE_VERSION,
+		PgBatchArrowInterface),
 	.get_column = get_arrow_column,
 };
 
@@ -731,8 +731,8 @@ get_int4_column(PgBatch *bridge_batch, int column,
 }
 
 static const PgBatchInt4VectorInterface pg_batch_compressed_int4 = {
-	.abi_version = PG_BATCH_INT4_VECTOR_INTERFACE_VERSION,
-	.struct_size = sizeof(PgBatchInt4VectorInterface),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_INT4_VECTOR_INTERFACE_VERSION,
+		PgBatchInt4VectorInterface),
 	.get_column = get_int4_column,
 };
 
@@ -749,6 +749,7 @@ get_datum_column(PgBatch *bridge_batch,
 	const int32 *values;
 	uint64		missing;
 
+	pg_batch_check_datum_vector(result);
 	if (column < 0 || column >= scan->request->ncolumns)
 		elog(ERROR, "pg_batch column %d is out of range", column + 1);
 	prepare_column(active, column, phase);
@@ -799,8 +800,7 @@ get_native_interface(PgBatch *batch,
 }
 
 static const PgBatchOps pg_batch_compressed_batch_ops = {
-	.abi_version = PG_BATCH_ABI_VERSION,
-	.struct_size = sizeof(PgBatchOps),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_OPS_ABI_VERSION, PgBatchOps),
 	.prepare_columns = prepare_columns,
 	.get_datum_column = get_datum_column,
 	.get_native_interface = get_native_interface,

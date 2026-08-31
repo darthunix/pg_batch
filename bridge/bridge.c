@@ -68,10 +68,10 @@ static void finish_batch(PgBatchBinding *binding);
 static bool batch_finished(PgBatchBinding *binding);
 static void clear_batch(PgBatchBinding *binding);
 static void detach_binding(PgBatchBinding *binding);
+static void get_row_view(PgBatchBinding *binding, PgBatchRowView *result);
 
 static const PgBatchAPI bridge_api = {
-	.abi_version = PG_BATCH_ABI_VERSION,
-	.struct_size = sizeof(PgBatchAPI),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_API_ABI_VERSION, PgBatchAPI),
 	.register_provider = register_provider,
 	.unregister_provider = unregister_provider,
 	.find_provider = find_provider,
@@ -92,6 +92,7 @@ static const PgBatchAPI bridge_api = {
 	.batch_finished = batch_finished,
 	.clear_batch = clear_batch,
 	.detach_binding = detach_binding,
+	.get_row_view = get_row_view,
 };
 
 static void
@@ -121,7 +122,8 @@ release_batch(PgBatchBinding *binding)
 		return;
 	binding->batch = NULL;
 	binding->batch_finished = false;
-	if (batch->ops->release != NULL)
+	if (PG_BATCH_ABI_HAS_FIELD(batch->ops, PgBatchOps, release) &&
+		batch->ops->release != NULL)
 		batch->ops->release(batch);
 }
 
@@ -148,15 +150,15 @@ slot_reset(void *arg)
 }
 
 static void
-validate_abi(uint32 version, Size struct_size,
+validate_abi(uint32 version, Size struct_size, uint32 expected_version,
 			 const char *what, Size required_size)
 {
-	if (version != PG_BATCH_ABI_VERSION || struct_size < required_size)
+	if (version != expected_version || struct_size < required_size)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("incompatible %s ABI", what),
 				 errdetail("Expected version %u and at least %zu bytes, got version %u and %zu bytes.",
-						   PG_BATCH_ABI_VERSION, required_size,
+						   expected_version, required_size,
 						   version, struct_size)));
 }
 
@@ -165,11 +167,13 @@ register_provider(const PgBatchProviderOps *provider)
 {
 	MemoryContext oldcontext;
 
-	if (provider == NULL || provider->provider_name == NULL ||
-		provider->provider_name[0] == '\0')
-		elog(ERROR, "pg_batch provider must have a name");
+	if (provider == NULL)
+		elog(ERROR, "pg_batch cannot register a null provider");
 	validate_abi(provider->abi_version, provider->struct_size,
-				 "provider", sizeof(PgBatchProviderOps));
+				 PG_BATCH_PROVIDER_OPS_ABI_VERSION,
+				 "provider", PG_BATCH_PROVIDER_OPS_MIN_SIZE);
+	if (provider->provider_name == NULL || provider->provider_name[0] == '\0')
+		elog(ERROR, "pg_batch provider must have a name");
 	if (provider->supports_relation == NULL || provider->plan_scan == NULL ||
 		provider->begin_scan == NULL || provider->rescan == NULL ||
 		provider->end_scan == NULL)
@@ -244,14 +248,16 @@ register_producer(const PgBatchProducerOps *producer)
 {
 	MemoryContext oldcontext;
 
-	if (producer == NULL || producer->producer_name == NULL ||
-		producer->producer_name[0] == '\0' ||
+	if (producer == NULL)
+		elog(ERROR, "pg_batch cannot register a null producer");
+	validate_abi(producer->abi_version, producer->struct_size,
+				 PG_BATCH_PRODUCER_OPS_ABI_VERSION,
+				 "producer", PG_BATCH_PRODUCER_OPS_MIN_SIZE);
+	if (producer->producer_name == NULL || producer->producer_name[0] == '\0' ||
 		producer->supports_path == NULL ||
 		producer->get_output_layout == NULL ||
 		producer->get_request_binding == NULL)
 		elog(ERROR, "invalid pg_batch producer registration");
-	validate_abi(producer->abi_version, producer->struct_size,
-				 "producer", sizeof(PgBatchProducerOps));
 	foreach_ptr(const PgBatchProducerOps, existing, producers)
 	{
 		if (strcmp(existing->producer_name, producer->producer_name) == 0)
@@ -333,12 +339,14 @@ attach_slot(TupleTableSlot *slot,
 	if (slot == NULL || ncolumns < 0 ||
 		(ncolumns > 0 && source_attnums == NULL))
 		elog(ERROR, "invalid pg_batch slot configuration");
-	if (consumer_ops == NULL || consumer_ops->accept_batch == NULL ||
-		consumer_ops->select_row == NULL)
+	if (consumer_ops == NULL)
 		elog(ERROR, "pg_batch slot requires consumer operations");
 	validate_abi(consumer_ops->abi_version,
-				 consumer_ops->struct_size, "consumer",
-				 sizeof(PgBatchConsumerOps));
+				 consumer_ops->struct_size,
+				 PG_BATCH_CONSUMER_OPS_ABI_VERSION,
+				 "consumer", PG_BATCH_CONSUMER_OPS_MIN_SIZE);
+	if (consumer_ops->accept_batch == NULL || consumer_ops->select_row == NULL)
+		elog(ERROR, "pg_batch slot requires consumer operations");
 	init_slots();
 	entry = hash_search(slot_entries, &key, HASH_ENTER, &found);
 	if (found)
@@ -354,6 +362,7 @@ attach_slot(TupleTableSlot *slot,
 		memcpy(attnums, source_attnums, sizeof(AttrNumber) * ncolumns);
 	}
 	binding->request.source_attnums = attnums;
+	binding->request.struct_size = sizeof(PgBatchRequest);
 	binding->request.ncolumns = ncolumns;
 	binding->consumer_ops = consumer_ops;
 	binding->cleanup.func = slot_reset;
@@ -415,20 +424,23 @@ publish_batch(PgBatchBinding *binding,
 {
 	if (binding->batch != NULL)
 		elog(ERROR, "pg_batch source published a new batch before clearing the previous one");
-	if (batch == NULL || batch->ops == NULL || batch->selection == NULL ||
+	if (batch == NULL)
+		elog(ERROR, "pg_batch source published an invalid batch");
+	validate_abi(batch->abi_version, batch->struct_size,
+				 PG_BATCH_ABI_VERSION, "batch", PG_BATCH_MIN_SIZE);
+	if (batch->ops == NULL || batch->selection == NULL ||
 		batch->nrows <= 0 || batch->nwords != (batch->nrows + 63) / 64)
 		elog(ERROR, "pg_batch source published an invalid batch");
 	if (batch->nrows % 64 != 0 &&
 		(batch->selection[batch->nwords - 1] &
 		 (UINT64_MAX << (batch->nrows % 64))) != 0)
 		elog(ERROR, "pg_batch source selected rows beyond the end of its batch");
-	validate_abi(batch->abi_version, batch->struct_size,
-				 "batch", sizeof(PgBatch));
 	if (batch->ops != binding->validated_ops)
 	{
 		validate_abi(batch->ops->abi_version,
-					 batch->ops->struct_size, "batch operations",
-					 sizeof(PgBatchOps));
+					 batch->ops->struct_size,
+					 PG_BATCH_OPS_ABI_VERSION,
+					 "batch operations", PG_BATCH_OPS_MIN_SIZE);
 		if (batch->ops->get_datum_column == NULL)
 			elog(ERROR, "pg_batch source must provide Datum materialization");
 		binding->validated_ops = batch->ops;
@@ -447,7 +459,8 @@ get_batch(PgBatchBinding *binding)
 static void
 select_row(PgBatchBinding *binding, int row)
 {
-	if (binding->batch == NULL || row < 0 || row >= binding->batch->nrows ||
+	if (binding->batch == NULL || binding->batch_finished ||
+		row < 0 || row >= binding->batch->nrows ||
 		!pg_batch_row_selected(binding->batch, row))
 		elog(ERROR, "pg_batch cannot select row %d", row);
 	binding->consumer_ops->select_row(binding->slot, binding->batch, row);
@@ -456,7 +469,7 @@ select_row(PgBatchBinding *binding, int row)
 static void
 finish_batch(PgBatchBinding *binding)
 {
-	if (binding->batch == NULL)
+	if (binding->batch == NULL || binding->batch_finished)
 		elog(ERROR, "pg_batch cannot finish a slot without an active batch");
 	binding->batch_finished = true;
 }
@@ -493,6 +506,19 @@ detach_binding(PgBatchBinding *binding)
 		pfree((void *) binding->request.source_attnums);
 	hash_search(slot_entries, &key, HASH_REMOVE, NULL);
 	pfree(binding);
+}
+
+static void
+get_row_view(PgBatchBinding *binding, PgBatchRowView *result)
+{
+	if (result == NULL || result->struct_size < PG_BATCH_ROW_VIEW_MIN_SIZE)
+		elog(ERROR, "pg_batch received an incompatible row view");
+	if (binding == NULL || binding->batch == NULL || binding->batch_finished)
+		elog(ERROR, "pg_batch binding has no active batch");
+	result->slot = binding->slot;
+	result->batch = binding->batch;
+	result->finished = &binding->batch_finished;
+	result->select_row = binding->consumer_ops->select_row;
 }
 
 void

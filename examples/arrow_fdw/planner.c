@@ -62,9 +62,13 @@ provider_plan_scan(const PgBatchSourcePlanRequest *request,
 {
 	List	   *source_exprs = NIL;
 	List	   *specs = NIL;
-	int			nquals = list_length(request->clauses);
+	int			nquals;
 
-	MemSet(result, 0, sizeof(*result));
+	if (request->struct_size < PG_BATCH_SOURCE_PLAN_REQUEST_MIN_SIZE ||
+		result->struct_size < PG_BATCH_SOURCE_PLAN_RESULT_MIN_SIZE)
+		elog(ERROR, "pg_batch_fdw received an incompatible planning request");
+	nquals = list_length(request->clauses);
+
 	result->nquals = nquals;
 	result->qual_support = palloc0_array(PgBatchQualSupport, nquals);
 	classify_quals(request->rel, request->clauses, request->restrictinfos,
@@ -76,6 +80,8 @@ provider_plan_scan(const PgBatchSourcePlanRequest *request,
 static void *
 provider_begin_scan(const PgBatchSourceExecRequest *request)
 {
+	if (request->struct_size < PG_BATCH_SOURCE_EXEC_REQUEST_MIN_SIZE)
+		elog(ERROR, "pg_batch_fdw received an incompatible execution request");
 	return pg_batch_fdw_scan_begin(request->relation, request->parent,
 								   request->source_private,
 								   request->source_exprs,
@@ -108,8 +114,8 @@ provider_explain(void *provider_state, ExplainState *es)
 }
 
 const PgBatchProviderOps pg_batch_fdw_provider_ops = {
-	.abi_version = PG_BATCH_ABI_VERSION,
-	.struct_size = sizeof(PgBatchProviderOps),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_PROVIDER_OPS_ABI_VERSION,
+		PgBatchProviderOps),
 	.provider_name = PG_BATCH_FDW_PROVIDER_NAME,
 	.supports_relation = supports_relation,
 	.plan_scan = provider_plan_scan,

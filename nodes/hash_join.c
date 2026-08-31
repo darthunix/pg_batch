@@ -1167,6 +1167,7 @@ get_output_datum_column(PgBatch *batch, int column,
 	uint64		missing;
 	MemoryContext oldcontext;
 
+	pg_batch_check_datum_vector(result);
 	if (column < 0 || column >= state->noutput_columns)
 		elog(ERROR, "pg_batch hash join output column is out of range");
 	oldcontext = MemoryContextSwitchTo(state->slot_context);
@@ -1216,8 +1217,8 @@ get_output_arrow_column(PgBatch *batch, int column,
 }
 
 static const PgBatchArrowInterface output_arrow_interface = {
-	.abi_version = PG_BATCH_ARROW_INTERFACE_VERSION,
-	.struct_size = sizeof(PgBatchArrowInterface),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_ARROW_INTERFACE_VERSION,
+		PgBatchArrowInterface),
 	.get_column = get_output_arrow_column,
 };
 
@@ -1232,8 +1233,7 @@ get_output_native_interface(PgBatch *batch, const char *name,
 }
 
 static const PgBatchOps hash_join_batch_ops = {
-	.abi_version = PG_BATCH_ABI_VERSION,
-	.struct_size = sizeof(PgBatchOps),
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_OPS_ABI_VERSION, PgBatchOps),
 	.prepare_columns = prepare_output_columns,
 	.get_datum_column = get_output_datum_column,
 	.get_native_interface = get_output_native_interface,
