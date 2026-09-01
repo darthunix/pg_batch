@@ -11,6 +11,7 @@
 #include "postgres.h"
 
 #include "access/tupdesc.h"
+#include "storage/dsm.h"
 
 #include "batch.h"
 #include "vector.h"
@@ -19,6 +20,9 @@
 
 typedef struct PgBatchSpillSet PgBatchSpillSet;
 typedef struct PgBatchSpillReader PgBatchSpillReader;
+typedef struct PgBatchSharedSpill PgBatchSharedSpill;
+typedef struct PgBatchSharedSpillWriter PgBatchSharedSpillWriter;
+typedef struct PgBatchSharedSpillReader PgBatchSharedSpillReader;
 
 typedef struct PgBatchSpillStats
 {
@@ -88,5 +92,52 @@ extern void pg_batch_spill_reader_close(PgBatchSpillReader *reader);
 extern const PgBatchSpillStats *pg_batch_spill_stats(
 	const PgBatchSpillSet *set);
 extern void pg_batch_spill_destroy(PgBatchSpillSet *set);
+
+/*
+ * Shared spill storage for parallel nodes.
+ *
+ * The caller places pg_batch_shared_spill_estimate() bytes in DSM and owns
+ * synchronization between its write and read phases. Each participant has
+ * one writer and writes only its own files. A partition reader combines the
+ * finished files from all participants. The shared object owns a
+ * SharedFileSet whose lifetime is tied to the supplied DSM segment.
+ */
+extern Size pg_batch_shared_spill_estimate(int participants, int partitions);
+extern PgBatchSharedSpill *pg_batch_shared_spill_initialize(
+	void *shared_memory, dsm_segment *segment, int participants,
+	int partitions, int ncolumns);
+extern PgBatchSharedSpill *pg_batch_shared_spill_attach(
+	void *shared_memory, dsm_segment *segment);
+extern void pg_batch_shared_spill_reset(PgBatchSharedSpill *shared);
+
+extern PgBatchSharedSpillWriter *pg_batch_shared_spill_writer_create(
+	MemoryContext parent_context, PgBatchSharedSpill *shared,
+	int participant, TupleDesc tuple_desc, Size buffer_limit);
+extern void pg_batch_shared_spill_write(PgBatchSharedSpillWriter *writer,
+	int partition, const PgBatchInt4Vector *columns,
+	const PgBatchSelection *selection, const uint32 *hashes);
+extern void pg_batch_shared_spill_write_dense(
+	PgBatchSharedSpillWriter *writer, int partition, int nrows,
+	const uint32 *hashes, const int32 *values, int value_stride,
+	const uint64 *validity);
+extern void pg_batch_shared_spill_writer_finish(
+	PgBatchSharedSpillWriter *writer);
+extern void pg_batch_shared_spill_writer_destroy(
+	PgBatchSharedSpillWriter *writer);
+
+extern uint64 pg_batch_shared_spill_partition_rows(
+	const PgBatchSharedSpill *shared, int partition);
+extern PgBatchSharedSpillReader *pg_batch_shared_spill_reader_open(
+	MemoryContext parent_context, PgBatchSharedSpill *shared, int partition);
+extern bool pg_batch_shared_spill_reader_next(
+	PgBatchSharedSpillReader *reader, PgBatchSpillBlock *result);
+extern void pg_batch_shared_spill_reader_rewind(
+	PgBatchSharedSpillReader *reader);
+extern void pg_batch_shared_spill_reader_close(
+	PgBatchSharedSpillReader *reader);
+extern const PgBatchSpillStats *pg_batch_shared_spill_reader_stats(
+	const PgBatchSharedSpillReader *reader);
+extern void pg_batch_shared_spill_stats(const PgBatchSharedSpill *shared,
+	PgBatchSpillStats *result);
 
 #endif /* PG_BATCH_SPILL_H */

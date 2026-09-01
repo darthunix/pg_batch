@@ -69,6 +69,11 @@ static const CustomExecMethods hash_join_exec_methods = {
 	.ExecCustomScan = hash_join_exec,
 	.EndCustomScan = hash_join_end,
 	.ReScanCustomScan = hash_join_rescan,
+	.EstimateDSMCustomScan = parallel_hash_join_estimate_dsm,
+	.InitializeDSMCustomScan = parallel_hash_join_initialize_dsm,
+	.ReInitializeDSMCustomScan = parallel_hash_join_reinitialize_dsm,
+	.InitializeWorkerCustomScan = parallel_hash_join_initialize_worker,
+	.ShutdownCustomScan = parallel_hash_join_shutdown,
 	.ExplainCustomScan = hash_join_explain,
 };
 
@@ -146,8 +151,6 @@ ensure_input_row(PgBatch *batch, int column, int row,
 
 	if (input->prepared)
 	{
-		if (input->vector.layout == PG_BATCH_INT4_PACKED)
-			return;
 		if ((input->available_rows & row_word) != 0)
 			return;
 	}
@@ -274,6 +277,35 @@ append_build_row_hash(BatchHashJoinState *state, InputColumn *columns, int row,
 		if (!isnull)
 			store->columns[column].validity[stored_row / 64] |=
 				UINT64CONST(1) << (stored_row % 64);
+	}
+}
+
+void
+hash_join_append_dense_build(BatchHashJoinState *state,
+							 const PgBatchSpillBlock *block)
+{
+	BuildStore *store = &state->build;
+
+	if (block->ncolumns != store->ncolumns)
+		elog(ERROR, "invalid pg_batch parallel build block");
+	while (store->capacity - store->nrows < (uint32) block->nrows)
+		hash_join_grow_build_store(store);
+	for (int row = 0; row < block->nrows; row++)
+	{
+		uint32		stored_row = store->nrows++;
+
+		store->links[stored_row].hash = block->hashes[row];
+		for (int column = 0; column < store->ncolumns; column++)
+		{
+			bool		valid = (block->validity[column * 8 + row / 8] &
+				((uint8) 1 << (row % 8))) != 0;
+
+			store->columns[column].values[stored_row] =
+				block->values[column * PG_BATCH_SPILL_BLOCK_ROWS + row];
+			if (valid)
+				store->columns[column].validity[stored_row / 64] |=
+					UINT64CONST(1) << (stored_row % 64);
+		}
 	}
 }
 
@@ -540,6 +572,8 @@ hash_join_prepare_probe_keys(BatchHashJoinState *state)
 static bool
 fetch_probe_batch(BatchHashJoinState *state)
 {
+	if (state->parallel != NULL)
+		return parallel_hash_join_fetch_probe(state);
 	if (state->spilled)
 	{
 		if (state->build_rows == 0)
@@ -617,6 +651,11 @@ finish_probe_batch(BatchHashJoinState *state)
 {
 	if (state->probe_batch == NULL)
 		return;
+	if (state->parallel != NULL)
+	{
+		parallel_hash_join_finish_probe(state);
+		return;
+	}
 	if (state->probe_from_resident)
 		hash_join_finish_resident_probe(state);
 	else if (!state->probe_from_spill)
@@ -628,7 +667,11 @@ static uint32
 find_build_head(BatchHashJoinState *state, uint32 hash, int probe_row)
 {
 	BuildStore *store = &state->build;
-	uint32		bucket = (hash >> store->hash_shift) & (store->nbuckets - 1);
+	uint32		bucket;
+
+	if (state->parallel != NULL)
+		return parallel_hash_join_find_head(state, hash, probe_row);
+	bucket = (hash >> store->hash_shift) & (store->nbuckets - 1);
 
 	for (;;)
 	{
@@ -735,14 +778,34 @@ build_value_valid(const BuildStore *store, int column, uint32 row)
 			(UINT64CONST(1) << (row % 64))) != 0;
 }
 
+static inline int32
+build_value(BatchHashJoinState *state, int column, uint32 row, bool *isnull)
+{
+	if (state->parallel != NULL)
+		return parallel_hash_join_build_value(state, column, row, isnull);
+	*isnull = !build_value_valid(&state->build, column, row);
+	return *isnull ? 0 : state->build.columns[column].values[row];
+}
+
 static void
 ensure_probe_raw_column(BatchHashJoinState *state, int column, int row)
 {
-	ensure_input_row(state->probe_batch,
-					 state->probe_from_spill ? column :
-					 state->outer_batch_columns[column], row,
-					 &state->probe_columns[column], PG_BATCH_PROJECT_PHASE,
-					 state->join_context);
+	InputColumn *input = &state->probe_columns[column];
+	int			batch_column = state->probe_from_spill ? column :
+		state->outer_batch_columns[column];
+
+	/* Spill and resident blocks already own every packed value in the batch. */
+	if ((state->probe_from_spill || state->probe_from_resident) &&
+		(!input->prepared ||
+		 (input->available_rows & (UINT64CONST(1) << (row % 64))) == 0))
+	{
+		hash_join_load_input_column(state->probe_batch, batch_column,
+			&state->probe_batch->selection, PG_BATCH_PROJECT_PHASE, input,
+			state->join_context);
+		return;
+	}
+	ensure_input_row(state->probe_batch, batch_column, row, input,
+		PG_BATCH_PROJECT_PHASE, state->join_context);
 }
 
 static void
@@ -774,13 +837,13 @@ fill_raw_slot(BatchHashJoinState *state, int probe_row, uint32 build_row,
 		else
 		{
 			int			inner_column = column - state->nouter_columns;
-			bool		isnull = !build_value_valid(&state->build,
-												 inner_column, build_row);
+			bool		isnull;
+			int32		value = build_value(state, inner_column, build_row,
+				&isnull);
 
 			slot->tts_isnull[column] = isnull;
 			if (!isnull)
-				slot->tts_values[column] = Int32GetDatum(
-					state->build.columns[inner_column].values[build_row]);
+				slot->tts_values[column] = Int32GetDatum(value);
 		}
 	}
 	ExecStoreVirtualTuple(slot);
@@ -826,7 +889,10 @@ probe_round(BatchHashJoinState *state)
 			state->output_probe_rows[output] = state->probe_rows[lane];
 			state->output_build_rows[output] = build_row;
 		}
-		state->probe_build_rows[lane] = store->links[build_row].next;
+		state->probe_build_rows[lane] = state->parallel != NULL ?
+			parallel_hash_join_next(state, build_row,
+				state->probe_rows[lane]) :
+			store->links[build_row].next;
 		if (state->probe_build_rows[lane] != 0)
 			remaining++;
 		processed++;
@@ -878,9 +944,7 @@ raw_value(BatchHashJoinState *state, int raw_column, int output_row,
 	{
 		int			inner_column = raw_column - state->nouter_columns;
 
-		*isnull = !build_value_valid(&state->build, inner_column, build_row);
-		*value = *isnull ? 0 :
-			state->build.columns[inner_column].values[build_row];
+		*value = build_value(state, inner_column, build_row, isnull);
 	}
 	return !*isnull;
 }
@@ -931,9 +995,7 @@ prepared_qual_value(BatchHashJoinState *state, int raw_column, int output_row,
 		int			inner_column = raw_column - state->nouter_columns;
 		uint32		build_row = state->output_build_rows[output_row];
 
-		*isnull = !build_value_valid(&state->build, inner_column, build_row);
-		return *isnull ? 0 :
-			state->build.columns[inner_column].values[build_row];
+		return build_value(state, inner_column, build_row, isnull);
 	}
 }
 
@@ -1130,10 +1192,7 @@ prepare_direct_output_column(BatchHashJoinState *state, OutputColumn *output,
 			int			inner_column = raw_column - state->nouter_columns;
 			uint32		build_row = state->output_build_rows[row];
 
-			isnull = !build_value_valid(&state->build, inner_column,
-										 build_row);
-			value = isnull ? 0 :
-				state->build.columns[inner_column].values[build_row];
+			value = build_value(state, inner_column, build_row, &isnull);
 		}
 		output->values[row] = value;
 		if (!isnull)
@@ -1351,7 +1410,8 @@ produce_output(BatchHashJoinState *state)
 		}
 		if (state->probe_batch == NULL && !fetch_probe_batch(state))
 			return state->output_count > 0;
-		if (!state->build.has_duplicates)
+		if (state->parallel == NULL ? !state->build.has_duplicates :
+			parallel_hash_join_build_is_unique(state))
 		{
 			if (probe_unique_rows(state))
 			{
@@ -1640,7 +1700,12 @@ hash_join_exec(CustomScanState *node)
 	BatchHashJoinState *state = (BatchHashJoinState *) node;
 
 	if (!state->built)
-		build_hash_table(state);
+	{
+		if (state->parallel != NULL)
+			parallel_hash_join_prepare(state);
+		else
+			build_hash_table(state);
+	}
 	if (state->output_request->spec.output_mode == PG_BATCH_OUTPUT_BATCH)
 		return exec_batch(state);
 	return exec_row(state);
@@ -1652,6 +1717,7 @@ hash_join_end(CustomScanState *node)
 	BatchHashJoinState *state = (BatchHashJoinState *) node;
 
 	clear_published_output(state, false);
+	parallel_hash_join_end(state);
 	hash_join_close_spill_files(state);
 	pg_batch_end_children(node);
 	if (state->join_context != NULL)
@@ -1666,6 +1732,7 @@ hash_join_rescan(CustomScanState *node)
 	clear_published_output(state, false);
 	if (state->probe_batch != NULL)
 		finish_probe_batch(state);
+	parallel_hash_join_rescan(state);
 	hash_join_close_spill_files(state);
 	MemoryContextReset(state->spill_context);
 	state->probe_batch = NULL;
@@ -1725,10 +1792,15 @@ hash_join_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
 	BatchHashJoinState *state = (BatchHashJoinState *) node;
 
-	ExplainPropertyInteger("Hash Buckets", NULL, state->build.nbuckets, es);
+	if (state->parallel != NULL)
+		parallel_hash_join_explain(state, es);
+	else if (node->ss.ps.plan->parallel_aware)
+		ExplainPropertyBool("Shared Hash", state->planned_partitions <= 1, es);
+	else
+		ExplainPropertyInteger("Hash Buckets", NULL, state->build.nbuckets, es);
 	ExplainPropertyInteger("Planned Partitions", NULL,
 						   state->planned_partitions, es);
-	if (state->spilled)
+	if (state->spilled && state->parallel == NULL)
 	{
 		ExplainPropertyInteger("Spill Partitions", NULL,
 								   state->npartitions, es);
@@ -1758,14 +1830,16 @@ hash_join_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 		ExplainPropertyInteger("Output Rows", NULL, state->output_rows, es);
 		if (state->spilled)
 		{
-			ExplainPropertyInteger("Resident Probe Rows", NULL,
-								   state->resident_probe_rows, es);
+			if (state->parallel == NULL)
+				ExplainPropertyInteger("Resident Probe Rows", NULL,
+									   state->resident_probe_rows, es);
 			ExplainPropertyInteger("Build Rows Written To Spill", NULL,
 								   state->spill_build_rows, es);
 			ExplainPropertyInteger("Probe Rows Written To Spill", NULL,
 								   state->spill_probe_rows, es);
-			ExplainPropertyInteger("Probe Rows Rejected By Bloom", NULL,
-								   state->bloom_rejected_rows, es);
+			if (state->parallel == NULL)
+				ExplainPropertyInteger("Probe Rows Rejected By Bloom", NULL,
+									   state->bloom_rejected_rows, es);
 			ExplainPropertyInteger("Probe Rows Read From Spill", NULL,
 								   state->spill_probe_reads, es);
 			ExplainPropertyInteger("Spill Pages Read", NULL,

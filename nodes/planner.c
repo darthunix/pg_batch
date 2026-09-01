@@ -15,6 +15,7 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/planner.h"
+#include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
@@ -111,7 +112,7 @@ read_hash_path_data(const CustomPath *path, List **hash_quals,
 }
 
 static List *
-make_agg_path_data(const char *child_name, List *specs)
+make_agg_path_data(const char *child_name, List *specs, bool partial)
 {
 	PgBatchPlanWriter *writer = pg_batch_plan_writer_create("aggregate_path",
 		PG_BATCH_PLAN_DATA_VERSION);
@@ -127,12 +128,13 @@ make_agg_path_data(const char *child_name, List *specs)
 	pg_batch_plan_write_string(writer, "child_name", child_name);
 	pg_batch_plan_write_int_list(writer, "kinds", kinds);
 	pg_batch_plan_write_list(writer, "expressions", expressions);
+	pg_batch_plan_write_int(writer, "partial", partial ? 1 : 0);
 	return pg_batch_plan_writer_finish(writer);
 }
 
 static void
 read_agg_path_data(const CustomPath *path, const char **child_name,
-	List **kinds, List **expressions)
+	List **kinds, List **expressions, bool *partial)
 {
 	PgBatchPlanReader *reader = pg_batch_plan_reader_create(
 		path->custom_private, "aggregate_path", PG_BATCH_PLAN_DATA_VERSION);
@@ -140,6 +142,7 @@ read_agg_path_data(const CustomPath *path, const char **child_name,
 	*child_name = pg_batch_plan_read_string(reader, "child_name");
 	*kinds = pg_batch_plan_read_int_list(reader, "kinds");
 	*expressions = pg_batch_plan_read_list(reader, "expressions");
+	*partial = pg_batch_plan_read_int(reader, "partial") != 0;
 	if (list_length(*kinds) != list_length(*expressions))
 		elog(ERROR, "pg_batch aggregate path fields are misaligned");
 	pg_batch_plan_reader_finish(reader);
@@ -606,6 +609,54 @@ make_base_path(RelOptInfo *rel, PgBatchHeapScanMode mode)
 	return path;
 }
 
+static bool
+source_supports_parallel(const PgBatchSourceOps *source, Relation relation)
+{
+	const PgBatchSourceParallelOps *parallel;
+
+	if (source == NULL || source->delivery != PG_BATCH_SOURCE_PULL ||
+		!PG_BATCH_ABI_HAS_FIELD(source, PgBatchSourceOps, parallel) ||
+		source->parallel == NULL)
+		return false;
+	parallel = source->parallel;
+	return parallel->abi_version == PG_BATCH_SOURCE_PARALLEL_OPS_ABI_VERSION &&
+		parallel->struct_size >= PG_BATCH_SOURCE_PARALLEL_OPS_MIN_SIZE &&
+		parallel->supports_parallel != NULL &&
+		parallel->estimate != NULL && parallel->initialize != NULL &&
+		parallel->reinitialize != NULL && parallel->attach != NULL &&
+		parallel->supports_parallel(relation);
+}
+
+static void
+add_parallel_seq_paths(RelOptInfo *rel, Relation relation,
+					   List *candidate_paths)
+{
+	const PgBatchSourceOps *source = pg_batch_api->find_source(relation);
+
+	if (relation->rd_rel->relam != HEAP_TABLE_AM_OID &&
+		!source_supports_parallel(source, relation))
+		return;
+	foreach_ptr(Path, candidate, candidate_paths)
+	{
+		CustomPath *path;
+
+		if (candidate->pathtype != T_SeqScan ||
+			candidate->param_info != NULL || !candidate->parallel_aware ||
+			!candidate->parallel_safe)
+			continue;
+		path = make_base_path(rel, PG_BATCH_HEAP_SEQ);
+		path->path.rows = candidate->rows;
+		path->path.disabled_nodes = candidate->disabled_nodes;
+		path->path.startup_cost = candidate->startup_cost;
+		path->path.total_cost = candidate->total_cost * 0.90;
+		path->path.pathkeys = candidate->pathkeys;
+		path->path.parallel_aware = true;
+		path->path.parallel_safe = true;
+		path->path.parallel_workers = candidate->parallel_workers;
+		add_partial_path(rel, &path->path);
+	}
+}
+
 static void
 add_bitmap_paths(PlannerInfo *root, RelOptInfo *rel, List *candidate_paths)
 {
@@ -681,6 +732,7 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 {
 	Relation	relation;
 	List	   *candidate_paths;
+	List	   *candidate_partial_paths;
 	CustomPath *path;
 	Path	   *foreign_path = NULL;
 
@@ -696,6 +748,7 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	 * alternatives.
 	 */
 	candidate_paths = list_copy(rel->pathlist);
+	candidate_partial_paths = list_copy(rel->partial_pathlist);
 
 	/*
 	 * This experiment deliberately remains heap-specific. The normal bitmap
@@ -706,7 +759,9 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	relation = table_open(rte->relid, NoLock);
 	if (relation->rd_rel->relam == HEAP_TABLE_AM_OID)
 		add_bitmap_paths(root, rel, candidate_paths);
+	add_parallel_seq_paths(rel, relation, candidate_partial_paths);
 	table_close(relation, NoLock);
+	list_free(candidate_partial_paths);
 
 	path = make_base_path(rel, PG_BATCH_HEAP_SEQ);
 	if (rte->relkind == RELKIND_FOREIGN_TABLE)
@@ -781,8 +836,7 @@ can_make_batch_input(PlannerInfo *root, Path *path)
 
 	if (pg_batch_api->find_node(path) != NULL)
 		return true;
-	if (rel->reloptkind != RELOPT_BASEREL || path->param_info != NULL ||
-		path->parallel_aware)
+	if (rel->reloptkind != RELOPT_BASEREL || path->param_info != NULL)
 		return false;
 	if (path->pathtype != T_SeqScan && !IsA(path, ForeignPath))
 		return false;
@@ -819,20 +873,20 @@ path_expression_position(Path *path, Node *expr)
 static bool
 can_pack_input(Path *path)
 {
-	return path->param_info == NULL && !path->parallel_aware &&
+	return path->param_info == NULL &&
 		path_outputs_supported_columns(path);
 }
 
 static bool
 hash_path_supported(PlannerInfo *root, HashPath *hash, RelOptInfo *outerrel,
-					RelOptInfo *innerrel)
+					RelOptInfo *innerrel, bool parallel)
 {
 	Path	   *outer = hash->jpath.outerjoinpath;
 	Path	   *inner = hash->jpath.innerjoinpath;
 
 	if (hash->jpath.jointype != JOIN_INNER ||
 		hash->jpath.path.param_info != NULL ||
-		hash->jpath.path.parallel_aware ||
+		hash->jpath.path.parallel_aware != parallel ||
 		outer->parent != outerrel || inner->parent != innerrel ||
 		(!can_make_batch_input(root, outer) &&
 		 !can_make_batch_input(root, inner)) ||
@@ -894,7 +948,6 @@ make_pack_input(Path *source)
 	path->path = *source;
 	NodeSetTag(path, T_CustomPath);
 	path->path.pathtype = T_CustomScan;
-	path->path.parallel_aware = false;
 	path->flags = 0;
 	path->custom_paths = list_make1(source);
 	path->methods = &pg_batch_pack_path_methods;
@@ -926,6 +979,9 @@ make_join_input(PlannerInfo *root, Path *source, const char **node_name)
 	path->path.startup_cost = source->startup_cost;
 	path->path.total_cost = source->total_cost;
 	path->path.pathkeys = source->pathkeys;
+	path->path.parallel_aware = source->parallel_aware;
+	path->path.parallel_safe = source->parallel_safe;
+	path->path.parallel_workers = source->parallel_workers;
 	node = pg_batch_api->find_node(&path->path);
 	if (node == NULL)
 		elog(ERROR, "pg_batch batch input has no registered node");
@@ -934,16 +990,43 @@ make_join_input(PlannerInfo *root, Path *source, const char **node_name)
 }
 
 static void
-set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
-				  RelOptInfo *outerrel, RelOptInfo *innerrel,
-				  JoinType jointype, JoinPathExtraData *extra)
+add_hash_join_path(PlannerInfo *root, RelOptInfo *joinrel, HashPath *best,
+				   bool partial)
 {
-	HashPath   *best = NULL;
 	CustomPath *path;
 	Path	   *outer_input;
 	Path	   *inner_input;
 	const char *outer_node_name;
 	const char *inner_node_name;
+
+	path = makeNode(CustomPath);
+	path->path = best->jpath.path;
+	NodeSetTag(path, T_CustomPath);
+	path->path.pathtype = T_CustomScan;
+	path->path.total_cost *= 0.85;
+	path->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+	outer_input = make_join_input(root, best->jpath.outerjoinpath,
+								  &outer_node_name);
+	inner_input = make_join_input(root, best->jpath.innerjoinpath,
+								  &inner_node_name);
+	path->custom_paths = list_make2(outer_input, inner_input);
+	path->custom_restrictinfo = copyObject(best->jpath.joinrestrictinfo);
+	path->custom_private = make_hash_path_data(best->path_hashclauses,
+		best->num_batches, outer_node_name, inner_node_name);
+	path->methods = &pg_batch_hash_join_path_methods;
+	if (partial)
+		add_partial_path(joinrel, &path->path);
+	else
+		add_path(joinrel, &path->path);
+}
+
+static void
+set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
+				  RelOptInfo *outerrel, RelOptInfo *innerrel,
+				  JoinType jointype, JoinPathExtraData *extra)
+{
+	HashPath   *best = NULL;
+	HashPath   *best_parallel = NULL;
 
 	if (previous_set_join_pathlist_hook != NULL)
 		previous_set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
@@ -959,31 +1042,26 @@ set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 		if (!IsA(candidate, HashPath))
 			continue;
 		hash = castNode(HashPath, candidate);
-		if (hash_path_supported(root, hash, outerrel, innerrel) &&
+		if (hash_path_supported(root, hash, outerrel, innerrel, false) &&
 			(best == NULL || candidate->total_cost < best->jpath.path.total_cost))
 			best = hash;
 	}
-	if (best == NULL)
-		return;
+	foreach_ptr(Path, candidate, joinrel->partial_pathlist)
+	{
+		HashPath   *hash;
 
-	path = makeNode(CustomPath);
-	path->path = best->jpath.path;
-	NodeSetTag(path, T_CustomPath);
-	path->path.pathtype = T_CustomScan;
-	path->path.parallel_aware = false;
-	path->path.parallel_safe = false;
-	path->path.total_cost *= 0.85;
-	path->flags = CUSTOMPATH_SUPPORT_PROJECTION;
-	outer_input = make_join_input(root, best->jpath.outerjoinpath,
-								  &outer_node_name);
-	inner_input = make_join_input(root, best->jpath.innerjoinpath,
-								  &inner_node_name);
-	path->custom_paths = list_make2(outer_input, inner_input);
-	path->custom_restrictinfo = copyObject(best->jpath.joinrestrictinfo);
-	path->custom_private = make_hash_path_data(best->path_hashclauses,
-		best->num_batches, outer_node_name, inner_node_name);
-	path->methods = &pg_batch_hash_join_path_methods;
-	add_path(joinrel, &path->path);
+		if (!IsA(candidate, HashPath))
+			continue;
+		hash = castNode(HashPath, candidate);
+		if (hash_path_supported(root, hash, outerrel, innerrel, true) &&
+			(best_parallel == NULL ||
+			 candidate->total_cost < best_parallel->jpath.path.total_cost))
+			best_parallel = hash;
+	}
+	if (best != NULL)
+		add_hash_join_path(root, joinrel, best, false);
+	if (best_parallel != NULL)
+		add_hash_join_path(root, joinrel, best_parallel, true);
 }
 
 static bool
@@ -1093,13 +1171,13 @@ query_aggregate_specs(PlannerInfo *root)
 }
 
 static Path *
-find_batch_path(RelOptInfo *input_rel, const char **node_name)
+find_batch_path(List *paths, const char **node_name)
 {
 	Path	   *best = NULL;
 	const PgBatchNodeOps *best_node = NULL;
 	ListCell   *lc;
 
-	foreach(lc, input_rel->pathlist)
+	foreach(lc, paths)
 	{
 		Path	   *path = lfirst(lc);
 		const PgBatchNodeOps *node =
@@ -1116,28 +1194,12 @@ find_batch_path(RelOptInfo *input_rel, const char **node_name)
 	return best;
 }
 
-static void
-create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
-				   RelOptInfo *input_rel, RelOptInfo *output_rel,
-				   void *extra)
+static Path *
+prepare_aggregate_child(PlannerInfo *root, RelOptInfo *input_rel,
+						Path *child, const char **node_name, List *agg_specs)
 {
-	Path	   *child;
-	CustomPath *path;
-	List	   *agg_specs;
-	const char *node_name;
 	bool		needs_project = false;
 
-	if (previous_create_upper_paths_hook != NULL)
-		previous_create_upper_paths_hook(root, stage, input_rel, output_rel,
-										 extra);
-	if (!pg_batch_enable || stage != UPPERREL_GROUP_AGG)
-		return;
-	agg_specs = query_aggregate_specs(root);
-	if (agg_specs == NIL)
-		return;
-	child = find_batch_path(input_rel, &node_name);
-	if (child == NULL)
-		return;
 	foreach_ptr(List, spec, agg_specs)
 	{
 		Node	   *expr = lsecond(spec);
@@ -1176,6 +1238,10 @@ create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		project->path.pathtype = T_CustomScan;
 		project->path.parent = input_rel;
 		project->path.pathtarget = target;
+		project->path.param_info = child->param_info;
+		project->path.parallel_aware = false;
+		project->path.parallel_safe = child->parallel_safe;
+		project->path.parallel_workers = child->parallel_workers;
 		project->path.rows = child->rows;
 		project->path.startup_cost = child->startup_cost;
 		project->path.total_cost = child->total_cost + target->cost.startup +
@@ -1183,34 +1249,134 @@ create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		project->path.disabled_nodes = child->disabled_nodes;
 		project->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 		project->custom_paths = list_make1(child);
-		project->custom_private = make_project_path_data(node_name);
+		project->custom_private = make_project_path_data(*node_name);
 		project->methods = &pg_batch_project_path_methods;
 		child = &project->path;
-		node_name = PG_BATCH_NODE_NAME;
+		*node_name = PG_BATCH_NODE_NAME;
 	}
+	return child;
+}
 
-	path = makeNode(CustomPath);
+static CustomPath *
+make_batch_aggregate_path(RelOptInfo *parent, Path *child,
+						  PathTarget *target, const char *node_name,
+						  List *agg_specs, bool partial, double rows)
+{
+	CustomPath *path = makeNode(CustomPath);
+
 	path->path.pathtype = T_CustomScan;
-	path->path.parent = output_rel;
-	path->path.pathtarget = output_rel->reltarget;
+	path->path.parent = parent;
+	path->path.pathtarget = target;
+	path->path.param_info = child->param_info;
+	path->path.parallel_aware = false;
+	path->path.parallel_safe = child->parallel_safe;
+	path->path.parallel_workers = child->parallel_workers;
+	path->path.rows = rows;
+	path->path.startup_cost = child->startup_cost;
+	path->path.total_cost = child->total_cost +
+		cpu_operator_cost * child->rows;
+	path->path.disabled_nodes = child->disabled_nodes;
+	path->custom_paths = list_make1(child);
+	path->custom_private = make_agg_path_data(node_name, agg_specs, partial);
+	path->methods = &pg_batch_agg_path_methods;
+	return path;
+}
+
+static void
+add_parallel_aggregate_path(PlannerInfo *root, RelOptInfo *input_rel,
+							RelOptInfo *output_rel,
+							GroupPathExtraData *extra, List *agg_specs)
+{
+	RelOptInfo *partial_rel;
+	Path	   *child;
+	CustomPath *partial;
+	GatherPath *gather;
+	AggPath    *final;
+	const char *node_name;
+
+	/* PgBatchAgg currently emits one partial row only for global aggregates. */
+	if (root->parse->groupClause != NIL || extra == NULL ||
+		(extra->flags & GROUPING_CAN_PARTIAL_AGG) == 0 ||
+		input_rel->partial_pathlist == NIL)
+		return;
+	child = find_batch_path(input_rel->partial_pathlist, &node_name);
+	if (child == NULL)
+		return;
+	partial_rel = fetch_upper_rel(root, UPPERREL_PARTIAL_GROUP_AGG,
+		output_rel->relids);
+	if (partial_rel->reltarget == NULL ||
+		list_length(partial_rel->reltarget->exprs) != list_length(agg_specs))
+		return;
+	child = prepare_aggregate_child(root, input_rel, child, &node_name,
+		agg_specs);
+	partial = make_batch_aggregate_path(partial_rel, child,
+		partial_rel->reltarget, node_name, agg_specs, true, 1);
+	add_partial_path(partial_rel, &partial->path);
+	/*
+	 * The upper-path hook runs after core has built its final aggregate paths.
+	 * Complete this alternative here: Gather carries one transition-state row
+	 * per participant and the ordinary final Agg combines those rows.
+	 */
+	gather = create_gather_path(root, partial_rel, &partial->path,
+		partial_rel->reltarget, NULL, NULL);
+	if (!extra->partial_costs_set)
+	{
+		get_agg_clause_costs(root, AGGSPLIT_INITIAL_SERIAL,
+			&extra->agg_partial_costs);
+		get_agg_clause_costs(root, AGGSPLIT_FINAL_DESERIAL,
+			&extra->agg_final_costs);
+		extra->partial_costs_set = true;
+	}
+	final = create_agg_path(root, output_rel, &gather->path,
+		output_rel->reltarget, AGG_PLAIN, AGGSPLIT_FINAL_DESERIAL,
+		NIL, NIL, &extra->agg_final_costs, 1);
+	add_path(output_rel, &final->path);
+}
+
+static void
+create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
+				   RelOptInfo *input_rel, RelOptInfo *output_rel,
+				   void *extra)
+{
+	Path	   *child;
+	CustomPath *path;
+	List	   *agg_specs;
+	const char *node_name;
+
+	if (previous_create_upper_paths_hook != NULL)
+		previous_create_upper_paths_hook(root, stage, input_rel, output_rel,
+										 extra);
+	if (!pg_batch_enable || stage != UPPERREL_GROUP_AGG)
+		return;
+	agg_specs = query_aggregate_specs(root);
+	if (agg_specs == NIL)
+		return;
+	child = find_batch_path(input_rel->pathlist, &node_name);
+	if (child == NULL)
+	{
+		add_parallel_aggregate_path(root, input_rel, output_rel,
+			(GroupPathExtraData *) extra, agg_specs);
+		return;
+	}
+	child = prepare_aggregate_child(root, input_rel, child, &node_name,
+		agg_specs);
 	if (root->parse->groupClause == NIL)
-		path->path.rows = 1;
+		path = make_batch_aggregate_path(output_rel, child,
+			output_rel->reltarget, node_name, agg_specs, false, 1);
 	else
 	{
 		List	   *group_exprs = get_sortgrouplist_exprs(
 			root->processed_groupClause, root->processed_tlist);
-
-		path->path.rows = estimate_num_groups(root, group_exprs,
+		double		groups = estimate_num_groups(root, group_exprs,
 			child->rows, NULL, NULL);
+
+		path = make_batch_aggregate_path(output_rel, child,
+			output_rel->reltarget, node_name, agg_specs, false, groups);
 		list_free(group_exprs);
 	}
-	path->path.startup_cost = child->startup_cost;
-	path->path.total_cost = child->total_cost + cpu_operator_cost * child->rows;
-	path->path.disabled_nodes = child->disabled_nodes;
-	path->custom_paths = list_make1(child);
-	path->custom_private = make_agg_path_data(node_name, agg_specs);
-	path->methods = &pg_batch_agg_path_methods;
 	add_path(output_rel, &path->path);
+	add_parallel_aggregate_path(root, input_rel, output_rel,
+		(GroupPathExtraData *) extra, agg_specs);
 }
 
 static SourceLayout
@@ -1471,6 +1637,8 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	scan->custom_private = pg_batch_plan_writer_finish(plan_data);
 	scan->custom_scan_tlist = copyObject(layout.targetlist);
 	scan->custom_relids = bms_copy(rel->relids);
+	scan->scan.plan.parallel_aware = best_path->path.parallel_aware;
+	scan->scan.plan.parallel_safe = best_path->path.parallel_safe;
 
 	filter = make_custom_scan(&pg_batch_filter_plan_methods);
 	filter->flags = CUSTOMPATH_SUPPORT_PROJECTION;
@@ -1726,10 +1894,12 @@ plan_aggregate(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
 	PgBatchPlanWriter *plan_data;
 	List	   *runtime_columns = NIL;
+	bool		partial;
 
 	Assert(list_length(custom_plans) == 1);
 	Assert(clauses == NIL);
-	read_agg_path_data(best_path, &node_name, &agg_kinds, &agg_exprs);
+	read_agg_path_data(best_path, &node_name, &agg_kinds, &agg_exprs,
+		&partial);
 	child = linitial(custom_plans);
 	node = pg_batch_api->get_node(node_name);
 	if (node == NULL)
@@ -1765,6 +1935,7 @@ plan_aggregate(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	pg_batch_plan_write_string(plan_data, "child_name", node_name);
 	pg_batch_plan_write_int_list(plan_data, "kinds", agg_kinds);
 	pg_batch_plan_write_int_list(plan_data, "columns", runtime_columns);
+	pg_batch_plan_write_int(plan_data, "partial", partial ? 1 : 0);
 	agg->custom_private = pg_batch_plan_writer_finish(plan_data);
 	agg->custom_scan_tlist = copyObject(tlist);
 	return &agg->scan.plan;

@@ -5,11 +5,13 @@
 #include "commands/explain.h"
 #include "commands/explain_format.h"
 #include "executor/executor.h"
+#include "executor/execParallel.h"
 #include "executor/nodeCustom.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/tidbitmap.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "storage/shm_toc.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -52,6 +54,14 @@ typedef struct BatchScanState
 	uint64		exact_rechecks_skipped;
 } BatchScanState;
 
+typedef struct BatchScanParallelState
+{
+	Size		payload_offset;
+	Size		payload_size;
+	int		max_participants;
+	char		payload[FLEXIBLE_ARRAY_MEMBER];
+} BatchScanParallelState;
+
 static const CustomExecMethods pg_batch_scan_exec_methods;
 
 static int
@@ -79,6 +89,13 @@ static void scan_end(CustomScanState *node);
 static void scan_rescan(CustomScanState *node);
 static void scan_explain(CustomScanState *node, List *ancestors,
 						 ExplainState *es);
+static Size scan_estimate_dsm(CustomScanState *node, ParallelContext *pcxt);
+static void scan_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+								void *coordinate);
+static void scan_reinitialize_dsm(CustomScanState *node,
+								  ParallelContext *pcxt, void *coordinate);
+static void scan_initialize_worker(CustomScanState *node, shm_toc *toc,
+								   void *coordinate);
 
 static const CustomExecMethods pg_batch_scan_exec_methods = {
 	.CustomName = "PgBatchScan",
@@ -86,8 +103,122 @@ static const CustomExecMethods pg_batch_scan_exec_methods = {
 	.ExecCustomScan = scan_exec,
 	.EndCustomScan = scan_end,
 	.ReScanCustomScan = scan_rescan,
+	.EstimateDSMCustomScan = scan_estimate_dsm,
+	.InitializeDSMCustomScan = scan_initialize_dsm,
+	.ReInitializeDSMCustomScan = scan_reinitialize_dsm,
+	.InitializeWorkerCustomScan = scan_initialize_worker,
 	.ExplainCustomScan = scan_explain,
 };
+
+static const PgBatchSourceParallelOps *
+scan_parallel_source(BatchScanState *state)
+{
+	const PgBatchSourceParallelOps *parallel;
+
+	if (state->source == NULL ||
+		!PG_BATCH_ABI_HAS_FIELD(state->source, PgBatchSourceOps, parallel) ||
+		state->source->parallel == NULL)
+		return NULL;
+	parallel = state->source->parallel;
+	if (parallel->abi_version != PG_BATCH_SOURCE_PARALLEL_OPS_ABI_VERSION ||
+		parallel->struct_size < PG_BATCH_SOURCE_PARALLEL_OPS_MIN_SIZE ||
+		state->source->delivery != PG_BATCH_SOURCE_PULL ||
+		parallel->supports_parallel == NULL || parallel->estimate == NULL ||
+		parallel->initialize == NULL || parallel->reinitialize == NULL ||
+		parallel->attach == NULL)
+		elog(ERROR, "pg_batch source has incompatible parallel operations");
+	return parallel;
+}
+
+static uint32
+scan_flags(BatchScanState *state)
+{
+	uint32		flags = SO_NONE;
+
+	if (ScanRelIsReadOnly(&state->css.ss))
+		flags |= SO_HINT_REL_READ_ONLY;
+	if (state->css.ss.ps.state->es_instrument & INSTRUMENT_IO)
+		flags |= SO_SCAN_INSTRUMENT;
+	return flags;
+}
+
+static Size
+scan_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
+{
+	BatchScanState *state = (BatchScanState *) node;
+	const PgBatchSourceParallelOps *parallel = scan_parallel_source(state);
+	Size		payload;
+
+	if (parallel != NULL)
+		payload = parallel->estimate(state->source_state, pcxt->nworkers + 1);
+	else
+		payload = table_parallelscan_estimate(node->ss.ss_currentRelation,
+										 node->ss.ps.state->es_snapshot);
+	return add_size(MAXALIGN(sizeof(BatchScanParallelState)), MAXALIGN(payload));
+}
+
+static void
+scan_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+					void *coordinate)
+{
+	BatchScanState *state = (BatchScanState *) node;
+	BatchScanParallelState *shared = coordinate;
+	const PgBatchSourceParallelOps *parallel = scan_parallel_source(state);
+	void	   *payload;
+
+	shared->payload_offset = MAXALIGN(sizeof(*shared));
+	shared->max_participants = pcxt->nworkers + 1;
+	payload = (char *) shared + shared->payload_offset;
+	if (parallel != NULL)
+	{
+		shared->payload_size = parallel->estimate(state->source_state,
+											 pcxt->nworkers + 1);
+		parallel->initialize(state->source_state, payload,
+							 pcxt->nworkers + 1);
+	}
+	else
+	{
+		shared->payload_size = table_parallelscan_estimate(
+			node->ss.ss_currentRelation, node->ss.ps.state->es_snapshot);
+		table_parallelscan_initialize(node->ss.ss_currentRelation, payload,
+								  node->ss.ps.state->es_snapshot);
+		state->scan = table_beginscan_parallel(node->ss.ss_currentRelation,
+										 payload, scan_flags(state));
+	}
+}
+
+static void
+scan_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+					  void *coordinate)
+{
+	BatchScanState *state = (BatchScanState *) node;
+	BatchScanParallelState *shared = coordinate;
+	const PgBatchSourceParallelOps *parallel = scan_parallel_source(state);
+	void	   *payload = (char *) shared + shared->payload_offset;
+
+	(void) pcxt;
+	if (parallel != NULL)
+		parallel->reinitialize(state->source_state, payload);
+	else
+		table_parallelscan_reinitialize(node->ss.ss_currentRelation, payload);
+}
+
+static void
+scan_initialize_worker(CustomScanState *node, shm_toc *toc,
+					   void *coordinate)
+{
+	BatchScanState *state = (BatchScanState *) node;
+	BatchScanParallelState *shared = coordinate;
+	const PgBatchSourceParallelOps *parallel = scan_parallel_source(state);
+	void	   *payload = (char *) shared + shared->payload_offset;
+
+	(void) toc;
+	if (parallel != NULL)
+		parallel->attach(state->source_state, payload);
+	else
+		state->scan = table_beginscan_parallel(node->ss.ss_currentRelation,
+										 payload, scan_flags(state));
+}
 
 static void
 scan_begin(CustomScanState *node, EState *estate, int eflags)
@@ -173,8 +304,9 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 		state->scan = table_beginscan_bm(node->ss.ss_currentRelation,
 										 estate->es_snapshot, 0, NULL, flags);
 	}
-	else if (state->source == NULL ||
-			 state->source->delivery == PG_BATCH_SOURCE_SLOT)
+	else if (!node->ss.ps.plan->parallel_aware &&
+			 (state->source == NULL ||
+			  state->source->delivery == PG_BATCH_SOURCE_SLOT))
 		state->scan = table_beginscan(node->ss.ss_currentRelation,
 									  estate->es_snapshot, 0, NULL, 0);
 	if (state->source == NULL)
@@ -293,6 +425,13 @@ static bool
 next_batch(BatchScanState *state, PgBatchSlot *bslot)
 {
 	HeapScanDesc hscan;
+
+	/* A partial plan can run without a DSM when no workers are launched. */
+	if (state->scan == NULL &&
+		(state->source == NULL ||
+		 state->source->delivery == PG_BATCH_SOURCE_SLOT))
+		state->scan = table_beginscan(state->css.ss.ss_currentRelation,
+			state->css.ss.ps.state->es_snapshot, 0, NULL, scan_flags(state));
 
 	if (state->source != NULL)
 	{

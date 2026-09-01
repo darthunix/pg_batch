@@ -1025,6 +1025,112 @@ SELECT NOT EXISTS (
            (TABLE plain_join_repartition EXCEPT ALL TABLE batch_join_repartition)
        ) AS join_repartition_match;
 
+-- Keep a complete chain of batch joins below one standard Gather.
+SET max_parallel_workers_per_gather = 2;
+SET min_parallel_table_scan_size = 0;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET pg_batch.enable = on;
+
+-- Parallel spill also preserves NULL and multi-key hash semantics.
+CREATE TEMP TABLE pg_batch_parallel_multi_outer AS
+TABLE pg_batch_join_multi_outer;
+CREATE TEMP TABLE pg_batch_parallel_multi_inner AS
+TABLE pg_batch_join_multi_inner;
+ANALYZE pg_batch_parallel_multi_outer;
+ANALYZE pg_batch_parallel_multi_inner;
+CREATE TEMP TABLE batch_join_parallel_multi AS
+SELECT count(*) AS n, sum(o.v) AS outer_total, sum(i.v) AS inner_total
+FROM pg_batch_parallel_multi_outer o
+JOIN pg_batch_parallel_multi_inner i
+  ON o.k1 = i.k1 AND o.k2 = i.k2
+WHERE o.v % 5 <> 0;
+SET pg_batch.enable = off;
+SET max_parallel_workers_per_gather = 0;
+CREATE TEMP TABLE plain_join_parallel_multi AS
+SELECT count(*) AS n, sum(o.v) AS outer_total, sum(i.v) AS inner_total
+FROM pg_batch_parallel_multi_outer o
+JOIN pg_batch_parallel_multi_inner i
+  ON o.k1 = i.k1 AND o.k2 = i.k2
+WHERE o.v % 5 <> 0;
+SELECT NOT EXISTS (
+           (TABLE batch_join_parallel_multi
+            EXCEPT ALL TABLE plain_join_parallel_multi)
+           UNION ALL
+           (TABLE plain_join_parallel_multi
+            EXCEPT ALL TABLE batch_join_parallel_multi)
+       ) AS join_parallel_multi_match;
+
+-- Duplicate build keys disable the parallel unique-key shortcut. The same
+-- query also checks every partial aggregate supported by PgBatchAgg.
+CREATE TABLE pg_batch_parallel_dup_outer(k int, v int);
+CREATE TABLE pg_batch_parallel_dup_inner(k int, v int);
+INSERT INTO pg_batch_parallel_dup_outer
+SELECT (g % 1000) + 1, g FROM generate_series(1, 10000) AS g;
+INSERT INTO pg_batch_parallel_dup_inner
+SELECT (g % 1000) + 1, g FROM generate_series(1, 2000) AS g;
+ANALYZE pg_batch_parallel_dup_outer;
+ANALYZE pg_batch_parallel_dup_inner;
+SET pg_batch.enable = on;
+SET max_parallel_workers_per_gather = 2;
+CREATE TEMP TABLE batch_join_parallel_dup AS
+SELECT count(*) AS n, count(o.v) AS nn, sum(o.v + 1) AS outer_total,
+       min(i.v) AS inner_minimum, max(i.v) AS inner_maximum
+FROM pg_batch_parallel_dup_outer o
+JOIN pg_batch_parallel_dup_inner i ON o.k = i.k;
+SET pg_batch.enable = off;
+SET max_parallel_workers_per_gather = 0;
+CREATE TEMP TABLE plain_join_parallel_dup AS
+SELECT count(*) AS n, count(o.v) AS nn, sum(o.v + 1) AS outer_total,
+       min(i.v) AS inner_minimum, max(i.v) AS inner_maximum
+FROM pg_batch_parallel_dup_outer o
+JOIN pg_batch_parallel_dup_inner i ON o.k = i.k;
+SELECT NOT EXISTS (
+           (TABLE batch_join_parallel_dup
+            EXCEPT ALL TABLE plain_join_parallel_dup)
+           UNION ALL
+           (TABLE plain_join_parallel_dup
+            EXCEPT ALL TABLE batch_join_parallel_dup)
+       ) AS join_parallel_dup_match;
+
+SET pg_batch.enable = on;
+SET max_parallel_workers_per_gather = 2;
+EXPLAIN (COSTS OFF)
+SELECT count(*), sum(o.v), sum(i1.v), sum(i2.v)
+FROM pg_batch_join_spill_outer o
+JOIN pg_batch_join_spill_inner i1 ON o.k = i1.k
+JOIN pg_batch_join_spill_inner i2 ON o.k = i2.k
+WHERE o.v > 0;
+
+CREATE TEMP TABLE batch_join_parallel_chain AS
+SELECT count(*) AS n, sum(o.v) AS outer_total,
+       sum(i1.v) AS inner1_total, sum(i2.v) AS inner2_total
+FROM pg_batch_join_spill_outer o
+JOIN pg_batch_join_spill_inner i1 ON o.k = i1.k
+JOIN pg_batch_join_spill_inner i2 ON o.k = i2.k
+WHERE o.v > 0;
+SET pg_batch.enable = off;
+SET max_parallel_workers_per_gather = 0;
+CREATE TEMP TABLE plain_join_parallel_chain AS
+SELECT count(*) AS n, sum(o.v) AS outer_total,
+       sum(i1.v) AS inner1_total, sum(i2.v) AS inner2_total
+FROM pg_batch_join_spill_outer o
+JOIN pg_batch_join_spill_inner i1 ON o.k = i1.k
+JOIN pg_batch_join_spill_inner i2 ON o.k = i2.k
+WHERE o.v > 0;
+
+SELECT NOT EXISTS (
+           (TABLE batch_join_parallel_chain
+            EXCEPT ALL TABLE plain_join_parallel_chain)
+           UNION ALL
+           (TABLE plain_join_parallel_chain
+            EXCEPT ALL TABLE batch_join_parallel_chain)
+       ) AS join_parallel_chain_match;
+
+RESET max_parallel_workers_per_gather;
+RESET min_parallel_table_scan_size;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
 RESET work_mem;
 
 -- A separately built unary node uses only the public bridge/runtime.
@@ -1088,6 +1194,8 @@ DROP TABLE pg_batch_join_multi_inner;
 DROP TABLE pg_batch_join_multi_outer;
 DROP TABLE pg_batch_join_inner;
 DROP TABLE pg_batch_join_outer;
+DROP TABLE pg_batch_parallel_dup_inner;
+DROP TABLE pg_batch_parallel_dup_outer;
 
 DROP TABLE pg_batch_tam;
 DROP TABLE pg_batch_groups;

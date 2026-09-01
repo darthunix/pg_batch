@@ -10,6 +10,7 @@ OBJS = \
 	pack.o \
 	project.o \
 	hash_join.o \
+	parallel_hash_join.o \
 	hash_join_spill.o \
 	aggregate.o
 

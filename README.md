@@ -169,9 +169,9 @@ memory limit are divided into spill partitions and processed later. A
 partition that still has too many distinct groups is divided again with the
 next hash bits.
 
-`PgBatchHashJoin` is a deliberately narrow `int4` experiment. It supports a
-serial, unparameterized inner join with one or more direct `int4 = int4` hash
-keys. The build table, probe windows, and output stay columnar. Output columns
+`PgBatchHashJoin` is a deliberately narrow `int4` experiment. It supports an
+unparameterized inner join with one or more direct `int4 = int4` hash keys.
+The build table, probe windows, and output stay columnar. Output columns
 are gathered lazily, so an unused projection does not have to be converted to
 Datum. Ordinary parents can still consume the same output slot one row at a
 time, while `PgBatchAgg` consumes its published batches directly.
@@ -194,6 +194,24 @@ hash bits. Data that remains skewed is read in bounded build chunks, with its
 probe partition rescanned for every chunk. The spill library owns only block
 storage and readers; partition choice, recursion, and join policy remain in the
 node and do not extend the bridge ABI.
+
+Heap scans, hash joins, and global aggregates also have parallel-aware paths.
+PostgreSQL places one ordinary `Gather` above the largest batch-aware subtree;
+it does not place a row boundary between batch joins. A partial `PgBatchAgg`
+consumes batches below that `Gather` and emits one transition-state row per
+participant, which the ordinary final aggregate combines. Workers divide heap
+pages with the normal parallel table-scan state. A parallel hash join publishes
+immutable column-major build chunks in query DSA and uses one shared atomic
+bucket array. The build records whether duplicate keys exist, allowing the
+common unique-key case to use the fused probe/output loop. If the combined
+worker memory budget is exceeded, all participants write to shared spill
+partitions and claim completed partitions once. Large partitions use the same
+bounded multi-pass and secondary partitioning policy as the serial node. The
+Arrow FDW remains serial until it implements the optional pull-source parallel
+operations. The test columnar TAM also remains serial; a slot-delivery source
+needs an explicit way to coordinate both its source state and the table AM's
+parallel scan descriptor.
+
 Set `pg_batch.enable_hash_join = off` to keep the other batch nodes enabled
 while comparing against PostgreSQL's Hash Join.
 Set `pg_batch.enable_simd = off` to use the direct scalar `int4` filter kernel
@@ -342,7 +360,7 @@ metadata, without private node headers. They check the reusable expression
 analyzer, kernels, public batch input/output symbols, a bounded spill set, and
 a 70-row owned builder containing by-value, copied by-reference, and NULL
 values. The SQL tests cover
-heap, bitmap-index, table-AM, and FDW batches;
+heap, parallel heap, bitmap-index, table-AM, and FDW batches;
 native Arrow consumption; lazy `Datum` fallback; exact and pruning-only
 predicates; arithmetic filters and projections; parameters; NULL and error
 semantics; grouped and global aggregates; in-memory and spilled joins; rescans;
@@ -370,11 +388,12 @@ rejection.
 - `expr/` builds `libpg_batch_expr.a`, analyzes and executes restricted `int4`
   expressions, and exposes a reusable lazy projection batch.
 - `spill/` builds `libpg_batch_spill.a` and provides bounded buffered logical
-  tape partitions with rewindable or destructive readers.
+  tape partitions with rewindable or destructive readers, plus shared
+  per-participant files for parallel nodes.
 - `nodes/planner.c` builds sequential and bitmap-backed custom plans.
 - `nodes/slot.c` implements the custom slot and heap batch source.
-- `nodes/scan.c`, `filter.c`, `project.c`, `hash_join.c`, and `aggregate.c`
-  implement the executor nodes.
+- `nodes/scan.c`, `filter.c`, `project.c`, `hash_join.c`,
+  `parallel_hash_join.c`, and `aggregate.c` implement the executor nodes.
 - `examples/compressed_tam/source.c` classifies source predicates and
   manages scans.
 - `examples/compressed_tam/compressed.c` owns snapshots, native columns, group
@@ -411,6 +430,7 @@ psql -f benchmark/run_brin.sql
 psql -f benchmark/run_bitmap_index.sql
 psql -f benchmark/run_hash_join.sql
 psql -f benchmark/run_hash_join_large.sql
+psql -f benchmark/run_parallel_hash_join.sql
 psql -f benchmark/run_group_aggregate.sql
 psql -f benchmark/run_fdw.sql
 ```
@@ -428,6 +448,11 @@ sparse Datum and packed int32 columns.
 `run_hash_kernel.sql` compares the current hash join with another library
 over one or two heap and packed keys, including sparse, spill, and early-limit
 cases. It also covers a scalar `generate_series` input packed below the join.
+`run_parallel_hash_join.sql` uses the large join tables to compare ordinary
+and batch hash joins with zero, one, two, and four workers. It measures both a
+single join and two batch joins kept below one `Gather`, with in-memory and
+spilled builds. Pass `-v setup=true` to create the 10-million-row probe and
+2-million-row build tables, or run `run_hash_join_large.sql` first.
 `run_pack.sql` compares two node libraries while `PgBatchPack` collects one or
 two `Datum` columns from a large scalar `generate_series` input.
 `run_input.sql` isolates the shared node-input lifecycle with empty and

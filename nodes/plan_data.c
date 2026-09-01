@@ -84,6 +84,7 @@ pg_batch_read_agg_plan(const CustomScan *scan, PgBatchAggPlanData *result)
 	result->child_name = pg_batch_plan_read_string(reader, "child_name");
 	result->kinds = pg_batch_plan_read_int_list(reader, "kinds");
 	result->columns = pg_batch_plan_read_int_list(reader, "columns");
+	result->partial = pg_batch_plan_read_int(reader, "partial") != 0;
 	if (list_length(result->kinds) != list_length(result->columns))
 		elog(ERROR, "pg_batch aggregate plan fields are misaligned");
 	pg_batch_plan_reader_finish(reader);

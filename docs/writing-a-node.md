@@ -248,6 +248,39 @@ PgBatchBuilder *builder = pg_batch_builder_create(
 Reset it, append slots, and finish it. The returned batch remains valid until
 the next reset.
 
+## Parallel execution
+
+Parallelism does not change the batch contract between plan nodes. Build one
+parallel-aware path for each batch node in the subtree and let PostgreSQL put
+one ordinary `Gather` above that subtree. Workers may then pass batches through
+several joins or a partial aggregate without an intermediate scalar row
+boundary. A global partial aggregate emits one transition-state row per
+participant; only those rows cross `Gather`, and PostgreSQL's final aggregate
+combines them.
+
+A directly pulled scan source may append `PgBatchSourceParallelOps` to its
+operation table. The callbacks estimate and initialize source-owned DSM state,
+attach workers, and reset allocation state for a rescan. They only divide
+source work between participants; `begin_scan()` and `end_scan()` still own
+backend-local state. Leaving the pointer NULL keeps the source serial. The
+heap source uses PostgreSQL's parallel table scan API internally. A source
+that publishes through table-AM slot callbacks needs to coordinate the table
+AM scan as well and is not covered by these pull-source callbacks.
+
+Stateful nodes still use the standard `CustomExecMethods` DSM callbacks. For
+example, `PgBatchHashJoin` stores immutable column-major build chunks in query
+DSA and links them from a shared atomic bucket array. Its parallel spill uses
+one file namespace per participant and partition, followed by a barrier and
+single-owner partition claims. This keeps node policy out of the bridge and
+the reusable spill library. If a probe algorithm has a distinct-key fast path,
+derive that property from all participants' build data before probing; a
+planner estimate is not a correctness guarantee.
+
+Release objects that refer to DSM or `SharedFileSet` from
+`ShutdownCustomScan`, while the mapping still exists. `EndCustomScan` may run
+after PostgreSQL has detached the parallel context and should only be a
+fallback for execution without DSM.
+
 ## Checklist
 
 - Keep plan payloads typed and `copyObject()`-compatible.
@@ -264,3 +297,6 @@ the next reset.
 - Add regression tests for batch and scalar parents, empty selections,
   rescans, early stop, NULL values, and lazy projection.
 - Benchmark the hot path against the previous implementation.
+- Keep one `Gather` above a parallel batch subtree; do not add scalar
+  boundaries between batch-aware nodes.
+- Destroy DSM-backed local objects from `ShutdownCustomScan`.

@@ -35,6 +35,38 @@ typedef enum PgBatchSourceDelivery
 } PgBatchSourceDelivery;
 
 /*
+ * Optional coordination used when several parallel-query participants pull
+ * batches directly from one source. The scan node owns the shared memory
+ * region and calls these operations after begin_scan() has created
+ * backend-local source state. Slot-delivery sources already scan through the
+ * table AM and need a separate contract before they can use this interface.
+ *
+ * initialize() both initializes the region and attaches the leader's local
+ * state. attach() connects a worker's local state. Existing end_scan()
+ * remains responsible for releasing backend-local resources.
+ */
+typedef struct PgBatchSourceParallelOps
+{
+	uint32		abi_version;
+	Size		struct_size;
+	/* Return whether this relation can divide its scan between backends. */
+	bool		(*supports_parallel) (Relation relation);
+	/* Return bytes required in the scan node's shared coordinate. */
+	Size		(*estimate) (void *source_state, int max_participants);
+	/* Initialize shared state and attach the leader. */
+	void		(*initialize) (void *source_state, void *shared,
+							   int max_participants);
+	/* Reset shared allocation state before a parallel rescan. */
+	void		(*reinitialize) (void *source_state, void *shared);
+	/* Attach one worker's backend-local state. */
+	void		(*attach) (void *source_state, void *shared);
+} PgBatchSourceParallelOps;
+
+#define PG_BATCH_SOURCE_PARALLEL_OPS_ABI_VERSION 1
+#define PG_BATCH_SOURCE_PARALLEL_OPS_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchSourceParallelOps, attach)
+
+/*
  * Borrowed planner input passed to one source's plan_scan() callback.
  *
  * clauses contains bare relation restrictions in executor order.
@@ -124,6 +156,8 @@ struct PgBatchSourceOps
 	PgBatch *(*next_batch) (void *source_state);
 	/* Add source-specific EXPLAIN properties; this callback is optional. */
 	void		(*explain) (void *source_state, ExplainState *es);
+	/* Optional parallel coordination for PG_BATCH_SOURCE_PULL. */
+	const PgBatchSourceParallelOps *parallel;
 };
 
 #define PG_BATCH_SOURCE_OPS_ABI_VERSION 1

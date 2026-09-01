@@ -173,9 +173,9 @@ static const PgBatchOps spill_batch_ops = {
 	.release = NULL,
 };
 
-static void
-init_spill_block(SpillBlock *block, int ncolumns, int capacity,
-				 MemoryContext context, bool allocate_data)
+void
+hash_join_init_spill_block(SpillBlock *block, int ncolumns, int capacity,
+							  MemoryContext context, bool allocate_data)
 {
 	int			validity_bytes = (capacity + 7) / 8;
 
@@ -226,43 +226,51 @@ init_spill_block(SpillBlock *block, int ncolumns, int capacity,
 	block->batch.private_data = block;
 }
 
-static bool
-read_spill_block(BatchHashJoinState *state, HashSpillFile *file,
-				 SpillBlock *block)
+void
+hash_join_use_spill_block(BatchHashJoinState *state, SpillBlock *block,
+						  const PgBatchSpillBlock *input)
 {
-	PgBatchSpillBlock input;
 	uint64		row_mask;
 
-	if (file->reader == NULL)
-		file->reader = pg_batch_spill_reader_open(file->set, file->partition);
-	if (!pg_batch_spill_reader_next(file->reader, &input))
-		return false;
-	if (input.ncolumns != block->ncolumns ||
+	if (input->ncolumns != block->ncolumns ||
 		block->capacity < PG_BATCH_SPILL_BLOCK_ROWS)
 		elog(ERROR, "invalid pg_batch hash join spill block");
 	/* Borrow the reader's dense block until its next read or rewind. */
-	block->hashes = (uint32 *) input.hashes;
-	block->values = (int32 *) input.values;
-	block->validity = (uint8 *) input.validity;
-	block->nrows = input.nrows;
+	block->hashes = (uint32 *) input->hashes;
+	block->values = (int32 *) input->values;
+	block->validity = (uint8 *) input->validity;
+	block->nrows = input->nrows;
 	row_mask = pg_batch_nrows_mask(block->nrows);
 	state->spill_pages_read++;
 	for (int column = 0; column < block->ncolumns; column++)
 	{
 		struct ArrowArray *array = &block->arrays[column];
 
-		block->buffers[column * 2] = &input.validity[column * 8];
+		block->buffers[column * 2] = &input->validity[column * 8];
 		block->buffers[column * 2 + 1] =
-			&input.values[column * PG_BATCH_SPILL_BLOCK_ROWS];
+			&input->values[column * PG_BATCH_SPILL_BLOCK_ROWS];
 		array->length = block->nrows;
 		array->offset = 0;
 		array->null_count = block->nrows -
-			pg_popcount64(spill_validity_word(&input.validity[column * 8]) &
+			pg_popcount64(spill_validity_word(&input->validity[column * 8]) &
 				row_mask);
 	}
 	block->selection = row_mask;
 	block->batch.selection.nrows = block->nrows;
 	MemSet(block->datum_rows, 0, sizeof(uint64) * block->ncolumns);
+}
+
+static bool
+read_spill_block(BatchHashJoinState *state, HashSpillFile *file,
+				 SpillBlock *block)
+{
+	PgBatchSpillBlock input;
+
+	if (file->reader == NULL)
+		file->reader = pg_batch_spill_reader_open(file->set, file->partition);
+	if (!pg_batch_spill_reader_next(file->reader, &input))
+		return false;
+	hash_join_use_spill_block(state, block, &input);
 	return true;
 }
 
@@ -761,14 +769,15 @@ hash_join_begin_spill(BatchHashJoinState *state, uint64 estimated_bytes,
 			state->resident_partitions =
 				bms_add_member(state->resident_partitions, partition);
 	}
-	init_spill_block(&state->build_block, state->ninner_columns,
+	hash_join_init_spill_block(&state->build_block, state->ninner_columns,
 					 PG_BATCH_SIZE,
 					 state->spill_context, false);
-	init_spill_block(&state->probe_block, state->nouter_columns,
+	hash_join_init_spill_block(&state->probe_block, state->nouter_columns,
 					 PG_BATCH_SIZE,
 					 state->spill_context, false);
-	init_spill_block(&state->resident_probe_block, state->nouter_columns,
-					 PG_BATCH_SIZE * 2, state->spill_context, true);
+	hash_join_init_spill_block(&state->resident_probe_block,
+					 state->nouter_columns, PG_BATCH_SIZE * 2,
+					 state->spill_context, true);
 	MemSet(state->resident_probe_block.validity, 0,
 		   sizeof(uint8) * state->nouter_columns *
 		   ((state->resident_probe_block.capacity + 7) / 8));

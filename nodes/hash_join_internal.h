@@ -1,6 +1,7 @@
 #ifndef PG_BATCH_HASH_JOIN_INTERNAL_H
 #define PG_BATCH_HASH_JOIN_INTERNAL_H
 
+#include "access/parallel.h"
 #include "executor/nodeCustom.h"
 #include "internal.h"
 #include "spill.h"
@@ -100,6 +101,8 @@ typedef struct BatchJoinQual
 	int			right_column;
 } BatchJoinQual;
 
+typedef struct ParallelHashJoinLocal ParallelHashJoinLocal;
+
 typedef struct BatchHashJoinState
 {
 	/* Plan children, slots, and mappings from plan columns to batch columns. */
@@ -136,6 +139,7 @@ typedef struct BatchHashJoinState
 	MemoryContext slot_context;
 	BuildStore	build;
 	bool		built;
+	ParallelHashJoinLocal *parallel;
 	size_t		memory_limit;
 	int			planned_partitions;
 	bool		spilled;
@@ -266,6 +270,43 @@ extern void hash_join_grow_build_store(BuildStore *store);
 extern void hash_join_finish_build_table(BatchHashJoinState *state);
 extern void hash_join_track_peak_memory(BatchHashJoinState *state);
 extern void hash_join_prepare_probe_keys(BatchHashJoinState *state);
+extern void hash_join_append_dense_build(BatchHashJoinState *state,
+									 const PgBatchSpillBlock *block);
+extern void hash_join_init_spill_block(SpillBlock *block, int ncolumns,
+									  int capacity, MemoryContext context,
+									  bool allocate_data);
+extern void hash_join_use_spill_block(BatchHashJoinState *state,
+									 SpillBlock *block,
+									 const PgBatchSpillBlock *input);
+
+/* Parallel build/probe services implemented in parallel_hash_join.c. */
+extern Size parallel_hash_join_estimate_dsm(CustomScanState *node,
+										ParallelContext *pcxt);
+extern void parallel_hash_join_initialize_dsm(CustomScanState *node,
+										 ParallelContext *pcxt,
+										 void *coordinate);
+extern void parallel_hash_join_reinitialize_dsm(CustomScanState *node,
+										   ParallelContext *pcxt,
+										   void *coordinate);
+extern void parallel_hash_join_initialize_worker(CustomScanState *node,
+											 shm_toc *toc,
+											 void *coordinate);
+extern void parallel_hash_join_shutdown(CustomScanState *node);
+extern void parallel_hash_join_prepare(BatchHashJoinState *state);
+extern bool parallel_hash_join_fetch_probe(BatchHashJoinState *state);
+extern uint32 parallel_hash_join_find_head(BatchHashJoinState *state,
+										  uint32 hash, int probe_row);
+extern uint32 parallel_hash_join_next(BatchHashJoinState *state,
+									 uint32 build_row, int probe_row);
+extern bool parallel_hash_join_build_is_unique(BatchHashJoinState *state);
+extern int32 parallel_hash_join_build_value(BatchHashJoinState *state,
+										   int column, uint32 row,
+										   bool *isnull);
+extern void parallel_hash_join_finish_probe(BatchHashJoinState *state);
+extern void parallel_hash_join_end(BatchHashJoinState *state);
+extern void parallel_hash_join_rescan(BatchHashJoinState *state);
+extern void parallel_hash_join_explain(BatchHashJoinState *state,
+									  ExplainState *es);
 
 /* Spill lifecycle and input/output services implemented separately. */
 extern uint64 hash_join_estimated_build_memory(uint64 nrows, int ncolumns);

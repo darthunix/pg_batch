@@ -77,6 +77,7 @@ typedef struct PgBatchAggPlanData
 	const char *child_name;
 	List	   *kinds;
 	List	   *columns;
+	bool		partial;
 } PgBatchAggPlanData;
 
 extern void pg_batch_read_scan_plan(const CustomScan *scan,

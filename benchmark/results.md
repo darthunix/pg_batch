@@ -1295,6 +1295,84 @@ The existing paths remain below the 3% regression threshold. The supported
 expression cases take 44% to 59% of the ordinary executor time, including the
 wide query where the projection column stays lazy until filtering finishes.
 
+## Parallel heap scan and hash join
+
+The parallel test uses a 10-million-row probe table with five matches for
+each key and a 2-million-row unique-key build table. `64MB` keeps each shared
+build in memory. `8MB` forces partitioned spill. The worker count below is the
+requested PostgreSQL worker count; the leader may participate as well.
+Each result is the median of five executions after one warm-up per variant.
+The variants run in alternating order over warm data with JIT disabled.
+
+The one-join query is:
+
+```sql
+SELECT count(*), sum(p.v), sum(b.v)
+FROM pg_batch_join_probe_large p
+JOIN pg_batch_join_build_large b ON p.k = b.k;
+```
+
+| Memory | Executor | Median, ms | Relative to serial batch |
+|---|---|---:|---:|
+| 64MB | PostgreSQL serial | 2046.712 | 3.442 |
+| 64MB | PostgreSQL, 4 workers | 427.620 | 0.719 |
+| 64MB | Batch serial | 594.673 | 1.000 |
+| 64MB | Batch, 1 worker | 352.499 | 0.593 |
+| 64MB | Batch, 2 workers | 240.068 | 0.404 |
+| 64MB | Batch, 4 workers | 159.815 | 0.269 |
+| 8MB | PostgreSQL serial | 1434.602 | 2.497 |
+| 8MB | PostgreSQL, 4 workers | 526.548 | 0.916 |
+| 8MB | Batch serial | 574.608 | 1.000 |
+| 8MB | Batch, 1 worker | 317.471 | 0.553 |
+| 8MB | Batch, 2 workers | 251.696 | 0.438 |
+| 8MB | Batch, 4 workers | 212.320 | 0.369 |
+
+Four requested workers make the batch query 3.72x faster than its serial
+batch plan in memory and 2.71x faster with spill. It is 62.6% faster than
+PostgreSQL's four-worker plan in memory and 59.7% faster with spill.
+
+The chain query joins the same build table twice and returns the same four
+aggregates in every variant. The batch plan keeps both `PgBatchHashJoin` nodes
+and a partial `PgBatchAgg` below one `Gather`. Only one aggregate-state row per
+participant crosses that boundary.
+
+| Memory | Executor | Median, ms | Relative to serial batch |
+|---|---|---:|---:|
+| 64MB | PostgreSQL, 4 workers | 564.136 | 0.710 |
+| 64MB | Batch serial | 794.558 | 1.000 |
+| 64MB | Batch, 2 workers | 565.625 | 0.712 |
+| 64MB | Batch, 4 workers | 362.401 | 0.456 |
+| 8MB | PostgreSQL, 4 workers | 653.922 | 0.856 |
+| 8MB | Batch serial | 763.904 | 1.000 |
+| 8MB | Batch, 2 workers | 524.261 | 0.686 |
+| 8MB | Batch, 4 workers | 439.890 | 0.576 |
+
+Four requested workers make the chain 2.19x faster than serial batching in
+memory and 1.74x faster with spill. The batch plan is 35.8% and 32.7% faster,
+respectively, than PostgreSQL's four-worker plan.
+
+Two changes address the earlier scaling loss. The first moves `PgBatchAgg`
+below `Gather`, so workers reduce their batches locally. The second records
+whether the shared build really contains duplicate keys and uses the existing
+fused unique-key probe when it does not. Repeating the same five-sample run
+after each change gives:
+
+| Query | Memory | Initial parallel path, ms | Partial batch aggregate, ms | Unique-build probe, ms |
+|---|---|---:|---:|---:|
+| One join, 4 workers | 64MB | 283.664 | 197.076 | 159.815 |
+| One join, 4 workers | 8MB | 314.859 | 223.133 | 212.320 |
+| Two joins, 4 workers | 64MB | 572.458 | 463.298 | 362.401 |
+| Two joins, 4 workers | 8MB | 604.519 | 448.985 | 439.890 |
+
+The unique-build shortcut helps most when the shared hash table stays in
+memory. Spilled partitions already use backend-local hash tables, where the
+serial shortcut was available. Duplicate build keys are detected from the
+actual shared table before probing; they fall back to chain traversal.
+
+Serial batch medians changed by +1.6%, +0.9%, +2.8%, and -0.2% across the
+four corresponding cases. All changes remain within the 3% regression
+threshold used by this experiment.
+
 ## Limits of the measurements
 
 - The expression module supports one `int4` input column per expression.
@@ -1317,9 +1395,10 @@ wide query where the projection column stays lazy until filtering finishes.
 - The BRIN batch path is serial and heap-specific. It deliberately reads
   `HeapScanDesc` page state as a playground shortcut; a production extension
   would need a supported core interface.
-- `PgBatchHashJoin` currently supports only serial, unparameterized inner
-  joins with direct `int4 = int4` keys. Its path cost is only a placeholder,
-  and its spill files are private to one executor node.
-- These are warm-cache, serial, single-machine measurements. They validate the
-  mechanism; they are not a general throughput claim for cold I/O or concurrent
-  workloads.
+- `PgBatchHashJoin` supports unparameterized inner joins with direct
+  `int4 = int4` keys. Its path cost is only a placeholder. Serial spill files
+  are private; parallel joins use shared participant files and single-owner
+  partition processing.
+- These are warm-cache, single-machine measurements. They validate the
+  mechanism; they are not a general throughput claim for cold I/O or
+  concurrent workloads.

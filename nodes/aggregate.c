@@ -84,6 +84,7 @@ typedef struct BatchAggState
 	bool		emitted;
 	uint64		input_batches;
 	uint64		input_rows;
+	bool		partial;
 } BatchAggState;
 
 static const CustomExecMethods pg_batch_agg_exec_methods;
@@ -164,6 +165,7 @@ agg_begin(CustomScanState *node, EState *estate, int eflags)
 
 	pg_batch_read_agg_plan(cscan, &data);
 	node_name = data.child_name;
+	state->partial = data.partial;
 
 	pg_batch_init_children(node, estate, eflags);
 	state->child = linitial(node->custom_ps);
@@ -844,6 +846,8 @@ agg_explain(CustomScanState *node, List *ancestors,
 {
 	BatchAggState *state = (BatchAggState *) node;
 
+	if (state->partial)
+		ExplainPropertyBool("Partial", true, es);
 	if (es->analyze)
 	{
 		ExplainPropertyInteger("Input Batches", NULL, state->input_batches, es);
