@@ -10,7 +10,7 @@
 typedef struct BatchFilterState
 {
 	CustomScanState css;
-	PgBatchPass *pass;
+	PgBatchUnary *unary;
 } BatchFilterState;
 
 static const CustomExecMethods pg_batch_filter_exec_methods;
@@ -38,7 +38,7 @@ intlist_to_bitmap(List *items)
 
 static int
 filter_batch(void *private_data, PgBatchInput *input,
-			 PgBatchInputBatch *input_batch, int input_rows)
+			 PgBatchInputResult *input_batch, int input_rows)
 {
 	BatchFilterState *state = private_data;
 	ExprContext *econtext = state->css.ss.ps.ps_ExprContext;
@@ -50,7 +50,7 @@ filter_batch(void *private_data, PgBatchInput *input,
 	if (state->css.ss.ps.qual == NULL)
 		return input_rows;
 	rows = pg_batch_input_row_view(input);
-	while ((row = pg_batch_next_selected(batch, row)) >= 0)
+	while ((row = pg_batch_selection_next(&batch->selection, row)) >= 0)
 	{
 		TupleTableSlot *slot;
 
@@ -59,31 +59,32 @@ filter_batch(void *private_data, PgBatchInput *input,
 			pg_batch_row_view_select(rows, row);
 		econtext->ecxt_scantuple = slot;
 		if (!ExecQual(state->css.ss.ps.qual, econtext))
-			pg_batch_clear_row(batch, row);
+			pg_batch_selection_clear(&batch->selection, row);
 	}
 	remaining = pg_batch_row_count(batch);
 	InstrCountFiltered1(&state->css.ss, input_rows - remaining);
 	return remaining;
 }
 
-static const PgBatchPassOps filter_ops = {
-	PG_BATCH_ABI_INITIALIZER(PG_BATCH_PASS_OPS_ABI_VERSION, PgBatchPassOps),
-	.process_batch = filter_batch,
-};
-
 static void
 filter_begin(CustomScanState *node, EState *estate, int eflags)
 {
 	BatchFilterState *state = (BatchFilterState *) node;
 	CustomScan *scan = castNode(CustomScan, node->ss.ps.plan);
-	List	   *source_attnums = linitial(scan->custom_private);
-	int			nfilter = intVal(lsecond(scan->custom_private));
+	PgBatchFilterPlanData data;
+	List	   *source_attnums;
+	int			nfilter;
 	Bitmapset  *filter_columns = NULL;
-	Bitmapset  *project_columns =
-		intlist_to_bitmap(lthird(scan->custom_private));
+	Bitmapset  *project_columns;
 	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
+	PgBatchUnaryConfig config;
 	int		   *target_columns;
 	int			target = 0;
+
+	pg_batch_read_filter_plan(scan, &data);
+	source_attnums = data.source_attnums;
+	nfilter = data.nfilter_columns;
+	project_columns = intlist_to_bitmap(data.project_columns);
 
 	layout.ncolumns = list_length(source_attnums);
 	layout.ntargets = list_length(node->ss.ps.plan->targetlist);
@@ -99,9 +100,21 @@ filter_begin(CustomScanState *node, EState *estate, int eflags)
 	layout.target_columns = target_columns;
 	if (nfilter > 0)
 		filter_columns = bms_add_range(filter_columns, 0, nfilter - 1);
-	state->pass = pg_batch_pass_create(estate->es_query_cxt, node, estate,
-		eflags, PG_BATCH_PRODUCER_NAME, &layout, filter_columns,
-		project_columns, 0, PG_BATCH_PASS_INPUT_ROW, &filter_ops, state);
+	config = (PgBatchUnaryConfig) {
+		.struct_size = sizeof(config),
+		.parent_context = estate->es_query_cxt,
+		.node = node,
+		.estate = estate,
+		.eflags = eflags,
+		.child_name = PG_BATCH_NODE_NAME,
+		.layout = &layout,
+		.filter_columns = filter_columns,
+		.project_columns = project_columns,
+		.row_mode = PG_BATCH_UNARY_INPUT_ROW,
+		.process = filter_batch,
+		.private_data = state,
+	};
+	state->unary = pg_batch_unary_create(&config);
 	bms_free(filter_columns);
 	bms_free(project_columns);
 	pfree(target_columns);
@@ -110,26 +123,26 @@ filter_begin(CustomScanState *node, EState *estate, int eflags)
 static TupleTableSlot *
 filter_exec(CustomScanState *node)
 {
-	return pg_batch_pass_exec(((BatchFilterState *) node)->pass);
+	return pg_batch_unary_exec(((BatchFilterState *) node)->unary);
 }
 
 static void
 filter_end(CustomScanState *node)
 {
-	pg_batch_pass_end(((BatchFilterState *) node)->pass);
+	pg_batch_unary_end(((BatchFilterState *) node)->unary);
 }
 
 static void
 filter_rescan(CustomScanState *node)
 {
-	pg_batch_pass_rescan(((BatchFilterState *) node)->pass);
+	pg_batch_unary_rescan(((BatchFilterState *) node)->unary);
 }
 
 static void
 filter_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
 	BatchFilterState *state = (BatchFilterState *) node;
-	const PgBatchPassStats *stats = pg_batch_pass_stats(state->pass);
+	const PgBatchUnaryStats *stats = pg_batch_unary_stats(state->unary);
 
 	if (es->analyze)
 	{

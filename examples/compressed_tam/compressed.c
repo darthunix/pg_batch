@@ -640,7 +640,7 @@ prepare_column(ActiveBatch *active, int column,
 		return;
 	source_attnum = scan->source_attnums[column];
 	stored = &active->batch->columns[source_attnum - 1];
-	arrow->array.length = bridge_batch->nrows;
+	arrow->array.length = bridge_batch->selection.nrows;
 	arrow->array.null_count = stored->null_count == 0 ? 0 : -1;
 	arrow->array.offset = active->start;
 	arrow->array.n_buffers = 2;
@@ -660,14 +660,14 @@ prepare_column(ActiveBatch *active, int column,
 static void
 prepare_columns(PgBatch *bridge_batch,
 				const Bitmapset *columns,
-				const uint64 *rows,
+				const PgBatchSelection *rows,
 				PgBatchColumnPhase phase)
 {
 	ActiveBatch *active = bridge_batch->private_data;
 	int			column = -1;
 
-	Assert(bridge_batch->nwords == 1);
-	if (columns == NULL || rows[0] == 0)
+	Assert(bridge_batch->selection.nwords == 1);
+	if (columns == NULL || rows->words[0] == 0)
 		return;
 	while ((column = bms_next_member(columns, column)) >= 0)
 		prepare_column(active, column, phase);
@@ -739,7 +739,7 @@ static const PgBatchInt4VectorInterface pg_batch_compressed_int4 = {
 
 static void
 get_datum_column(PgBatch *bridge_batch,
-				 int column, const uint64 *rows,
+				 int column, const PgBatchSelection *rows,
 				 PgBatchColumnPhase phase,
 				 PgBatchDatumVector *result)
 {
@@ -759,12 +759,12 @@ get_datum_column(PgBatch *bridge_batch,
 	if (datum->values == NULL)
 	{
 		datum->values = MemoryContextAlloc(scan->batch_context,
-										   sizeof(Datum) * bridge_batch->nrows);
+										   sizeof(Datum) * bridge_batch->selection.nrows);
 		datum->isnull = MemoryContextAlloc(scan->batch_context,
-										   sizeof(bool) * bridge_batch->nrows);
+										   sizeof(bool) * bridge_batch->selection.nrows);
 	}
 	values = view.array->buffers[1];
-	missing = rows[0] & ~datum->valid_rows;
+	missing = rows->words[0] & ~datum->valid_rows;
 	while (missing != 0)
 	{
 		int			row = pg_rightmost_one_pos64(missing);
@@ -783,8 +783,7 @@ get_datum_column(PgBatch *bridge_batch,
 	}
 	result->values = datum->values;
 	result->isnull = datum->isnull;
-	result->valid_rows = &datum->valid_rows;
-	result->nwords = 1;
+	result->nrows = bridge_batch->selection.nrows;
 }
 
 static const PgBatchNativeInterface *
@@ -799,7 +798,7 @@ get_native_interface(const PgBatchNativeType *type)
 	return NULL;
 }
 
-static const PgBatchOps pg_batch_compressed_batch_ops = {
+static const PgBatchOps compressed_ops = {
 	PG_BATCH_ABI_INITIALIZER(PG_BATCH_OPS_ABI_VERSION, PgBatchOps),
 	.prepare_columns = prepare_columns,
 	.get_datum_column = get_datum_column,
@@ -828,11 +827,11 @@ load_batch(CompressedScan *scan,
 	active->selection = PG_BATCH_ALL_ROWS >> (PG_BATCH_SIZE - nrows);
 	active->bridge_batch.abi_version = PG_BATCH_ABI_VERSION;
 	active->bridge_batch.struct_size = sizeof(PgBatch);
-	active->bridge_batch.nrows = nrows;
-	active->bridge_batch.nwords = 1;
-	active->bridge_batch.selection = &active->selection;
+	active->bridge_batch.selection.nrows = nrows;
+	active->bridge_batch.selection.nwords = 1;
+	active->bridge_batch.selection.words = &active->selection;
 	active->bridge_batch.table_oid = scan->relation->relid;
-	active->bridge_batch.ops = &pg_batch_compressed_batch_ops;
+	active->bridge_batch.ops = &compressed_ops;
 	active->bridge_batch.private_data = active;
 	scan->active = active;
 }
@@ -850,7 +849,7 @@ filter_batch(CompressedScan *scan)
 		if (qual->expr == NULL)
 			continue;
 		prepare_columns(&active->bridge_batch, qual->column_mask,
-						&active->selection, PG_BATCH_COLUMN_FILTER);
+			&active->bridge_batch.selection, PG_BATCH_COLUMN_FILTER);
 		pg_batch_expr_bind(qual->expr, &active->bridge_batch, scan->econtext,
 						   PG_BATCH_COLUMN_FILTER);
 		pg_batch_expr_apply_filter(qual->expr, true);
@@ -918,8 +917,8 @@ pg_batch_compressed_scan_next(PgBatchBinding *binding,
 			CompressedBatch *stored_batch =
 				compressed->batches[scan->batch_index];
 			int			start = scan->batch_row;
-			int			nrows = Min(scan->request->max_rows > 0 ?
-								Min(scan->request->max_rows, PG_BATCH_SIZE) :
+			int			nrows = Min(scan->request->spec.max_rows > 0 ?
+								Min(scan->request->spec.max_rows, PG_BATCH_SIZE) :
 								PG_BATCH_SIZE,
 							stored_batch->nrows - start);
 

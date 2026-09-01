@@ -31,7 +31,7 @@ The report uses these executor names:
   `PgBatchAgg` reading heap tuples in batches of 64.
 - **PostgreSQL BRIN**: a core `Bitmap Index Scan` and row-at-a-time
   `Bitmap Heap Scan`.
-- **Heap batch BRIN**: the same core bitmap producer followed by
+- **Heap batch BRIN**: the same core bitmap node followed by
   `PgBatchScan`, which exposes visible tuples from each selected heap page in
   batches.
 - **Arrow batch**: the same batch nodes reading a backend-local compressed
@@ -863,7 +863,7 @@ skew keys were selected using the prototype's `murmurhash32`; PostgreSQL's
 Hash Join uses a different hash function and therefore does not see the same
 skew. Its timing is not used as a baseline for these two stress checks.
 
-## Arrow IPC FDW and the direct batch-provider boundary
+## Arrow IPC FDW and the direct batch-source boundary
 
 This experiment checks whether an FDW can keep its normal `ForeignScan` path
 and also return source-native batches directly to the independent batch nodes.
@@ -1169,10 +1169,10 @@ noise. The full heap, packed, sparse, and spill paths did not regress. Separate
 heap-filter and reduction runs also remained within the earlier measurements;
 packed exact filters improved because they now share the SIMD kernel.
 
-## Reusable owned Datum buffer
+## Reusable owned builder
 
 `PgBatchPack` previously owned its column arrays, NULL flags, Datum copying,
-and batch operation table. The runtime now provides `PgBatchDatumBuffer` as an
+and batch operation table. The runtime now provides `PgBatchBuilder` as an
 installed row-to-batch building block. It keeps column arrays and selection
 words between batches, resets a child context for pass-by-reference values,
 and publishes an eagerly materialized Datum batch of any positive capacity.
@@ -1189,7 +1189,7 @@ the same warm heap table. Five warm-ups precede 31 samples. The first query
 packs one million `int4` rows from `generate_series`; the second packs two
 columns and 1,000,003 rows, exercising a partial final batch.
 
-| Packed scalar input | `1a777fc`, ms | Datum buffer, ms | Change |
+| Packed scalar input | `1a777fc`, ms | builder, ms | Change |
 |---|---:|---:|---:|
 | One column, exact 64-row batches | 58.889 | 60.270 | +2.3% |
 | Two columns, partial final batch | 111.620 | 113.155 | +1.4% |
@@ -1202,18 +1202,18 @@ cases within the threshold without exposing the buffer representation.
 ## Reusable batch child input
 
 The filter, aggregate, and hash join nodes previously implemented the same
-producer lookup and batch lifetime rules separately. In particular, a
-pass-through producer may receive its request through one slot but return a
+node lookup and batch lifetime rules separately. In particular, a
+pass-through node may receive its request through one slot but return a
 different slot owned by its child. Every consumer therefore had to remember
 both bindings and repeat the same error checks.
 
 The runtime now provides an opaque `PgBatchInput`. It resolves the named
-producer and request binding once, caches the binding of the actual returned
+node and request binding once, caches the binding of the actual returned
 slot, and owns the next, finish, and rescan state. Consumers finish each batch
 explicitly before requesting another one. The filter, aggregate, and both hash
 join inputs use this object. The aggregate
-planner also uses the producer's public output layout instead of recognizing
-specific `pg_batch` plan methods, so another registered producer can feed
+planner also uses the node's public output layout instead of recognizing
+specific `pg_batch` plan methods, so another registered node can feed
 `PgBatchAgg` directly.
 
 An external PGXS test links against all installed input functions without any

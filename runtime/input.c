@@ -22,30 +22,30 @@ struct PgBatchInput
 
 PgBatchInput *
 pg_batch_input_create(MemoryContext parent_context,
-					  PlanState *child, const char *producer_name)
+					  PlanState *child, const char *node_name)
 {
 	PgBatchInput *input;
-	const PgBatchProducerOps *producer;
+	const PgBatchNodeOps *node;
 	const PgBatchRequest *request;
 
 	if (parent_context == NULL || child == NULL ||
-		producer_name == NULL || producer_name[0] == '\0')
-		elog(ERROR, "pg_batch input requires a context, child, and producer");
+		node_name == NULL || node_name[0] == '\0')
+		elog(ERROR, "pg_batch input requires a context, child, and node");
 	input = MemoryContextAllocZero(parent_context, sizeof(*input));
 	input->api = pg_batch_api_get();
 	input->child = child;
-	producer = input->api->get_producer(producer_name);
-	if (producer == NULL)
-		elog(ERROR, "pg_batch producer \"%s\" is not registered", producer_name);
-	input->request_binding = producer->get_request_binding(child);
+	node = input->api->get_node(node_name);
+	if (node == NULL)
+		elog(ERROR, "pg_batch node \"%s\" is not registered", node_name);
+	input->request_binding = node->get_request_binding(child);
 	if (input->request_binding == NULL)
-		elog(ERROR, "pg_batch producer \"%s\" has no request binding",
-			 producer_name);
+		elog(ERROR, "pg_batch node \"%s\" has no request binding",
+			 node_name);
 	input->request = input->api->get_request(input->request_binding);
 	request = input->request;
 	if (request == NULL || request->struct_size < PG_BATCH_REQUEST_MIN_SIZE)
-		elog(ERROR, "pg_batch producer \"%s\" returned an invalid request",
-			 producer_name);
+		elog(ERROR, "pg_batch node \"%s\" returned an invalid request",
+			 node_name);
 	pg_batch_check_layout(request->layout);
 	return input;
 }
@@ -70,16 +70,13 @@ pg_batch_input_request(PgBatchInput *input)
 
 void
 pg_batch_input_set_request(PgBatchInput *input,
-						   const Bitmapset *filter_columns,
-						   const Bitmapset *project_columns,
-						   bool return_batch, int max_rows)
+						   const PgBatchRequestSpec *spec)
 {
-	input->api->set_request(input->request_binding, filter_columns,
-		project_columns, return_batch, max_rows);
+	input->api->set_request(input->request_binding, spec);
 }
 
 static bool
-input_fetch(PgBatchInput *input, PgBatchInputBatch *result)
+input_fetch(PgBatchInput *input, PgBatchInputResult *result)
 {
 	TupleTableSlot *slot;
 	PgBatch *batch;
@@ -98,10 +95,10 @@ input_fetch(PgBatchInput *input, PgBatchInputBatch *result)
 		input->cached_binding = input->api->find_binding(slot);
 	}
 	if (input->cached_binding == NULL)
-		elog(ERROR, "pg_batch producer returned a slot without a batch binding");
+		elog(ERROR, "pg_batch node returned a slot without a batch binding");
 	batch = input->api->get_batch(input->cached_binding);
 	if (batch == NULL)
-		elog(ERROR, "pg_batch producer returned no batch");
+		elog(ERROR, "pg_batch node returned no batch");
 
 	input->active_binding = input->cached_binding;
 	input->active_slot = slot;
@@ -121,12 +118,12 @@ input_fetch(PgBatchInput *input, PgBatchInputBatch *result)
 }
 
 bool
-pg_batch_input_next(PgBatchInput *input, PgBatchInputBatch *result)
+pg_batch_input_next(PgBatchInput *input, PgBatchInputResult *result)
 {
 	if (input->active_batch != NULL)
 	{
-		/* A pass-through parent may have finished this binding directly. */
-		if (!input->api->batch_finished(input->active_binding))
+		/* A forwarding parent may have finished this binding directly. */
+		if (!input->api->finished(input->active_binding))
 			elog(ERROR, "pg_batch input requested a new batch before finishing the previous one");
 		input->active_binding = NULL;
 		input->active_slot = NULL;
@@ -165,6 +162,7 @@ pg_batch_input_copy_row(PgBatchInput *input, int row,
 	TupleTableSlot *source;
 	uint64		local_rows;
 	uint64	   *rows;
+	PgBatchSelection selected;
 	int			word;
 	uint64		bit;
 
@@ -177,31 +175,31 @@ pg_batch_input_copy_row(PgBatchInput *input, int row,
 	desc = destination->tts_tupleDescriptor;
 	word = row / 64;
 	bit = UINT64CONST(1) << (row % 64);
-	if (batch->nwords == 1)
+	if (batch->selection.nwords == 1)
 	{
 		local_rows = bit;
 		rows = &local_rows;
 	}
 	else
 	{
-		rows = palloc0_array(uint64, batch->nwords);
+		rows = palloc0_array(uint64, batch->selection.nwords);
 		rows[word] = bit;
 	}
+	selected.nrows = batch->selection.nrows;
+	selected.nwords = batch->selection.nwords;
+	selected.words = rows;
 
 	ExecClearTuple(destination);
 	for (int attribute = 0; attribute < desc->natts; attribute++)
 	{
 		PgBatchDatumVector vector;
 
-		pg_batch_get_datum_column(batch, batch_columns[attribute], rows,
+		pg_batch_get_datum_column(batch, batch_columns[attribute], &selected,
 			PG_BATCH_COLUMN_PROJECT, &vector);
-		if (word >= vector.nwords || (vector.valid_rows[word] & bit) == 0)
-			elog(ERROR, "pg_batch input did not materialize column %d row %d",
-				 batch_columns[attribute] + 1, row);
 		destination->tts_values[attribute] = vector.values[row];
 		destination->tts_isnull[attribute] = vector.isnull[row];
 	}
-	if (batch->nwords > 1)
+	if (batch->selection.nwords > 1)
 		pfree(rows);
 	destination->tts_tid = source->tts_tid;
 	destination->tts_tableOid = batch->table_oid;
@@ -210,11 +208,11 @@ pg_batch_input_copy_row(PgBatchInput *input, int row,
 }
 
 bool
-pg_batch_input_batch_finished(PgBatchInput *input)
+pg_batch_input_finished(PgBatchInput *input)
 {
 	if (unlikely(input->active_batch == NULL))
 		elog(ERROR, "pg_batch input has no active batch");
-	return input->api->batch_finished(input->active_binding);
+	return input->api->finished(input->active_binding);
 }
 
 void
@@ -222,7 +220,7 @@ pg_batch_input_finish(PgBatchInput *input)
 {
 	if (unlikely(input->active_batch == NULL))
 		elog(ERROR, "pg_batch input has no active batch");
-	input->api->finish_batch(input->active_binding);
+	input->api->finish(input->active_binding);
 	input->active_slot = NULL;
 	input->active_binding = NULL;
 	input->active_batch = NULL;

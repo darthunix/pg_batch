@@ -39,13 +39,13 @@ _PG_init(void)
 							 8.0, 0.0, PG_BATCH_SIZE, PGC_USERSET, 0,
 								 NULL, NULL, NULL);
 	pg_batch_planner_init();
-	pg_batch_api->register_producer(&pg_batch_producer_ops);
+	pg_batch_api->register_node(&pg_batch_node_ops);
 }
 
 void
 _PG_fini(void)
 {
 	if (pg_batch_api != NULL)
-		pg_batch_api->unregister_producer(PG_BATCH_PRODUCER_NAME);
+		pg_batch_api->unregister_node(PG_BATCH_NODE_NAME);
 	pg_batch_planner_fini();
 }

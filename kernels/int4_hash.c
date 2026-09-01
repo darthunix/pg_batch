@@ -27,25 +27,21 @@ hash_value(uint32 *hashes, int row, int key, int32 value)
 static void
 hash_two_keys(const PgBatchInt4Vector *left,
 			  const PgBatchInt4Vector *right,
-			  int nrows, int nwords, const uint64 *selection,
-			  uint32 *hashes, uint64 *valid_rows)
+			  const PgBatchSelection *selection,
+			  uint32 *hashes, PgBatchSelection *valid_rows)
 {
+	int			nrows = selection->nrows;
+	int			nwords = selection->nwords;
+
+	Assert(valid_rows->nrows == nrows && valid_rows->nwords == nwords);
 	for (int word = 0; word < nwords; word++)
 	{
-		uint64		rows = selection[word] & word_mask(nrows, word);
+		uint64		rows = selection->words[word] & word_mask(nrows, word);
 		int			first_row = word * 64;
 
-		valid_rows[word] = 0;
+		valid_rows->words[word] = 0;
 		if (rows == 0)
 			continue;
-		if (left->layout == PG_BATCH_INT4_DATUM &&
-			(word >= left->data.datum.nwords ||
-			 (left->data.datum.available[word] & rows) != rows))
-			elog(ERROR, "pg_batch int4 hash received unavailable Datum rows");
-		if (right->layout == PG_BATCH_INT4_DATUM &&
-			(word >= right->data.datum.nwords ||
-			 (right->data.datum.available[word] & rows) != rows))
-			elog(ERROR, "pg_batch int4 hash received unavailable Datum rows");
 		while (rows != 0)
 		{
 			int			bitno = pg_rightmost_one_pos64(rows);
@@ -61,7 +57,7 @@ hash_two_keys(const PgBatchInt4Vector *left,
 					pg_batch_int4_row_value(right, row));
 
 				hashes[row] = hash_combine(left_hash, right_hash);
-				valid_rows[word] |= bit;
+				valid_rows->words[word] |= bit;
 			}
 			rows &= ~bit;
 		}
@@ -70,22 +66,26 @@ hash_two_keys(const PgBatchInt4Vector *left,
 
 void
 pg_batch_hash_int4(const PgBatchInt4Vector *const *keys,
-				   int nkeys, int nrows, int nwords,
-				   const uint64 *selection, uint32 *hashes,
-				   uint64 *valid_rows)
+				   int nkeys, const PgBatchSelection *selection,
+				   uint32 *hashes, PgBatchSelection *valid_rows)
 {
+	int			nrows = selection->nrows;
+	int			nwords = selection->nwords;
+
 	Assert(nkeys > 0);
 	Assert(nrows > 0);
 	Assert(nwords == (nrows + 63) / 64);
+	Assert(valid_rows->nrows == nrows && valid_rows->nwords == nwords);
 	if (nkeys == 2)
 	{
-		hash_two_keys(keys[0], keys[1], nrows, nwords, selection,
+		hash_two_keys(keys[0], keys[1], selection,
 					  hashes, valid_rows);
 		return;
 	}
 
 	for (int word = 0; word < nwords; word++)
-		valid_rows[word] = selection[word] & word_mask(nrows, word);
+		valid_rows->words[word] =
+			selection->words[word] & word_mask(nrows, word);
 
 	for (int key = 0; key < nkeys; key++)
 	{
@@ -93,16 +93,13 @@ pg_batch_hash_int4(const PgBatchInt4Vector *const *keys,
 
 		for (int word = 0; word < nwords; word++)
 		{
-			uint64		rows = valid_rows[word];
+			uint64		rows = valid_rows->words[word];
 			int			first_row = word * 64;
 
 			if (rows == 0)
 				continue;
 			if (column->layout == PG_BATCH_INT4_DATUM)
 			{
-				if (word >= column->data.datum.nwords ||
-					(column->data.datum.available[word] & rows) != rows)
-					elog(ERROR, "pg_batch int4 hash received unavailable Datum rows");
 				while (rows != 0)
 				{
 					int			bitno = pg_rightmost_one_pos64(rows);
@@ -110,7 +107,7 @@ pg_batch_hash_int4(const PgBatchInt4Vector *const *keys,
 					int			row = first_row + bitno;
 
 					if (column->data.datum.isnull[row])
-						valid_rows[word] &= ~bit;
+						valid_rows->words[word] &= ~bit;
 					else
 						hash_value(hashes, row, key,
 								   DatumGetInt32(column->data.datum.values[row]));
@@ -133,7 +130,7 @@ pg_batch_hash_int4(const PgBatchInt4Vector *const *keys,
 					if (validity != NULL &&
 						(validity[physical / 8] &
 						 ((uint8) 1 << (physical % 8))) == 0)
-						valid_rows[word] &= ~bit;
+						valid_rows->words[word] &= ~bit;
 					else
 						hash_value(hashes, row, key, values[bitno]);
 					rows &= ~bit;

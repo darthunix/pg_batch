@@ -16,7 +16,7 @@ typedef struct PgBatchLayout
 {
 	/* Set by the caller to sizeof(PgBatchLayout). */
 	Size		struct_size;
-	/* Number of logical columns available from the batch producer. */
+	/* Number of logical columns available from the batch node. */
 	int			ncolumns;
 	/* Number of entries in the plan target list described below. */
 	int			ntargets;

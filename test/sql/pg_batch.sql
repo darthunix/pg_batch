@@ -22,9 +22,9 @@ CREATE FUNCTION pg_batch_bridge_test_bad_abi()
 RETURNS void
 AS :'bridge_test', 'pg_batch_bridge_test_bad_abi'
 LANGUAGE C;
-CREATE FUNCTION pg_batch_bridge_test_duplicate_provider()
+CREATE FUNCTION pg_batch_bridge_test_duplicate_source()
 RETURNS void
-AS :'bridge_test', 'pg_batch_bridge_test_duplicate_provider'
+AS :'bridge_test', 'pg_batch_bridge_test_duplicate_source'
 LANGUAGE C;
 CREATE FUNCTION pg_batch_bridge_test_compatible_sizes()
 RETURNS boolean
@@ -38,13 +38,17 @@ CREATE FUNCTION pg_batch_expr_api_test()
 RETURNS boolean
 AS :'expr_test', 'pg_batch_expr_api_test'
 LANGUAGE C;
-CREATE FUNCTION pg_batch_datum_buffer_test()
+CREATE FUNCTION pg_batch_builder_test()
 RETURNS boolean
-AS :'runtime_test', 'pg_batch_datum_buffer_test'
+AS :'runtime_test', 'pg_batch_builder_test'
 LANGUAGE C;
 CREATE FUNCTION pg_batch_input_api_test()
 RETURNS boolean
 AS :'runtime_test', 'pg_batch_input_api_test'
+LANGUAGE C;
+CREATE FUNCTION pg_batch_plan_data_test()
+RETURNS boolean
+AS :'runtime_test', 'pg_batch_plan_data_test'
 LANGUAGE C;
 CREATE FUNCTION pg_batch_output_test()
 RETURNS boolean
@@ -80,12 +84,13 @@ AS :'spill_test', 'pg_batch_spill_test'
 LANGUAGE C;
 
 SELECT pg_batch_bridge_test_bad_abi();
-SELECT pg_batch_bridge_test_duplicate_provider();
+SELECT pg_batch_bridge_test_duplicate_source();
 SELECT pg_batch_bridge_test_compatible_sizes() AS compatible_abi_sizes_ok;
 SELECT pg_batch_kernels_test() AS installed_kernels_ok;
 SELECT pg_batch_expr_api_test() AS installed_expr_api_ok;
-SELECT pg_batch_datum_buffer_test() AS installed_datum_buffer_ok;
+SELECT pg_batch_builder_test() AS installed_builder_ok;
 SELECT pg_batch_input_api_test() AS installed_input_api_ok;
+SELECT pg_batch_plan_data_test() AS installed_plan_data_ok;
 SELECT pg_batch_output_test() AS installed_output_ok;
 SELECT pg_batch_output_over_max_test();
 SELECT pg_batch_binding_request_test() AS installed_binding_request_ok;
@@ -1022,7 +1027,7 @@ SELECT NOT EXISTS (
 
 RESET work_mem;
 
--- A separately built pass-through node uses only the public bridge/runtime.
+-- A separately built unary node uses only the public bridge/runtime.
 LOAD 'pg_batch_limit';
 SET pg_batch.enable = on;
 SET pg_batch_limit.enable = on;

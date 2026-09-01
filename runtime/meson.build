@@ -2,10 +2,11 @@ runtime_lib = static_library(
   'pg_batch_runtime',
   'api.c',
   'adapter.c',
-  'datum_buffer.c',
+  'builder.c',
   'input.c',
   'output.c',
-  'pass.c',
+  'unary.c',
+  'plan.c',
   dependencies: postgres_dep,
   include_directories: public_inc,
   gnu_symbol_visibility: 'hidden',
@@ -22,6 +23,6 @@ runtime_dep = declare_dependency(
 
 install_headers(
   '../include/pg_batch/runtime.h',
-  '../include/pg_batch/vector.h',
+  '../include/pg_batch/plan.h',
   install_dir: pg_server_include / 'extension' / 'pg_batch',
 )

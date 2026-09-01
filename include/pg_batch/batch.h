@@ -34,6 +34,14 @@ typedef enum PgBatchColumnPhase
 
 typedef struct PgBatch PgBatch;
 
+/* Mutable set of active physical row numbers in one batch. */
+typedef struct PgBatchSelection
+{
+	int			nrows;
+	int			nwords;
+	uint64	   *words;
+} PgBatchSelection;
+
 /* Common header of a typed source-native column interface. */
 typedef struct PgBatchNativeInterface
 {
@@ -52,16 +60,15 @@ typedef struct PgBatchNativeType
 /* Borrowed Datum view indexed by physical row number in the batch. */
 typedef struct PgBatchDatumVector
 {
-	/* Capacity supplied by the caller; providers must preserve this field. */
+	/* Capacity supplied by the caller; sources must preserve this field. */
 	Size		struct_size;
 	const Datum *values;
 	const bool *isnull;
-	const uint64 *valid_rows;
-	int			nwords;
+	int			nrows;
 } PgBatchDatumVector;
 
 #define PG_BATCH_DATUM_VECTOR_MIN_SIZE \
-	PG_BATCH_ABI_SIZE_THROUGH(PgBatchDatumVector, nwords)
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchDatumVector, nrows)
 
 static inline void
 pg_batch_check_datum_vector(const PgBatchDatumVector *result)
@@ -77,13 +84,13 @@ typedef struct PgBatchOps
 	Size		struct_size;
 	/* Required v1 fallback available for every physical representation. */
 	void		(*get_datum_column) (PgBatch *batch, int column,
-									 const uint64 *rows,
+									 const PgBatchSelection *rows,
 									 PgBatchColumnPhase phase,
 									 PgBatchDatumVector *result);
 	/* Optional append-only operations. */
 	void		(*prepare_columns) (PgBatch *batch,
 									const Bitmapset *columns,
-									const uint64 *rows,
+									const PgBatchSelection *rows,
 									PgBatchColumnPhase phase);
 	/* The returned interface depends only on this operations table. */
 	const PgBatchNativeInterface *(*get_native_interface) (
@@ -108,9 +115,7 @@ struct PgBatch
 {
 	uint32		abi_version;
 	Size		struct_size;
-	int			nrows;
-	int			nwords;
-	uint64	   *selection;
+	PgBatchSelection selection;
 	Oid			table_oid;
 	const PgBatchOps *ops;
 	void	   *private_data;
@@ -123,8 +128,10 @@ typedef struct PgBatchConsumerOps
 {
 	uint32		abi_version;
 	Size		struct_size;
-	void		(*accept_batch) (TupleTableSlot *slot, PgBatch *batch);
-	void		(*select_row) (TupleTableSlot *slot, PgBatch *batch, int row);
+	void		(*accept_batch) (void *consumer_state, TupleTableSlot *slot,
+							 PgBatch *batch);
+	void		(*select_row) (void *consumer_state, TupleTableSlot *slot,
+							 PgBatch *batch, int row);
 } PgBatchConsumerOps;
 
 /*
@@ -137,29 +144,31 @@ typedef struct PgBatchRowView
 	TupleTableSlot *slot;
 	PgBatch    *batch;
 	uint64		generation;
-	void		(*select_row) (TupleTableSlot *slot, PgBatch *batch, int row);
+	void	   *consumer_state;
+	void		(*select_row) (void *consumer_state, TupleTableSlot *slot,
+							 PgBatch *batch, int row);
 } PgBatchRowView;
 
 #define PG_BATCH_ROW_VIEW_MIN_SIZE \
 	PG_BATCH_ABI_SIZE_THROUGH(PgBatchRowView, select_row)
 
 static inline int
-pg_batch_selection_count(const PgBatch *batch)
+pg_batch_selection_count(const PgBatchSelection *selection)
 {
 	int			result = 0;
 
-	if (likely(batch->nwords == 1))
-		return pg_popcount64(batch->selection[0]);
-	for (int word = 0; word < batch->nwords; word++)
-		result += pg_popcount64(batch->selection[word]);
+	if (likely(selection->nwords == 1))
+		return pg_popcount64(selection->words[0]);
+	for (int word = 0; word < selection->nwords; word++)
+		result += pg_popcount64(selection->words[word]);
 	return result;
 }
 
 static inline bool
-pg_batch_row_selected(const PgBatch *batch, int row)
+pg_batch_selection_contains(const PgBatchSelection *selection, int row)
 {
-	Assert(row >= 0 && row < batch->nrows);
-	return (batch->selection[row / 64] &
+	Assert(row >= 0 && row < selection->nrows);
+	return (selection->words[row / 64] &
 			(UINT64CONST(1) << (row % 64))) != 0;
 }
 
@@ -170,51 +179,54 @@ pg_batch_row_view_select(const PgBatchRowView *view, int row)
 		view->batch == NULL || view->generation == 0 ||
 		view->batch->generation != view->generation ||
 		view->select_row == NULL ||
-		row < 0 || row >= view->batch->nrows ||
-		!pg_batch_row_selected(view->batch, row))
+		row < 0 || row >= view->batch->selection.nrows ||
+		!pg_batch_selection_contains(&view->batch->selection, row))
 		elog(ERROR, "pg_batch cannot select row %d", row);
-	view->select_row(view->slot, view->batch, row);
+	view->select_row(view->consumer_state, view->slot, view->batch, row);
 	return view->slot;
 }
 
 static inline void
-pg_batch_clear_row(PgBatch *batch, int row)
+pg_batch_selection_clear(PgBatchSelection *selection, int row)
 {
-	Assert(row >= 0 && row < batch->nrows);
-	batch->selection[row / 64] &=
+	Assert(row >= 0 && row < selection->nrows);
+	selection->words[row / 64] &=
 		~(UINT64CONST(1) << (row % 64));
 }
 
-/* Remove every row not present in rows; selected rows can never be restored. */
+/* Remove rows not present in other; selected rows can never be restored. */
 static inline void
-pg_batch_intersect_selection(PgBatch *batch, const uint64 *rows)
+pg_batch_selection_intersect(PgBatchSelection *selection,
+							 const PgBatchSelection *other)
 {
-	for (int word = 0; word < batch->nwords; word++)
-		batch->selection[word] &= rows[word];
+	Assert(selection->nrows == other->nrows);
+	Assert(selection->nwords == other->nwords);
+	for (int word = 0; word < selection->nwords; word++)
+		selection->words[word] &= other->words[word];
 }
 
 /* Pass -1 to start; return -1 after the last selected row. */
 static inline int
-pg_batch_next_selected(const PgBatch *batch, int previous)
+pg_batch_selection_next(const PgBatchSelection *selection, int previous)
 {
 	int			row = previous + 1;
 	int			word = row / 64;
 	uint64		bits;
 
-	if (row >= batch->nrows)
+	if (row >= selection->nrows)
 		return -1;
-	bits = batch->selection[word] & (UINT64_MAX << (row % 64));
+	bits = selection->words[word] & (UINT64_MAX << (row % 64));
 	for (;;)
 	{
 		if (bits != 0)
 		{
 			int			result = word * 64 + pg_rightmost_one_pos64(bits);
 
-			return result < batch->nrows ? result : -1;
+			return result < selection->nrows ? result : -1;
 		}
-		if (++word >= batch->nwords)
+		if (++word >= selection->nwords)
 			return -1;
-		bits = batch->selection[word];
+		bits = selection->words[word];
 	}
 }
 

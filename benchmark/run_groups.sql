@@ -44,7 +44,7 @@ PREPARE batch_brin_range_hit AS
 SELECT count(*) FROM pg_batch_bench_heap_groups
 WHERE c1 BETWEEN 1000001 AND 1001000;
 
--- The provider captures scan_mode while planning. Keep one prepared statement
+-- The source captures scan_mode while planning. Keep one prepared statement
 -- per mode so the plan cache cannot make all three measurements use one mode.
 SET pg_batch_tam.scan_mode = batch;
 PREPARE arrow_batch_range_hit AS

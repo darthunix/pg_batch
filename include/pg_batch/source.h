@@ -25,6 +25,15 @@ typedef enum PgBatchQualSupport
 	PG_BATCH_QUAL_EXACT
 } PgBatchQualSupport;
 
+/* How the scan executor obtains batches from this source. */
+typedef enum PgBatchSourceDelivery
+{
+	/* table_scan_getnextslot() publishes through the scan slot binding. */
+	PG_BATCH_SOURCE_SLOT,
+	/* next_batch() returns a batch directly to the scan executor. */
+	PG_BATCH_SOURCE_PULL
+} PgBatchSourceDelivery;
+
 /*
  * Borrowed planner input passed to one source's plan_scan() callback.
  *
@@ -52,7 +61,7 @@ typedef struct PgBatchSourcePlanRequest
 /* Copyable source plan returned from plan_scan() in the planner context. */
 typedef struct PgBatchSourcePlanResult
 {
-	/* Set by the caller. The provider fills fields without clearing it. */
+	/* Set by the caller. The source fills fields without clearing it. */
 	Size		struct_size;
 	/* One classification for every input clause, in the same order. */
 	int			nquals;
@@ -87,15 +96,16 @@ typedef struct PgBatchSourceExecRequest
 /*
  * Operations implemented by an independently built batch source.
  *
- * The table has a unique stable name and remains valid while registered. A
- * scan calls plan_scan(), begin_scan(), optional rescans, and finally
- * end_scan().
+ * The operation table has a unique stable name and remains valid while
+ * registered. A scan calls plan_scan(), begin_scan(), optional rescans, and
+ * finally end_scan().
  */
-struct PgBatchProviderOps
+struct PgBatchSourceOps
 {
 	uint32		abi_version;
 	Size		struct_size;
-	const char *provider_name;
+	const char *source_name;
+	PgBatchSourceDelivery delivery;
 	/* Return whether this source can scan the open relation. */
 	bool		(*supports_relation) (Relation relation);
 	/* Classify all restrictions and return source-owned plan data. */
@@ -104,21 +114,20 @@ struct PgBatchProviderOps
 	/* Start a scan and return opaque state for the remaining callbacks. */
 	void	   *(*begin_scan) (const PgBatchSourceExecRequest *request);
 	/* Required lifecycle operations. */
-	void		(*rescan) (void *provider_state);
-	void		(*end_scan) (void *provider_state);
-	/* Optional append-only operations. */
+	void		(*rescan) (void *source_state);
+	void		(*end_scan) (void *source_state);
+	/* Append-only operations after the required v1 prefix. */
 	/*
-	 * Return the next source-owned batch, or NULL at end of scan. A NULL
-	 * callback keeps the table-AM path, where the source publishes through the
-	 * scan slot instead.
+	 * Return the next source-owned batch, or NULL at end of scan. This is
+	 * required for PG_BATCH_SOURCE_PULL and unused for PG_BATCH_SOURCE_SLOT.
 	 */
-	PgBatch *(*next_batch) (void *provider_state);
+	PgBatch *(*next_batch) (void *source_state);
 	/* Add source-specific EXPLAIN properties; this callback is optional. */
-	void		(*explain) (void *provider_state, ExplainState *es);
+	void		(*explain) (void *source_state, ExplainState *es);
 };
 
-#define PG_BATCH_PROVIDER_OPS_ABI_VERSION 1
-#define PG_BATCH_PROVIDER_OPS_MIN_SIZE \
-	PG_BATCH_ABI_SIZE_THROUGH(PgBatchProviderOps, end_scan)
+#define PG_BATCH_SOURCE_OPS_ABI_VERSION 1
+#define PG_BATCH_SOURCE_OPS_MIN_SIZE \
+	PG_BATCH_ABI_SIZE_THROUGH(PgBatchSourceOps, end_scan)
 
 #endif /* PG_BATCH_SOURCE_H */

@@ -50,7 +50,7 @@ slot_clear(TupleTableSlot *slot)
 {
 	PgBatchSlot *bslot = (PgBatchSlot *) slot;
 
-	pg_batch_api->clear_batch(bslot->binding);
+	pg_batch_api->clear(bslot->binding);
 	bslot->active_batch = NULL;
 	release_materialized(bslot);
 	if (BufferIsValid(bslot->buffer))
@@ -74,7 +74,7 @@ heap_tuple(PgBatchSlot *bslot, int row)
 	OffsetNumber offset;
 
 	Assert(BufferIsValid(bslot->buffer));
-	Assert(row >= 0 && row < bslot->heap_batch.nrows);
+	Assert(row >= 0 && row < bslot->heap_batch.selection.nrows);
 	page = BufferGetPage(bslot->buffer);
 	offset = bslot->item_offsets[row];
 	item = PageGetItemId(page, offset);
@@ -250,16 +250,16 @@ sort_columns_by_attnum(PgBatchSlot *bslot, int *columns, int ncolumns)
 static void
 heap_prepare_columns(PgBatch *batch,
 					 const Bitmapset *columns,
-					 const uint64 *selected_rows,
+					 const PgBatchSelection *selected_rows,
 					 PgBatchMaterializePhase phase)
 {
 	PgBatchSlot *bslot = batch->private_data;
 	int			requested_columns[MaxTupleAttributeNumber];
 	int			ncolumns = 0;
 	int			column = -1;
-	uint64		rows = selected_rows[0];
+	uint64		rows = selected_rows->words[0];
 
-	Assert(batch->nwords == 1);
+	Assert(batch->selection.nwords == 1);
 	if (columns == NULL || rows == 0)
 		return;
 	while ((column = bms_next_member(columns, column)) >= 0)
@@ -296,7 +296,7 @@ heap_prepare_columns(PgBatch *batch,
 
 static void
 heap_get_datum_column(PgBatch *batch, int column,
-					  const uint64 *selected_rows,
+					  const PgBatchSelection *selected_rows,
 					  PgBatchMaterializePhase phase,
 					  PgBatchDatumVector *result)
 {
@@ -308,7 +308,7 @@ heap_get_datum_column(PgBatch *batch, int column,
 	if (column < 0 || column >= bslot->ncolumns)
 		elog(ERROR, "pg_batch column %d is out of range", column + 1);
 	bcolumn = &bslot->columns[column];
-	missing = selected_rows[0] & ~bcolumn->valid_rows;
+	missing = selected_rows->words[0] & ~bcolumn->valid_rows;
 	if (missing != 0)
 	{
 		Bitmapset  *columns = bms_make_singleton(column);
@@ -318,8 +318,7 @@ heap_get_datum_column(PgBatch *batch, int column,
 	}
 	result->values = bcolumn->values;
 	result->isnull = bcolumn->isnull;
-	result->valid_rows = &bcolumn->valid_rows;
-	result->nwords = 1;
+	result->nrows = batch->selection.nrows;
 }
 
 static void
@@ -333,7 +332,7 @@ heap_release(PgBatch *batch)
 	bslot->block = InvalidBlockNumber;
 }
 
-static const PgBatchOps pg_batch_heap_batch_ops = {
+static const PgBatchOps heap_ops = {
 	PG_BATCH_ABI_INITIALIZER(PG_BATCH_OPS_ABI_VERSION, PgBatchOps),
 	.prepare_columns = heap_prepare_columns,
 	.get_datum_column = heap_get_datum_column,
@@ -341,31 +340,31 @@ static const PgBatchOps pg_batch_heap_batch_ops = {
 	.release = heap_release,
 };
 
-static void consumer_select_row(TupleTableSlot *slot,
-								PgBatch *batch, int row);
+static void consumer_select_row(void *consumer_state, TupleTableSlot *slot,
+	PgBatch *batch, int row);
 
 static void
-accept_batch(TupleTableSlot *slot, PgBatch *batch)
+accept_batch(void *consumer_state, TupleTableSlot *slot, PgBatch *batch)
 {
 	PgBatchSlot *bslot = pg_batch_slot_cast(slot);
-	int			row = pg_batch_next_selected(batch, -1);
+	int			row = pg_batch_selection_next(&batch->selection, -1);
 
 	if (row < 0)
 		elog(ERROR, "pg_batch source published an empty selection");
 	bslot->active_batch = batch;
 	bslot->current_row = -1;
 	/* publish_batch() calls us after the bridge has installed the batch. */
-	consumer_select_row(slot, batch, row);
+	consumer_select_row(consumer_state, slot, batch, row);
 }
 
 static void
-consumer_select_row(TupleTableSlot *slot,
+consumer_select_row(void *consumer_state, TupleTableSlot *slot,
 					PgBatch *batch, int row)
 {
 	PgBatchSlot *bslot = pg_batch_slot_cast(slot);
 
-	Assert(row >= 0 && row < batch->nrows);
-	Assert(pg_batch_row_selected(batch, row));
+	Assert(row >= 0 && row < batch->selection.nrows);
+	Assert(pg_batch_selection_contains(&batch->selection, row));
 	release_materialized(bslot);
 	bslot->current_row = row;
 	slot->tts_nvalid = 0;
@@ -389,9 +388,9 @@ pg_batch_select_row(TupleTableSlot *slot, int row)
 {
 	PgBatch *batch = pg_batch_get_batch(slot);
 
-	if (!pg_batch_row_selected(batch, row))
+	if (!pg_batch_selection_contains(&batch->selection, row))
 		elog(ERROR, "pg_batch cannot select row %d", row);
-	consumer_select_row(slot, batch, row);
+	consumer_select_row(pg_batch_slot_cast(slot), slot, batch, row);
 }
 
 static void
@@ -403,11 +402,12 @@ batch_slot_getsomeattrs(TupleTableSlot *slot, int natts)
 	PgBatchMaterializePhase phase;
 	uint64		local_rowbits;
 	uint64	   *rowbits;
+	PgBatchSelection selected;
 	MemoryContext oldcontext;
 
-	if (bslot->current_row < 0 || bslot->current_row >= batch->nrows)
+	if (bslot->current_row < 0 || bslot->current_row >= batch->selection.nrows)
 		elog(ERROR, "pg_batch slot has no current row (current %d, rows %d)",
-			 bslot->current_row, batch->nrows);
+			 bslot->current_row, batch->selection.nrows);
 	if (natts > bslot->ncolumns)
 		elog(ERROR, "pg_batch requested too many attributes");
 
@@ -416,35 +416,33 @@ batch_slot_getsomeattrs(TupleTableSlot *slot, int natts)
 		needed = bms_add_range(needed, slot->tts_nvalid, natts - 1);
 	phase = natts <= bslot->nfilter_columns ?
 		PG_BATCH_FILTER_PHASE : PG_BATCH_PROJECT_PHASE;
-	if (likely(batch->nwords == 1))
+	if (likely(batch->selection.nwords == 1))
 	{
 		local_rowbits = UINT64CONST(1) << bslot->current_row;
 		rowbits = &local_rowbits;
 	}
 	else
 	{
-		rowbits = palloc0_array(uint64, batch->nwords);
+		rowbits = palloc0_array(uint64, batch->selection.nwords);
 		rowbits[bslot->current_row / 64] =
 			UINT64CONST(1) << (bslot->current_row % 64);
 	}
-	pg_batch_prepare_columns(batch, needed, rowbits, phase);
+	selected.nrows = batch->selection.nrows;
+	selected.nwords = batch->selection.nwords;
+	selected.words = rowbits;
+	pg_batch_prepare_columns(batch, needed, &selected, phase);
 
 	for (int column = slot->tts_nvalid; column < natts; column++)
 	{
 		PgBatchDatumVector bcolumn;
-		int			word = bslot->current_row / 64;
-		uint64		bit = UINT64CONST(1) << (bslot->current_row % 64);
 
-		pg_batch_get_datum_column(batch, column, rowbits, phase, &bcolumn);
-		if (word >= bcolumn.nwords || (bcolumn.valid_rows[word] & bit) == 0)
-			elog(ERROR, "pg_batch source did not materialize column %d row %d",
-				 column + 1, bslot->current_row);
+		pg_batch_get_datum_column(batch, column, &selected, phase, &bcolumn);
 		slot->tts_values[column] = bcolumn.values[bslot->current_row];
 		slot->tts_isnull[column] = bcolumn.isnull[bslot->current_row];
 	}
 	slot->tts_nvalid = natts;
 	bms_free(needed);
-	if (batch->nwords > 1)
+	if (batch->selection.nwords > 1)
 		pfree(rowbits);
 	MemoryContextSwitchTo(oldcontext);
 }
@@ -561,17 +559,8 @@ pg_batch_configure_slot(PgBatchSlot *bslot, TupleDesc source_desc,
 	layout.ntargets = bslot->ncolumns;
 	bslot->binding = pg_batch_api->attach_slot(&bslot->base,
 												  &layout,
-												  &pg_batch_slot_consumer_ops);
-}
-
-void
-pg_batch_set_request(TupleTableSlot *slot, const Bitmapset *filter_columns,
-					 const Bitmapset *project_columns, bool return_batch)
-{
-	PgBatchSlot *bslot = pg_batch_slot_cast(slot);
-
-	pg_batch_api->set_request(bslot->binding, filter_columns,
-								 project_columns, return_batch, 0);
+												  &pg_batch_slot_consumer_ops,
+												  bslot);
 }
 
 void
@@ -596,11 +585,11 @@ pg_batch_load_batch(PgBatchSlot *bslot, Buffer buffer, BlockNumber block,
 	bslot->heap_selection = pg_batch_nrows_mask(nrows);
 	bslot->heap_batch.abi_version = PG_BATCH_ABI_VERSION;
 	bslot->heap_batch.struct_size = sizeof(PgBatch);
-	bslot->heap_batch.nrows = nrows;
-	bslot->heap_batch.nwords = 1;
-	bslot->heap_batch.selection = &bslot->heap_selection;
+	bslot->heap_batch.selection.nrows = nrows;
+	bslot->heap_batch.selection.nwords = 1;
+	bslot->heap_batch.selection.words = &bslot->heap_selection;
 	bslot->heap_batch.table_oid = table_oid;
-	bslot->heap_batch.ops = &pg_batch_heap_batch_ops;
+	bslot->heap_batch.ops = &heap_ops;
 	bslot->heap_batch.private_data = bslot;
 	pg_batch_api->publish_batch(bslot->binding, &bslot->heap_batch);
 }

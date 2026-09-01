@@ -141,28 +141,25 @@ not_null_mask(const PgBatchInt4Vector *column, int first_row, int nrows,
 }
 
 void
-pg_batch_filter_int4(const PgBatchInt4Vector *column, int nrows, int nwords,
-					 uint64 *selection, PgBatchInt4Op op, int32 scalar,
+pg_batch_filter_int4(const PgBatchInt4Vector *column,
+					 PgBatchSelection *selection, PgBatchInt4Op op, int32 scalar,
 					 bool enable_simd)
 {
 	bool		use_simd = enable_simd && pg_batch_int4_simd_available();
+	int			nrows = selection->nrows;
+	int			nwords = selection->nwords;
 
 	Assert(nrows > 0);
 	Assert(nwords == (nrows + 63) / 64);
 
 	for (int word = 0; word < nwords; word++)
 	{
-		uint64		rows = selection[word] & word_mask(nrows, word);
+		uint64		rows = selection->words[word] & word_mask(nrows, word);
 		int			first_row = word * 64;
 		int			word_nrows = Min(64, nrows - first_row);
 
 		if (rows == 0)
 			continue;
-		if (column->layout == PG_BATCH_INT4_DATUM &&
-			(word >= column->data.datum.nwords ||
-			 (column->data.datum.available[word] & rows) != rows))
-			elog(ERROR, "pg_batch int4 kernel received unavailable Datum rows");
-
 		/* Sparse selections are cheaper to visit through their set bits. */
 		if (use_simd &&
 			rows == word_mask(nrows, word) && word_nrows >= 4)
@@ -172,10 +169,10 @@ pg_batch_filter_int4(const PgBatchInt4Vector *column, int nrows, int nwords,
 			passing = pg_batch_int4_simd_compare(column, first_row,
 											 word_nrows, op, scalar);
 			passing &= not_null_mask(column, first_row, word_nrows, rows);
-			selection[word] = rows & passing;
+			selection->words[word] = rows & passing;
 		}
 		else
-			selection[word] = scalar_compare(column, first_row, rows,
+			selection->words[word] = scalar_compare(column, first_row, rows,
 										 op, scalar);
 	}
 }
@@ -229,25 +226,22 @@ overflow:
 
 void
 pg_batch_int4_arithmetic_scalar(const PgBatchInt4Vector *input,
-								int nrows, int nwords,
-								const uint64 *selection,
+								const PgBatchSelection *selection,
 								PgBatchInt4ArithmeticOp op, int32 scalar,
 								bool scalar_on_left,
 								int32 *output_values,
 								uint8 *output_validity)
 {
+	int			nrows = selection->nrows;
+	int			nwords = selection->nwords;
+
 	Assert(nrows > 0);
 	Assert(nwords == (nrows + 63) / 64);
 	MemSet(output_validity, 0, (nrows + 7) / 8);
 
 	for (int word = 0; word < nwords; word++)
 	{
-		uint64		rows = selection[word] & word_mask(nrows, word);
-
-		if (input->layout == PG_BATCH_INT4_DATUM && rows != 0 &&
-			(word >= input->data.datum.nwords ||
-			 (input->data.datum.available[word] & rows) != rows))
-			elog(ERROR, "pg_batch int4 kernel received unavailable Datum rows");
+		uint64		rows = selection->words[word] & word_mask(nrows, word);
 
 		while (rows != 0)
 		{
@@ -346,10 +340,12 @@ reduce_sum(const PgBatchInt4Vector *column, int first_row, int nrows,
 }
 
 void
-pg_batch_reduce_int4(const PgBatchInt4Vector *column, int nrows, int nwords,
-					 const uint64 *selection, uint32 flags,
+pg_batch_reduce_int4(const PgBatchInt4Vector *column,
+					 const PgBatchSelection *selection, uint32 flags,
 					 PgBatchInt4Reduction *result)
 {
+	int			nrows = selection->nrows;
+	int			nwords = selection->nwords;
 	uint32		value_flags = flags & (PG_BATCH_INT4_REDUCE_SUM |
 									 PG_BATCH_INT4_REDUCE_MIN |
 									 PG_BATCH_INT4_REDUCE_MAX);
@@ -363,15 +359,10 @@ pg_batch_reduce_int4(const PgBatchInt4Vector *column, int nrows, int nwords,
 	{
 		int			first_row = word * 64;
 		int			word_nrows = Min(64, nrows - first_row);
-		uint64		rows = selection[word] & word_mask(nrows, word);
+		uint64		rows = selection->words[word] & word_mask(nrows, word);
 
 		if (rows == 0)
 			continue;
-		if (column->layout == PG_BATCH_INT4_DATUM &&
-			(word >= column->data.datum.nwords ||
-			 (column->data.datum.available[word] & rows) != rows))
-			elog(ERROR, "pg_batch int4 kernel received unavailable Datum rows");
-
 		rows &= not_null_mask(column, first_row, word_nrows, rows);
 		if (rows == 0)
 			continue;

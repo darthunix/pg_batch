@@ -30,14 +30,14 @@ examples/limit_node/ ----------/-----------------/
   an ordinary
   row-at-a-time FDW path and a direct bridge callback that returns native
   Arrow batches to the same nodes.
-- `examples/limit_node/` is an independently built pass-through node. It uses
+- `examples/limit_node/` is an independently built unary node. It uses
   only installed public headers and the runtime library, which keeps the
-  producer interface honest without depending on `nodes/` internals.
+  node interface honest without depending on `nodes/` internals.
 - `runtime/` provides common batch traversal, lazy Datum/native adapters,
-  borrowed vector views, an owned Datum buffer for collecting scalar slots,
-  and opaque input/output objects for connecting batch producers and
+  borrowed vector views, an owned builder for collecting scalar slots,
+  and opaque input/output objects for connecting batch nodes and
   consumers.
-  It also provides `PgBatchPass` for selection-changing nodes that preserve a
+  It also provides `PgBatchUnary` for selection-changing nodes that preserve a
   child's batch. `kernels/` provides type-specific operations over those
   views. `expr/`
   compiles a deliberately small class of PostgreSQL expressions into reusable
@@ -52,10 +52,13 @@ libraries. The node extension also uses the spill library. The bridge remains
 their only shared runtime service; the static libraries only remove duplicated
 C implementation from the extensions.
 
+See [`docs/writing-a-node.md`](docs/writing-a-node.md) for the public execution
+model and a step-by-step guide to building an independent batch-aware node.
+
 The `.control` and extension SQL files retain their full extension names
 because PostgreSQL looks them up by those names. Public headers are installed
 under `extension/pg_batch/`; internal source files use short
-names such as `planner.c`, `slot.c`, `provider.c`, and `compressed.c`.
+names such as `planner.c`, `slot.c`, `source.c`, and `compressed.c`.
 
 ## Batch contract
 
@@ -74,7 +77,7 @@ for surviving rows.
 At execution time the bridge attaches a request to the scan slot. A table
 access method may publish through its normal slot callback. A source without
 such a callback, including an FDW, may instead return a batch from the optional
-provider `next_batch` operation; `PgBatchScan` publishes it on the same slot.
+source `next_batch` operation; `PgBatchScan` publishes it on the same slot.
 Every batch must provide lazy `Datum` materialization, which is the
 format-neutral fallback for ordinary PostgreSQL consumers. A batch may also
 publish optional named native interfaces. The test columnar sources and
@@ -90,8 +93,8 @@ opaque `PgBatchBinding *`. Batch-aware nodes retain that pointer and use
 it directly; the test table access method performs one lookup for each batch it
 returns.
 
-Batch consumers use `PgBatchInput` to keep the producer, request binding, and
-actual returned slot binding together. This matters for pass-through nodes:
+Batch consumers use `PgBatchInput` to keep the node, request binding, and
+actual returned slot binding together. This matters for unary nodes:
 the slot that receives a request need not be the slot that later publishes a
 batch. The input object caches that returned binding and provides explicit
 next, finish, and rescan transitions without exposing its state.
@@ -99,13 +102,13 @@ For scalar expressions it can borrow one `PgBatchRowView` per batch and select
 rows through the consumer directly, avoiding a bridge call in the hot loop.
 `PgBatchOutput` publishes batches to another batch-aware node or exposes the
 selected rows through the same slot to an ordinary row-at-a-time parent.
-`PgBatchPass` implements the common case where a node keeps the child's batch
+`PgBatchUnary` implements the common case where a node keeps the child's batch
 representation and only changes its row selection. The node supplies one
 batch callback; the runtime forwards column and batch-size requests and owns
 the scalar/batch, finish, rescan, and instrumentation bookkeeping.
 
 `PgBatchLayout` separates compact batch columns from plan target-list
-positions. This preserves hidden filter columns across pass-through nodes
+positions. This preserves hidden filter columns across unary nodes
 without making them visible in the tuple descriptor. `PgBatchRequest` uses
 that logical layout, separate filter and lazy-projection masks, and an optional
 maximum batch size. The request becomes immutable before execution starts, so
@@ -159,7 +162,7 @@ representation, duplicate expressions are computed once, and conversion to
 Datum stays lazy. `PgBatchAgg` consumes full batches for `count(*)`,
 `count(expression)`, `sum(expression)`, `min(expression)`, and
 `max(expression)` without turning them into a row stream. Its planner asks the
-registered producer for the output-column layout, so it is not tied to a
+registered node for the output-column layout, so it is not tied to a
 private node or slot type. It also supports one direct `int4` grouping key.
 Groups that fit stay in a PostgreSQL hash table; new groups beyond the hash
 memory limit are divided into spill partitions and processed later. A
@@ -337,13 +340,13 @@ PGPORT=5432 make \
 The suite also builds separate C modules through the installed `pkg-config`
 metadata, without private node headers. They check the reusable expression
 analyzer, kernels, public batch input/output symbols, a bounded spill set, and
-a 70-row owned Datum buffer containing by-value, copied by-reference, and NULL
+a 70-row owned builder containing by-value, copied by-reference, and NULL
 values. The SQL tests cover
 heap, bitmap-index, table-AM, and FDW batches;
 native Arrow consumption; lazy `Datum` fallback; exact and pruning-only
 predicates; arithmetic filters and projections; parameters; NULL and error
 semantics; grouped and global aggregates; in-memory and spilled joins; rescans;
-early stop; disabled-source fallback; ABI rejection; and duplicate provider
+early stop; disabled-source fallback; ABI rejection; and duplicate source
 rejection.
 
 ## Source layout
@@ -352,13 +355,15 @@ rejection.
 - `include/pg_batch/bridge.h` defines bindings, requests, and the versioned
   registry ABI.
 - `include/pg_batch/source.h` defines the planner and executor contract for a
-  batch source; `node.h` defines the producer-side plan-node contract.
+  batch source; `node.h` defines the node-side plan-node contract.
+- `include/pg_batch/plan.h` provides named, checked plan data that remains
+  compatible with PostgreSQL's `copyObject()`.
 - `include/pg_batch/arrow.h` defines the optional Arrow interface.
 - `bridge/bridge.c` owns the registry and slot attachments.
 - `runtime/` builds `libpg_batch_runtime.a` and provides common selection,
   column access, native/Datum adapters, borrowed vector views, and the
-  reusable scalar-to-Datum batch buffer used by `PgBatchPack`. Its opaque
-  `PgBatchInput` also implements the common child-producer lifecycle.
+  reusable scalar-to-Datum builder used by `PgBatchPack`. Its opaque
+  `PgBatchInput` also implements the common child-node lifecycle.
 - `kernels/` builds `libpg_batch_kernels.a` and provides direct `int4`
   comparisons, scalar arithmetic, reductions, and hashing, with optional SIMD
   for dense comparisons.
@@ -370,7 +375,7 @@ rejection.
 - `nodes/slot.c` implements the custom slot and heap batch source.
 - `nodes/scan.c`, `filter.c`, `project.c`, `hash_join.c`, and `aggregate.c`
   implement the executor nodes.
-- `examples/compressed_tam/provider.c` classifies source predicates and
+- `examples/compressed_tam/source.c` classifies source predicates and
   manages scans.
 - `examples/compressed_tam/compressed.c` owns snapshots, native columns, group
   pruning, and source
@@ -425,7 +430,7 @@ over one or two heap and packed keys, including sparse, spill, and early-limit
 cases. It also covers a scalar `generate_series` input packed below the join.
 `run_pack.sql` compares two node libraries while `PgBatchPack` collects one or
 two `Datum` columns from a large scalar `generate_series` input.
-`run_input.sql` isolates the shared producer-input lifecycle with empty and
+`run_input.sql` isolates the shared node-input lifecycle with empty and
 dense filters, a late projection, and fused aggregates. It accepts the same
 `batch_library`, `variant`, and `repetitions` variables.
 `run_expr.sql` alternates ordinary and batch execution for arithmetic filters,

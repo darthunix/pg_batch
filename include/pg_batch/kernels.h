@@ -11,6 +11,8 @@
 
 #include "vector.h"
 
+typedef struct PgBatchColumnAccess PgBatchColumnAccess;
+
 typedef enum PgBatchInt4Op
 {
 	PG_BATCH_INT4_EQ,
@@ -55,9 +57,13 @@ typedef struct PgBatchInt4Reduction
 extern bool pg_batch_int4_compare_op(Oid funcid, uint8 var_argno,
 									 PgBatchInt4Op *result);
 
+/* Return an int4 view for rows prepared by access. */
+extern void pg_batch_column_get_int4(PgBatchColumnAccess *access, int column,
+	PgBatchInt4Vector *result);
+
 /* Remove rows that are NULL or do not satisfy column op scalar. */
 extern void pg_batch_filter_int4(const PgBatchInt4Vector *column,
-								 int nrows, int nwords, uint64 *selection,
+								 PgBatchSelection *selection,
 								 PgBatchInt4Op op, int32 scalar,
 								 bool enable_simd);
 
@@ -67,21 +73,20 @@ extern void pg_batch_filter_int4(const PgBatchInt4Vector *column,
  * bitmap: one means that the output value is present and non-NULL.
  */
 extern void pg_batch_int4_arithmetic_scalar(
-	const PgBatchInt4Vector *input, int nrows, int nwords,
-	const uint64 *selection, PgBatchInt4ArithmeticOp op, int32 scalar,
+	const PgBatchInt4Vector *input, const PgBatchSelection *selection,
+	PgBatchInt4ArithmeticOp op, int32 scalar,
 	bool scalar_on_left, int32 *output_values, uint8 *output_validity);
 
 /* Calculate the requested reductions without changing the row selection. */
 extern void pg_batch_reduce_int4(const PgBatchInt4Vector *column,
-								 int nrows, int nwords,
-								 const uint64 *selection, uint32 flags,
+								 const PgBatchSelection *selection,
+								 uint32 flags,
 								 PgBatchInt4Reduction *result);
 
 /* Hash selected rows and reject rows with a NULL in any key column. */
 extern void pg_batch_hash_int4(const PgBatchInt4Vector *const *keys,
-							   int nkeys, int nrows, int nwords,
-							   const uint64 *selection, uint32 *hashes,
-							   uint64 *valid_rows);
+							   int nkeys, const PgBatchSelection *selection,
+							   uint32 *hashes, PgBatchSelection *valid_rows);
 
 extern bool pg_batch_int4_simd_available(void);
 

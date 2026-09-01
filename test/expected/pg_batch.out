@@ -20,9 +20,9 @@ CREATE FUNCTION pg_batch_bridge_test_bad_abi()
 RETURNS void
 AS :'bridge_test', 'pg_batch_bridge_test_bad_abi'
 LANGUAGE C;
-CREATE FUNCTION pg_batch_bridge_test_duplicate_provider()
+CREATE FUNCTION pg_batch_bridge_test_duplicate_source()
 RETURNS void
-AS :'bridge_test', 'pg_batch_bridge_test_duplicate_provider'
+AS :'bridge_test', 'pg_batch_bridge_test_duplicate_source'
 LANGUAGE C;
 CREATE FUNCTION pg_batch_bridge_test_compatible_sizes()
 RETURNS boolean
@@ -36,13 +36,17 @@ CREATE FUNCTION pg_batch_expr_api_test()
 RETURNS boolean
 AS :'expr_test', 'pg_batch_expr_api_test'
 LANGUAGE C;
-CREATE FUNCTION pg_batch_datum_buffer_test()
+CREATE FUNCTION pg_batch_builder_test()
 RETURNS boolean
-AS :'runtime_test', 'pg_batch_datum_buffer_test'
+AS :'runtime_test', 'pg_batch_builder_test'
 LANGUAGE C;
 CREATE FUNCTION pg_batch_input_api_test()
 RETURNS boolean
 AS :'runtime_test', 'pg_batch_input_api_test'
+LANGUAGE C;
+CREATE FUNCTION pg_batch_plan_data_test()
+RETURNS boolean
+AS :'runtime_test', 'pg_batch_plan_data_test'
 LANGUAGE C;
 CREATE FUNCTION pg_batch_output_test()
 RETURNS boolean
@@ -77,10 +81,10 @@ RETURNS boolean
 AS :'spill_test', 'pg_batch_spill_test'
 LANGUAGE C;
 SELECT pg_batch_bridge_test_bad_abi();
-ERROR:  incompatible provider ABI
-DETAIL:  Expected version 1 and at least 64 bytes, got version 2 and 80 bytes.
-SELECT pg_batch_bridge_test_duplicate_provider();
-ERROR:  pg_batch provider "pg_batch_bridge_test_duplicate" is already registered
+ERROR:  incompatible source ABI
+DETAIL:  Expected version 1 and at least 72 bytes, got version 2 and 88 bytes.
+SELECT pg_batch_bridge_test_duplicate_source();
+ERROR:  pg_batch source "pg_batch_bridge_test_duplicate" is already registered
 SELECT pg_batch_bridge_test_compatible_sizes() AS compatible_abi_sizes_ok;
  compatible_abi_sizes_ok 
 -------------------------
@@ -99,14 +103,20 @@ SELECT pg_batch_expr_api_test() AS installed_expr_api_ok;
  t
 (1 row)
 
-SELECT pg_batch_datum_buffer_test() AS installed_datum_buffer_ok;
- installed_datum_buffer_ok 
----------------------------
+SELECT pg_batch_builder_test() AS installed_builder_ok;
+ installed_builder_ok 
+----------------------
  t
 (1 row)
 
 SELECT pg_batch_input_api_test() AS installed_input_api_ok;
  installed_input_api_ok 
+------------------------
+ t
+(1 row)
+
+SELECT pg_batch_plan_data_test() AS installed_plan_data_ok;
+ installed_plan_data_ok 
 ------------------------
  t
 (1 row)
@@ -1046,7 +1056,7 @@ WHERE c2 < 100;
          ->  Custom Scan (PgBatchScan) on pg_batch_arrow (actual rows=84.00 loops=1)
                Batch Size: 64
                Batch Source: pg_batch_compressed_tam
-               Batch Provider: pg_batch_compressed_tam
+               Batch Source: pg_batch_compressed_tam
                Batches: 3
                Source Rows: 130
                Filter Datums: 0
@@ -1081,7 +1091,7 @@ WHERE c2 < 100 AND (c1 + c3) % 5 = 0;
    ->  Custom Scan (PgBatchScan) on pg_batch_arrow (actual rows=84.00 loops=1)
          Batch Size: 64
          Batch Source: pg_batch_compressed_tam
-         Batch Provider: pg_batch_compressed_tam
+         Batch Source: pg_batch_compressed_tam
          Batches: 3
          Source Rows: 130
          Filter Datums: 0
@@ -1160,7 +1170,7 @@ SELECT count(*) FROM pg_batch_groups WHERE c1 >= 130 AND c1 <= 140;
          ->  Custom Scan (PgBatchScan) on pg_batch_groups (actual rows=11.00 loops=1)
                Batch Size: 64
                Batch Source: pg_batch_compressed_tam
-               Batch Provider: pg_batch_compressed_tam
+               Batch Source: pg_batch_compressed_tam
                Batches: 2
                Source Rows: 128
                Filter Datums: 0
@@ -1194,7 +1204,7 @@ SELECT count(*) FROM pg_batch_groups WHERE c2 = 3;
          ->  Custom Scan (PgBatchScan) on pg_batch_groups (actual rows=0.00 loops=1)
                Batch Size: 64
                Batch Source: pg_batch_compressed_tam
-               Batch Provider: pg_batch_compressed_tam
+               Batch Source: pg_batch_compressed_tam
                Batches: 0
                Source Rows: 0
                Filter Datums: 0
@@ -1256,7 +1266,7 @@ SELECT count(*), sum(c3) FROM pg_batch_tam WHERE c2 = 2 AND c1 > 100;
          ->  Custom Scan (PgBatchScan) on pg_batch_tam (actual rows=71.00 loops=1)
                Batch Size: 64
                Batch Source: pg_batch_compressed_tam
-               Batch Provider: pg_batch_compressed_tam
+               Batch Source: pg_batch_compressed_tam
                Batches: 5
                Source Rows: 320
                Filter Datums: 0
@@ -1410,7 +1420,7 @@ WHERE o.v > 10;
          ->  Custom Scan (PgBatchScan) on pg_batch_join_inner i
                Batch Size: 64
                Batch Source: pg_batch_compressed_tam
-               Batch Provider: pg_batch_compressed_tam
+               Batch Source: pg_batch_compressed_tam
 (12 rows)
 
 CREATE TEMP TABLE batch_join_rows AS
@@ -1514,7 +1524,7 @@ WHERE i.v > 0;
                ->  Custom Scan (PgBatchScan) on pg_batch_join_inner i
                      Batch Size: 64
                      Batch Source: pg_batch_compressed_tam
-                     Batch Provider: pg_batch_compressed_tam
+                     Batch Source: pg_batch_compressed_tam
 (12 rows)
 
 SELECT count(*) AS rows, sum(g.k) AS packed_total,
@@ -1671,7 +1681,7 @@ SELECT NOT EXISTS (
 (1 row)
 
 RESET work_mem;
--- A separately built pass-through node uses only the public bridge/runtime.
+-- A separately built unary node uses only the public bridge/runtime.
 LOAD 'pg_batch_limit';
 SET pg_batch.enable = on;
 SET pg_batch_limit.enable = on;

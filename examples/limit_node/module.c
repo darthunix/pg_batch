@@ -22,14 +22,14 @@ _PG_init(void)
 							 NULL, &pg_batch_limit_enable, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 	pg_batch_limit_planner_init();
-	pg_batch_limit_api->register_producer(&pg_batch_limit_producer_ops);
+	pg_batch_limit_api->register_node(&pg_batch_limit_node_ops);
 }
 
 void
 _PG_fini(void)
 {
 	if (pg_batch_limit_api != NULL)
-		pg_batch_limit_api->unregister_producer(
-			PG_BATCH_LIMIT_PRODUCER_NAME);
+		pg_batch_limit_api->unregister_node(
+			PG_BATCH_LIMIT_NODE_NAME);
 	pg_batch_limit_planner_fini();
 }

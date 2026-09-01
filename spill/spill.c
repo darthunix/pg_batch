@@ -188,18 +188,21 @@ pg_batch_spill_create(MemoryContext parent_context, TupleDesc tuple_desc,
 
 void
 pg_batch_spill_write(PgBatchSpillSet *set, int partition,
-					 const PgBatchInt4Vector *columns, int nrows,
-					 const uint64 *selection, const uint32 *hashes)
+					 const PgBatchInt4Vector *columns,
+					 const PgBatchSelection *selection,
+					 const uint32 *hashes)
 {
 	SpillWriter *writer;
 	uint64		rows;
 
 	validate_partition(set, partition);
 	if (set->finished || columns == NULL || selection == NULL || hashes == NULL ||
-		nrows < 0 || nrows > PG_BATCH_SPILL_BLOCK_ROWS)
+		selection->nrows < 0 || selection->nrows > PG_BATCH_SPILL_BLOCK_ROWS ||
+		selection->nwords != 1 || selection->words == NULL)
 		elog(ERROR, "invalid pg_batch spill write");
-	rows = selection[0] & (nrows == 64 ? UINT64_MAX :
-		(UINT64CONST(1) << nrows) - 1);
+	rows = selection->words[0] &
+		(selection->nrows == 64 ? UINT64_MAX :
+		 (UINT64CONST(1) << selection->nrows) - 1);
 	if (rows == 0)
 		return;
 	writer = get_writer(set, partition);

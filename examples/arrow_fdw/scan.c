@@ -83,7 +83,7 @@ struct PgBatchFdwScan
 
 static const PgBatchOps batch_ops;
 static void prepare_columns(PgBatch *bridge_batch,
-	const Bitmapset *columns, const uint64 *rows,
+	const Bitmapset *columns, const PgBatchSelection *rows,
 	PgBatchColumnPhase phase);
 
 static void
@@ -347,7 +347,7 @@ request_phase_for_attnum(PgBatchFdwScan *scan, AttrNumber attnum)
 	for (int column = 0; column < scan->ncolumns; column++)
 	{
 		if (scan->source_attnums[column] == attnum)
-			return bms_is_member(column, scan->request->filter_columns) ?
+			return bms_is_member(column, scan->request->spec.filter_columns) ?
 				PG_BATCH_COLUMN_FILTER :
 				PG_BATCH_COLUMN_PROJECT;
 	}
@@ -398,7 +398,7 @@ apply_source_quals(ActiveBatch *active)
 		SourceQual *qual = &scan->quals[q];
 
 		prepare_columns(&active->bridge_batch, qual->column_mask,
-						&active->selection, PG_BATCH_COLUMN_FILTER);
+			&active->bridge_batch.selection, PG_BATCH_COLUMN_FILTER);
 		pg_batch_expr_bind(qual->expr, &active->bridge_batch, scan->econtext,
 						   PG_BATCH_COLUMN_FILTER);
 		pg_batch_expr_apply_filter(qual->expr, true);
@@ -438,7 +438,7 @@ prepare_column(ActiveBatch *active, int column,
 	source = decode_column(scan, attnum, phase);
 	window = &active->columns[column];
 	*window = *source;
-	window->length = active->bridge_batch.nrows;
+	window->length = active->bridge_batch.selection.nrows;
 	window->offset = source->offset + active->start;
 	window->release = NULL;
 	window->private_data = NULL;
@@ -447,13 +447,13 @@ prepare_column(ActiveBatch *active, int column,
 
 static void
 prepare_columns(PgBatch *bridge_batch,
-				const Bitmapset *columns, const uint64 *rows,
+				const Bitmapset *columns, const PgBatchSelection *rows,
 				PgBatchColumnPhase phase)
 {
 	ActiveBatch *active = bridge_batch->private_data;
 	int			column = -1;
 
-	if (columns == NULL || rows[0] == 0)
+	if (columns == NULL || rows->words[0] == 0)
 		return;
 	while ((column = bms_next_member(columns, column)) >= 0)
 		prepare_column(active, column, phase);
@@ -514,7 +514,7 @@ get_native_interface(const PgBatchNativeType *type)
 
 static void
 get_datum_column(PgBatch *bridge_batch, int column,
-				 const uint64 *rows,
+				 const PgBatchSelection *rows,
 				 PgBatchColumnPhase phase,
 				 PgBatchDatumVector *result)
 {
@@ -532,12 +532,12 @@ get_datum_column(PgBatch *bridge_batch, int column,
 	if (datum->values == NULL)
 	{
 		datum->values = MemoryContextAlloc(scan->batch_context,
-										 sizeof(Datum) * bridge_batch->nrows);
+										 sizeof(Datum) * bridge_batch->selection.nrows);
 		datum->isnull = MemoryContextAlloc(scan->batch_context,
-										 sizeof(bool) * bridge_batch->nrows);
+										 sizeof(bool) * bridge_batch->selection.nrows);
 	}
 	values = array->buffers[1];
-	missing = rows[0] & ~datum->valid_rows;
+	missing = rows->words[0] & ~datum->valid_rows;
 	while (missing != 0)
 	{
 		int			row = pg_rightmost_one_pos64(missing);
@@ -556,8 +556,7 @@ get_datum_column(PgBatch *bridge_batch, int column,
 	}
 	result->values = datum->values;
 	result->isnull = datum->isnull;
-	result->valid_rows = &datum->valid_rows;
-	result->nwords = 1;
+	result->nrows = bridge_batch->selection.nrows;
 }
 
 static void
@@ -606,15 +605,20 @@ pg_batch_fdw_scan_begin(Relation relation, PlanState *parent,
 						int nsource_columns,
 						MemoryContext query_context)
 {
+	PgBatchPlanReader *plan_reader;
 	MemoryContext context;
 	MemoryContext oldcontext;
 	PgBatchFdwScan *scan;
-	List	   *specs = castNode(List, source_private);
+	List	   *specs;
 	char	   *filename;
 	int			qualno = 0;
 	int			natts = RelationGetNumberOfAttributes(relation);
 
 	pg_batch_fdw_validate_relation(relation);
+	plan_reader = pg_batch_plan_reader_create(castNode(List, source_private),
+		PG_BATCH_FDW_SOURCE_PLAN_KIND, PG_BATCH_FDW_SOURCE_PLAN_VERSION);
+	specs = pg_batch_plan_read_int_list(plan_reader, "filter_exprs");
+	pg_batch_plan_reader_finish(plan_reader);
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -678,8 +682,8 @@ pg_batch_fdw_scan_next(PgBatchFdwScan *scan)
 		active = MemoryContextAllocZero(scan->batch_context, sizeof(*active));
 		active->scan = scan;
 		active->start = scan->record_offset;
-		nrows = Min(scan->request->max_rows > 0 ?
-					Min(scan->request->max_rows, PG_BATCH_FDW_BATCH_SIZE) :
+		nrows = Min(scan->request->spec.max_rows > 0 ?
+					Min(scan->request->spec.max_rows, PG_BATCH_FDW_BATCH_SIZE) :
 					PG_BATCH_FDW_BATCH_SIZE,
 					scan->record_length - scan->record_offset);
 		if (ncolumns > 0)
@@ -694,9 +698,9 @@ pg_batch_fdw_scan_next(PgBatchFdwScan *scan)
 		active->selection = UINT64_MAX >> (64 - nrows);
 		active->bridge_batch.abi_version = PG_BATCH_ABI_VERSION;
 		active->bridge_batch.struct_size = sizeof(PgBatch);
-		active->bridge_batch.nrows = nrows;
-		active->bridge_batch.nwords = 1;
-		active->bridge_batch.selection = &active->selection;
+		active->bridge_batch.selection.nrows = nrows;
+		active->bridge_batch.selection.nwords = 1;
+		active->bridge_batch.selection.words = &active->selection;
 		active->bridge_batch.table_oid = RelationGetRelid(scan->relation);
 		active->bridge_batch.ops = &batch_ops;
 		active->bridge_batch.private_data = active;
@@ -816,7 +820,7 @@ pg_batch_fdw_iterate_foreign_scan(ForeignScanState *node)
 			scan->scalar_row = -1;
 		}
 		batch = &scan->active->bridge_batch;
-		row = pg_batch_next_selected(batch, scan->scalar_row);
+		row = pg_batch_selection_next(&batch->selection, scan->scalar_row);
 		if (row < 0)
 		{
 			release_batch(batch);
@@ -828,8 +832,11 @@ pg_batch_fdw_iterate_foreign_scan(ForeignScanState *node)
 		{
 			PgBatchDatumVector datum;
 			uint64		rows = UINT64CONST(1) << row;
+			PgBatchSelection selected = {
+				batch->selection.nrows, 1, &rows
+			};
 
-			pg_batch_get_datum_column(batch, column, &rows,
+			pg_batch_get_datum_column(batch, column, &selected,
 				PG_BATCH_COLUMN_PROJECT, &datum);
 			slot->tts_values[column] = datum.values[row];
 			slot->tts_isnull[column] = datum.isnull[row];

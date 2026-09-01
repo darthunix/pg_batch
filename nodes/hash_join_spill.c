@@ -78,10 +78,41 @@ bloom_may_contain(const BatchHashJoinState *state, uint32 hash)
 
 static void
 spill_prepare_columns(PgBatch *batch, const Bitmapset *columns,
-					  const uint64 *rows,
+					  const PgBatchSelection *rows,
 					  PgBatchColumnPhase phase)
 {
 	/* Spill blocks are already stored as dense native int32 columns. */
+}
+
+static void
+spill_get_datum_column(PgBatch *batch, int column,
+					   const PgBatchSelection *rows,
+					   PgBatchColumnPhase phase,
+					   PgBatchDatumVector *result)
+{
+	SpillBlock *block = batch->private_data;
+	uint64		missing;
+
+	pg_batch_check_datum_vector(result);
+	if (column < 0 || column >= block->ncolumns)
+		elog(ERROR, "pg_batch spill column is out of range");
+	missing = rows->words[0] & ~block->datum_rows[column];
+	while (missing != 0)
+	{
+		int			row = pg_rightmost_one_pos64(missing);
+		uint64		bit = UINT64CONST(1) << row;
+		bool		valid = pg_batch_arrow_row_is_valid(
+			&block->arrays[column], row);
+
+		block->datum_nulls[column * block->capacity + row] = !valid;
+		block->datum_values[column * block->capacity + row] = valid ?
+			Int32GetDatum(block->values[column * block->capacity + row]) : 0;
+		block->datum_rows[column] |= bit;
+		missing &= ~bit;
+	}
+	result->values = &block->datum_values[column * block->capacity];
+	result->isnull = &block->datum_nulls[column * block->capacity];
+	result->nrows = batch->selection.nrows;
 }
 
 static void
@@ -102,9 +133,32 @@ static const PgBatchArrowInterface spill_arrow_interface = {
 	.get_column = spill_get_arrow_column,
 };
 
+static bool
+spill_get_int4_column(PgBatch *batch, int column,
+					  PgBatchInt4Vector *result)
+{
+	SpillBlock *block = batch->private_data;
+
+	if (column < 0 || column >= block->ncolumns)
+		elog(ERROR, "pg_batch spill column is out of range");
+	pg_batch_int4_vector_init_packed(result,
+		&block->values[column * block->capacity],
+		block->arrays[column].buffers[0], 0);
+	return true;
+}
+
+static const PgBatchInt4VectorInterface spill_int4_interface = {
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_INT4_VECTOR_INTERFACE_VERSION,
+		PgBatchInt4VectorInterface),
+	.get_column = spill_get_int4_column,
+};
+
 static const PgBatchNativeInterface *
 spill_get_native_interface(const PgBatchNativeType *type)
 {
+	if (type->abi_version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
+		strcmp(type->name, PG_BATCH_INT4_VECTOR_INTERFACE_NAME) == 0)
+		return (const PgBatchNativeInterface *) &spill_int4_interface;
 	if (type->abi_version == PG_BATCH_ARROW_INTERFACE_VERSION &&
 		strcmp(type->name, PG_BATCH_ARROW_INTERFACE_NAME) == 0)
 		return (const PgBatchNativeInterface *) &spill_arrow_interface;
@@ -114,7 +168,7 @@ spill_get_native_interface(const PgBatchNativeType *type)
 static const PgBatchOps spill_batch_ops = {
 	PG_BATCH_ABI_INITIALIZER(PG_BATCH_OPS_ABI_VERSION, PgBatchOps),
 	.prepare_columns = spill_prepare_columns,
-	.get_datum_column = NULL,
+	.get_datum_column = spill_get_datum_column,
 	.get_native_interface = spill_get_native_interface,
 	.release = NULL,
 };
@@ -139,6 +193,12 @@ init_spill_block(SpillBlock *block, int ncolumns, int capacity,
 	}
 	block->buffers = MemoryContextAlloc(context,
 										sizeof(void *) * ncolumns * 2);
+	block->datum_values = MemoryContextAlloc(context,
+		sizeof(Datum) * ncolumns * capacity);
+	block->datum_nulls = MemoryContextAlloc(context,
+		sizeof(bool) * ncolumns * capacity);
+	block->datum_rows = MemoryContextAllocZero(context,
+		sizeof(uint64) * ncolumns);
 	block->arrays = MemoryContextAllocZero(context,
 										   sizeof(struct ArrowArray) * ncolumns);
 	block->schemas = MemoryContextAllocZero(context,
@@ -159,8 +219,8 @@ init_spill_block(SpillBlock *block, int ncolumns, int capacity,
 	}
 	block->batch.abi_version = PG_BATCH_ABI_VERSION;
 	block->batch.struct_size = sizeof(PgBatch);
-	block->batch.nwords = 1;
-	block->batch.selection = &block->selection;
+	block->batch.selection.nwords = 1;
+	block->batch.selection.words = &block->selection;
 	block->batch.table_oid = InvalidOid;
 	block->batch.ops = &spill_batch_ops;
 	block->batch.private_data = block;
@@ -201,7 +261,8 @@ read_spill_block(BatchHashJoinState *state, HashSpillFile *file,
 				row_mask);
 	}
 	block->selection = row_mask;
-	block->batch.nrows = block->nrows;
+	block->batch.selection.nrows = block->nrows;
+	MemSet(block->datum_rows, 0, sizeof(uint64) * block->ncolumns);
 	return true;
 }
 
@@ -234,13 +295,14 @@ write_partition_rows(BatchHashJoinState *state, HashSpillFile **files,
 {
 	PgBatchSpillSet *set = spill_set_for_files(state, files);
 	uint64		selection = 0;
+	PgBatchSelection selected = {PG_BATCH_SIZE, 1, &selection};
 
 	for (int column = 0; column < ncolumns; column++)
 		state->spill_input_vectors[column] = columns[column].vector;
 	for (int i = 0; i < nrows; i++)
 		selection |= UINT64CONST(1) << rows[i];
 	pg_batch_spill_write(set, partition, state->spill_input_vectors,
-		PG_BATCH_SIZE, &selection, hashes);
+		&selected, hashes);
 	spill_file(set, &files[partition], partition);
 }
 
@@ -281,12 +343,12 @@ hash_join_spill_input_batch(BatchHashJoinState *state, PgBatch *batch,
 	uint64		routed_rows = hash_rows;
 	uint64		accepted = pg_popcount64(hash_rows);
 
-	Assert(batch->nrows <= PG_BATCH_SIZE);
-	Assert(batch->nwords == 1);
+	Assert(batch->selection.nrows <= PG_BATCH_SIZE);
+	Assert(batch->selection.nwords == 1);
 	next_rows = MemoryContextAlloc(state->join_context,
-								   sizeof(int) * batch->nrows);
+								   sizeof(int) * batch->selection.nrows);
 	used_partitions = MemoryContextAlloc(state->join_context,
-									 sizeof(int) * batch->nrows);
+									 sizeof(int) * batch->selection.nrows);
 	if (resident_rows != NULL)
 		*resident_rows = 0;
 	/* Apply routing filters to the rows already hashed by the caller. */
@@ -316,13 +378,16 @@ hash_join_spill_input_batch(BatchHashJoinState *state, PgBatch *batch,
 	if (files == state->probe_files)
 	{
 		uint64		survivors = routed_rows;
+		PgBatchSelection selected = {
+			batch->selection.nrows, 1, &survivors
+		};
 
 		/* Do not materialize probe payload rejected by the complete key filter. */
 		for (int column = 0; column < ncolumns && survivors != 0; column++)
 		{
 			if (!columns[column].prepared)
 				hash_join_load_input_column(batch, batch_columns[column],
-					&survivors, PG_BATCH_PROJECT_PHASE, &columns[column],
+					&selected, PG_BATCH_PROJECT_PHASE, &columns[column],
 					state->join_context);
 		}
 	}
@@ -997,7 +1062,8 @@ hash_join_publish_resident_probe(BatchHashJoinState *state, bool final_batch)
 		array->null_count = -1;
 	}
 	block->selection = pg_batch_nrows_mask(nrows);
-	block->batch.nrows = nrows;
+	block->batch.selection.nrows = nrows;
+	MemSet(block->datum_rows, 0, sizeof(uint64) * block->ncolumns);
 	state->probe_batch = &block->batch;
 	state->probe_from_spill = true;
 	state->probe_from_resident = true;
@@ -1010,7 +1076,7 @@ void
 hash_join_finish_resident_probe(BatchHashJoinState *state)
 {
 	SpillBlock *block = &state->resident_probe_block;
-	int			consumed = block->batch.nrows;
+	int			consumed = block->batch.selection.nrows;
 	int			remaining = block->nrows - consumed;
 	int			stride = (block->capacity + 7) / 8;
 

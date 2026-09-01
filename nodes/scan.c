@@ -19,7 +19,7 @@ typedef struct BatchQualState
 {
 	PgBatchExpr *expr;
 	int			column;
-	Bitmapset  *provider_column;
+	Bitmapset  *source_column;
 	Bitmapset  *heap_columns;
 	Bitmapset  *exact_heap_columns;
 	bool		recheck_only;
@@ -42,8 +42,8 @@ typedef struct BatchScanState
 	bool		first_batch_on_page;
 	bool		bitmap_initialized;
 	const		PgBatchRequest *request;
-	const		PgBatchProviderOps *provider;
-	void	   *provider_state;
+	const		PgBatchSourceOps *source;
+	void	   *source_state;
 	bool		done;
 	uint64		batches;
 	uint64		source_rows;
@@ -95,22 +95,31 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 	BatchScanState *state = (BatchScanState *) node;
 	CustomScan *cscan = castNode(CustomScan, node->ss.ps.plan);
 	PgBatchSlot *bslot = pg_batch_slot_cast(node->ss.ss_ScanTupleSlot);
-	List	   *attnums = (List *) linitial(cscan->custom_private);
-	int			nfilter = intVal(lsecond(cscan->custom_private));
-	PgBatchHeapScanMode heap_scan_mode = intVal(lthird(cscan->custom_private));
-	const char *provider_name = strVal(list_nth(cscan->custom_private, 3));
-	Node	   *source_private = list_nth(cscan->custom_private, 4);
-	int			nsource_exprs = intVal(list_nth(cscan->custom_private, 5));
-	List	   *batch_recheck_flags =
-		(List *) list_nth(cscan->custom_private, 6);
-	List	   *exact_filter_items =
-		(List *) list_nth(cscan->custom_private, 7);
-	List	   *source_exprs = list_copy_head(cscan->custom_exprs,
-											  nsource_exprs);
-	List	   *local_quals = list_copy_tail(cscan->custom_exprs,
-											 nsource_exprs);
+	PgBatchScanPlanData data;
+	List	   *attnums;
+	int			nfilter;
+	PgBatchHeapScanMode heap_scan_mode;
+	const char *source_name;
+	Node	   *source_private;
+	int			nsource_exprs;
+	List	   *batch_recheck_flags;
+	List	   *exact_filter_items;
+	List	   *source_exprs;
+	List	   *local_quals;
 	PgBatchBinding *binding;
 	int			i = 0;
+
+	pg_batch_read_scan_plan(cscan, &data);
+	attnums = data.source_attnums;
+	nfilter = data.nfilter_columns;
+	heap_scan_mode = data.heap_scan_mode;
+	source_name = data.source_name;
+	source_private = data.source_private;
+	nsource_exprs = data.nsource_exprs;
+	batch_recheck_flags = data.batch_recheck_flags;
+	exact_filter_items = data.exact_filter_columns;
+	source_exprs = list_copy_head(cscan->custom_exprs, nsource_exprs);
+	local_quals = list_copy_tail(cscan->custom_exprs, nsource_exprs);
 
 	if (eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK))
 		ereport(ERROR,
@@ -122,22 +131,22 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 	binding = bslot->binding;
 	state->request = pg_batch_api->get_request(binding);
 	state->heap_scan_mode = heap_scan_mode;
-	if (provider_name[0] != '\0')
+	if (source_name[0] != '\0')
 	{
 		PgBatchSourceExecRequest request =
 			PG_BATCH_STRUCT_INITIALIZER(PgBatchSourceExecRequest);
 
-		state->provider = pg_batch_api->get_provider(provider_name);
-		if (state->provider == NULL)
+		state->source = pg_batch_api->get_source(source_name);
+		if (state->source == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("pg_batch provider \"%s\" is not loaded",
-							provider_name)));
-		if (!state->provider->supports_relation(node->ss.ss_currentRelation))
+					 errmsg("pg_batch source \"%s\" is not loaded",
+							source_name)));
+		if (!state->source->supports_relation(node->ss.ss_currentRelation))
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("pg_batch provider \"%s\" no longer supports relation \"%s\"",
-							provider_name,
+					 errmsg("pg_batch source \"%s\" no longer supports relation \"%s\"",
+							source_name,
 							RelationGetRelationName(node->ss.ss_currentRelation))));
 		request.relation = node->ss.ss_currentRelation;
 		request.parent = &node->ss.ps;
@@ -147,9 +156,9 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 		request.slot_request = state->request;
 		request.source_attnums = bslot->source_attnums;
 		request.nsource_columns = bslot->ncolumns;
-		state->provider_state = state->provider->begin_scan(&request);
-		pg_batch_api->set_provider(binding, provider_name,
-									  state->provider_state);
+		state->source_state = state->source->begin_scan(&request);
+		pg_batch_api->set_source(binding, source_name,
+									  state->source_state);
 	}
 	if (heap_scan_mode == PG_BATCH_HEAP_BITMAP)
 	{
@@ -164,12 +173,11 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 		state->scan = table_beginscan_bm(node->ss.ss_currentRelation,
 										 estate->es_snapshot, 0, NULL, flags);
 	}
-	else if (state->provider == NULL ||
-			 !PG_BATCH_ABI_HAS_FIELD(state->provider, PgBatchProviderOps,
-				next_batch) || state->provider->next_batch == NULL)
+	else if (state->source == NULL ||
+			 state->source->delivery == PG_BATCH_SOURCE_SLOT)
 		state->scan = table_beginscan(node->ss.ss_currentRelation,
 									  estate->es_snapshot, 0, NULL, 0);
-	if (state->provider == NULL)
+	if (state->source == NULL)
 	{
 		state->heap_slot = ExecInitExtraTupleSlot(estate,
 												  RelationGetDescr(node->ss.ss_currentRelation),
@@ -189,7 +197,7 @@ scan_begin(CustomScanState *node, EState *estate, int eflags)
 		qual->expr = pg_batch_expr_compile_filter(qual_expr, &node->ss.ps,
 											 resolve_scan_var, NULL);
 		qual->column = pg_batch_expr_input_column(qual->expr);
-		qual->provider_column = bms_make_singleton(qual->column);
+		qual->source_column = bms_make_singleton(qual->column);
 		qual->recheck_only = recheck_only;
 	}
 	foreach_int(column, exact_filter_items)
@@ -286,15 +294,14 @@ next_batch(BatchScanState *state, PgBatchSlot *bslot)
 {
 	HeapScanDesc hscan;
 
-	if (state->provider != NULL)
+	if (state->source != NULL)
 	{
 		bool		found;
 
-		if (PG_BATCH_ABI_HAS_FIELD(state->provider, PgBatchProviderOps,
-				next_batch) && state->provider->next_batch != NULL)
+		if (state->source->delivery == PG_BATCH_SOURCE_PULL)
 		{
 			PgBatch *batch =
-				state->provider->next_batch(state->provider_state);
+				state->source->next_batch(state->source_state);
 
 			found = batch != NULL;
 			if (found)
@@ -311,7 +318,8 @@ next_batch(BatchScanState *state, PgBatchSlot *bslot)
 			return false;
 		}
 		state->batches++;
-		state->source_rows += pg_batch_get_batch(&bslot->base)->nrows;
+		state->source_rows +=
+			pg_batch_get_batch(&bslot->base)->selection.nrows;
 		return true;
 	}
 
@@ -340,8 +348,8 @@ next_batch(BatchScanState *state, PgBatchSlot *bslot)
 				continue;
 		}
 
-		nrows = Min(state->request->max_rows > 0 ?
-					Min(state->request->max_rows, PG_BATCH_SIZE) :
+		nrows = Min(state->request->spec.max_rows > 0 ?
+					Min(state->request->spec.max_rows, PG_BATCH_SIZE) :
 					PG_BATCH_SIZE,
 					(int) hscan->rs_ntuples - state->next_page_row);
 		/* The core callback counted the first row of the first batch. */
@@ -382,14 +390,14 @@ filter_batch(BatchScanState *state, PgBatchSlot *bslot)
 			state->exact_rechecks_skipped += pg_batch_row_count(batch);
 			continue;
 		}
-		if (state->provider != NULL)
-			columns = qual->provider_column;
+		if (state->source != NULL)
+			columns = qual->source_column;
 		else if (state->heap_scan_mode == PG_BATCH_HEAP_BITMAP &&
 				 !state->page_recheck)
 			columns = qual->exact_heap_columns;
 		else
 			columns = qual->heap_columns;
-		pg_batch_prepare_columns(batch, columns, batch->selection,
+		pg_batch_prepare_columns(batch, columns, &batch->selection,
 								 PG_BATCH_FILTER_PHASE);
 		pg_batch_expr_bind(qual->expr, batch, econtext,
 						   PG_BATCH_FILTER_PHASE);
@@ -421,7 +429,7 @@ scan_exec(CustomScanState *node)
 	batch = bslot->active_batch;
 	if (batch != NULL)
 	{
-		if (!pg_batch_api->batch_finished(bslot->binding))
+		if (!pg_batch_api->finished(bslot->binding))
 			elog(ERROR, "pg_batch consumer requested a new batch too early");
 		ExecClearTuple(&bslot->base);
 	}
@@ -434,12 +442,12 @@ scan_exec(CustomScanState *node)
 		batch = pg_batch_get_batch(&bslot->base);
 		if (rows == 0)
 		{
-			pg_batch_finish_batch(&bslot->base);
+			pg_batch_slot_finish(&bslot->base);
 			ExecClearTuple(&bslot->base);
 			continue;
 		}
 		pg_batch_select_row(&bslot->base,
-							pg_batch_next_selected(batch, -1));
+							pg_batch_selection_next(&batch->selection, -1));
 		if (node->ss.ps.instrument != NULL)
 			node->ss.ps.instrument->tuplecount += rows - 1;
 		return &bslot->base;
@@ -468,9 +476,9 @@ scan_end(CustomScanState *node)
 	bitmap_end(state);
 	if (state->scan != NULL)
 		table_endscan(state->scan);
-	if (state->provider != NULL && state->provider_state != NULL)
-		state->provider->end_scan(state->provider_state);
-	state->provider_state = NULL;
+	if (state->source != NULL && state->source_state != NULL)
+		state->source->end_scan(state->source_state);
+	state->source_state = NULL;
 	pg_batch_end_children(node);
 }
 
@@ -483,8 +491,8 @@ scan_rescan(CustomScanState *node)
 	bitmap_end(state);
 	if (state->scan != NULL)
 		table_rescan(state->scan, NULL);
-	if (state->provider != NULL && state->provider_state != NULL)
-		state->provider->rescan(state->provider_state);
+	if (state->source != NULL && state->source_state != NULL)
+		state->source->rescan(state->source_state);
 	if (state->bitmap_plan != NULL && state->bitmap_plan->chgParam == NULL)
 		ExecReScan(state->bitmap_plan);
 	state->page_active = false;
@@ -503,11 +511,11 @@ scan_explain(CustomScanState *node, List *ancestors,
 
 	ExplainPropertyInteger("Batch Size", NULL, PG_BATCH_SIZE, es);
 	ExplainPropertyText("Batch Source",
-						state->provider != NULL ? state->provider->provider_name :
+						state->source != NULL ? state->source->source_name :
 						state->heap_scan_mode == PG_BATCH_HEAP_BITMAP ?
 						"Heap Bitmap" : "Heap", es);
-	if (state->provider != NULL)
-		ExplainPropertyText("Batch Provider", state->provider->provider_name, es);
+	if (state->source != NULL)
+		ExplainPropertyText("Batch Source", state->source->source_name, es);
 	if (es->analyze)
 	{
 		ExplainPropertyInteger("Batches", NULL, state->batches, es);
@@ -526,9 +534,9 @@ scan_explain(CustomScanState *node, List *ancestors,
 			ExplainPropertyInteger("Exact Rechecks Skipped", NULL,
 								   state->exact_rechecks_skipped, es);
 		}
-		if (state->provider != NULL &&
-			PG_BATCH_ABI_HAS_FIELD(state->provider, PgBatchProviderOps,
-				explain) && state->provider->explain != NULL)
-			state->provider->explain(state->provider_state, es);
+		if (state->source != NULL &&
+			PG_BATCH_ABI_HAS_FIELD(state->source, PgBatchSourceOps,
+				explain) && state->source->explain != NULL)
+			state->source->explain(state->source_state, es);
 	}
 }

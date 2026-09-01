@@ -79,8 +79,8 @@ request_side_columns(PgBatchBinding *binding,
 {
 	const PgBatchRequest *request =
 		pg_batch_api->get_request(binding);
-	Bitmapset  *filters = bms_copy(request->filter_columns);
-	Bitmapset  *survivors = bms_copy(request->project_columns);
+	Bitmapset  *filters = bms_copy(request->spec.filter_columns);
+	Bitmapset  *survivors = bms_copy(request->spec.project_columns);
 	bool	   *key_columns = palloc0_array(bool, ncolumns);
 
 	for (int key = 0; key < nkeys; key++)
@@ -93,37 +93,45 @@ request_side_columns(PgBatchBinding *binding,
 		if (!key_columns[column])
 			survivors = bms_add_member(survivors, columns[column]);
 	}
-	pg_batch_api->set_request(binding, filters, survivors, true,
-		PG_BATCH_SIZE);
+	pg_batch_api->set_request(binding,
+		&(PgBatchRequestSpec) {
+			.struct_size = sizeof(PgBatchRequestSpec),
+			.filter_columns = filters,
+			.project_columns = survivors,
+			.output_mode = PG_BATCH_OUTPUT_BATCH,
+			.max_rows = PG_BATCH_SIZE
+		});
 	bms_free(filters);
 	bms_free(survivors);
 	pfree(key_columns);
 }
 
 static void
-bind_input_column(PgBatch *batch, int column, const uint64 *rows,
-				  PgBatchMaterializePhase phase, InputColumn *result)
+bind_input_column(PgBatchColumnAccess *access, int column,
+				  InputColumn *result)
 {
-	pg_batch_get_int4_vector(batch, column, rows, phase, &result->vector);
+	pg_batch_column_get_int4(access, column, &result->vector);
 	result->prepared = true;
+	result->available_rows |= access->rows->words[0];
 }
 
 void
 hash_join_load_input_column(PgBatch *batch, int column,
-				  const uint64 *rows, PgBatchMaterializePhase phase,
+				  const PgBatchSelection *rows, PgBatchMaterializePhase phase,
 				  InputColumn *result, MemoryContext scratch_context)
 {
 	Bitmapset  *columns;
+	PgBatchColumnAccess access;
 	MemoryContext oldcontext;
 
 	oldcontext = MemoryContextSwitchTo(scratch_context);
 	columns = bms_make_singleton(column);
 	MemoryContextSwitchTo(oldcontext);
-	pg_batch_prepare_columns(batch, columns, rows, phase);
+	pg_batch_column_access_init(&access, batch, columns, rows, phase);
+	bind_input_column(&access, column, result);
 	oldcontext = MemoryContextSwitchTo(scratch_context);
 	bms_free(columns);
 	MemoryContextSwitchTo(oldcontext);
-	bind_input_column(batch, column, rows, phase, result);
 }
 
 static void
@@ -134,24 +142,28 @@ ensure_input_row(PgBatch *batch, int column, int row,
 	uint64		row_word = UINT64CONST(1) << (row % 64);
 	uint64	   *rows;
 	uint64	   *allocated = NULL;
+	PgBatchSelection selected;
 
 	if (input->prepared)
 	{
 		if (input->vector.layout == PG_BATCH_INT4_PACKED)
 			return;
-		if (pg_batch_int4_row_available(&input->vector, row))
+		if ((input->available_rows & row_word) != 0)
 			return;
 	}
-	if (batch->nwords == 1)
+	if (batch->selection.nwords == 1)
 		rows = &row_word;
 	else
 	{
 		allocated = MemoryContextAllocZero(scratch_context,
-										  sizeof(uint64) * batch->nwords);
+										  sizeof(uint64) * batch->selection.nwords);
 		allocated[row / 64] = row_word;
 		rows = allocated;
 	}
-	hash_join_load_input_column(batch, column, rows, phase, input,
+	selected.nrows = batch->selection.nrows;
+	selected.nwords = batch->selection.nwords;
+	selected.words = rows;
+	hash_join_load_input_column(batch, column, &selected, phase, input,
 								scratch_context);
 	if (allocated != NULL)
 		pfree(allocated);
@@ -162,17 +174,18 @@ hash_input_batch(BatchHashJoinState *state, PgBatch *batch,
 				 InputColumn *columns, const int *keys, uint32 *hashes)
 {
 	uint64		hash_rows;
+	PgBatchSelection valid_rows = batch->selection;
 
-	Assert(batch->nrows <= PG_BATCH_SIZE);
-	Assert(batch->nwords == 1);
+	Assert(batch->selection.nrows <= PG_BATCH_SIZE);
+	Assert(batch->selection.nwords == 1);
 	for (int key = 0; key < state->nkeys; key++)
 	{
 		Assert(columns[keys[key]].prepared);
 		state->hash_keys[key] = &columns[keys[key]].vector;
 	}
+	valid_rows.words = &hash_rows;
 	pg_batch_hash_int4(state->hash_keys, state->nkeys,
-					   batch->nrows, batch->nwords, batch->selection,
-					   hashes, &hash_rows);
+		&batch->selection, hashes, &valid_rows);
 	return hash_rows;
 }
 
@@ -418,7 +431,7 @@ build_hash_table(BatchHashJoinState *state)
 							 estimated_rows);
 	for (;;)
 	{
-		PgBatchInputBatch input;
+		PgBatchInputResult input;
 		PgBatch *batch;
 		InputColumn *columns;
 		uint32		hashes[PG_BATCH_SIZE];
@@ -434,7 +447,7 @@ build_hash_table(BatchHashJoinState *state)
 		for (int column = 0; column < state->ninner_columns; column++)
 			hash_join_load_input_column(batch,
 									state->inner_batch_columns[column],
-							  batch->selection, PG_BATCH_PROJECT_PHASE,
+							  &batch->selection, PG_BATCH_PROJECT_PHASE,
 								  &columns[column], state->join_context);
 		hash_rows = hash_input_batch(state, batch, columns,
 								 state->inner_keys, hashes);
@@ -509,19 +522,17 @@ hash_join_prepare_probe_keys(BatchHashJoinState *state)
 	Bitmapset  *columns = state->probe_from_spill ?
 		state->spill_outer_key_columns :
 		state->outer_key_columns;
+	PgBatchColumnAccess access;
 
-	pg_batch_prepare_columns(state->probe_batch, columns,
-							 state->probe_batch->selection,
-							 PG_BATCH_FILTER_PHASE);
+	pg_batch_column_access_init(&access, state->probe_batch, columns,
+		&state->probe_batch->selection, PG_BATCH_FILTER_PHASE);
 	for (int key = 0; key < state->nkeys; key++)
 	{
 		int			raw_column = state->outer_keys[key];
 		int			batch_column = state->probe_from_spill ? raw_column :
 			state->outer_batch_columns[raw_column];
 
-		bind_input_column(state->probe_batch, batch_column,
-						  state->probe_batch->selection,
-						  PG_BATCH_FILTER_PHASE,
+		bind_input_column(&access, batch_column,
 						  &state->probe_columns[raw_column]);
 	}
 }
@@ -537,7 +548,7 @@ fetch_probe_batch(BatchHashJoinState *state)
 			return hash_join_fetch_spilled_probe_batch(state);
 		while (!state->probe_input_done)
 		{
-			PgBatchInputBatch input;
+			PgBatchInputResult input;
 			PgBatch *batch;
 			uint32		hashes[PG_BATCH_SIZE];
 			uint64		hash_rows;
@@ -560,7 +571,7 @@ fetch_probe_batch(BatchHashJoinState *state)
 				int			column = state->outer_keys[key];
 
 				hash_join_load_input_column(batch,
-					state->outer_batch_columns[column], batch->selection,
+					state->outer_batch_columns[column], &batch->selection,
 					PG_BATCH_FILTER_PHASE, &state->probe_columns[column],
 					state->join_context);
 			}
@@ -581,7 +592,7 @@ fetch_probe_batch(BatchHashJoinState *state)
 	}
 	for (;;)
 	{
-		PgBatchInputBatch input;
+		PgBatchInputResult input;
 
 		if (!pg_batch_input_next(state->outer_input, &input))
 			return false;
@@ -667,7 +678,7 @@ load_probe_window(BatchHashJoinState *state)
 	int			row = state->next_probe_row;
 
 	while (count < PG_BATCH_SIZE &&
-		   (row = pg_batch_next_selected(state->probe_batch, row)) >= 0)
+		   (row = pg_batch_selection_next(&state->probe_batch->selection, row)) >= 0)
 	{
 		uint32		hash;
 
@@ -686,8 +697,8 @@ load_probe_window(BatchHashJoinState *state)
 static inline int
 output_capacity(BatchHashJoinState *state)
 {
-	return state->output_request->max_rows > 0 ?
-		Min(state->output_request->max_rows, PG_BATCH_SIZE) : PG_BATCH_SIZE;
+	return state->output_request->spec.max_rows > 0 ?
+		Min(state->output_request->spec.max_rows, PG_BATCH_SIZE) : PG_BATCH_SIZE;
 }
 
 /* Avoid a second pass over each probe window when every build key is unique. */
@@ -697,7 +708,7 @@ probe_unique_rows(BatchHashJoinState *state)
 	int			row = state->next_probe_row;
 
 	while (state->output_count < output_capacity(state) &&
-		   (row = pg_batch_next_selected(state->probe_batch, row)) >= 0)
+		   (row = pg_batch_selection_next(&state->probe_batch->selection, row)) >= 0)
 	{
 		uint32		hash;
 		uint32		link;
@@ -878,14 +889,19 @@ static void
 prepare_qual_columns(BatchHashJoinState *state, int first, int end)
 {
 	uint64		probe_rows = 0;
+	PgBatchSelection selected;
+	PgBatchColumnAccess access;
 	int			raw_column = -1;
 
 	if (state->qual_probe_columns == NULL)
 		return;
 	for (int row = first; row < end; row++)
 		probe_rows |= UINT64CONST(1) << state->output_probe_rows[row];
-	pg_batch_prepare_columns(state->probe_batch, state->qual_probe_columns,
-							 &probe_rows, PG_BATCH_PROJECT_PHASE);
+	selected.nrows = state->probe_batch->selection.nrows;
+	selected.nwords = 1;
+	selected.words = &probe_rows;
+	pg_batch_column_access_init(&access, state->probe_batch,
+		state->qual_probe_columns, &selected, PG_BATCH_PROJECT_PHASE);
 	while ((raw_column = bms_next_member(state->qual_raw_columns,
 										   raw_column)) >= 0 &&
 		   raw_column < state->nouter_columns)
@@ -893,8 +909,7 @@ prepare_qual_columns(BatchHashJoinState *state, int first, int end)
 		int			batch_column = state->probe_from_spill ? raw_column :
 			state->outer_batch_columns[raw_column];
 
-		bind_input_column(state->probe_batch, batch_column, &probe_rows,
-						  PG_BATCH_PROJECT_PHASE,
+		bind_input_column(&access, batch_column,
 						  &state->probe_columns[raw_column]);
 	}
 }
@@ -1105,7 +1120,8 @@ prepare_direct_output_column(BatchHashJoinState *state, OutputColumn *output,
 			InputColumn *input = &state->probe_columns[raw_column];
 
 			if (!input->prepared ||
-				!pg_batch_int4_row_available(&input->vector, probe_row))
+				(input->available_rows &
+				 (UINT64CONST(1) << probe_row)) == 0)
 				ensure_probe_raw_column(state, raw_column, probe_row);
 			value = hash_join_input_value(input, probe_row, &isnull);
 		}
@@ -1131,12 +1147,13 @@ prepare_direct_output_column(BatchHashJoinState *state, OutputColumn *output,
 
 static void
 prepare_output_columns(PgBatch *batch,
-					   const Bitmapset *columns, const uint64 *rows,
+					   const Bitmapset *columns,
+					   const PgBatchSelection *rows,
 					   PgBatchColumnPhase phase)
 {
 	BatchHashJoinState *state = batch->private_data;
 	int			column = -1;
-	uint64		selected = rows[0];
+	uint64		selected = rows->words[0];
 
 	while (columns != NULL &&
 		   (column = bms_next_member(columns, column)) >= 0)
@@ -1165,7 +1182,7 @@ prepare_output_columns(PgBatch *batch,
 
 static void
 get_output_datum_column(PgBatch *batch, int column,
-						const uint64 *rows,
+						const PgBatchSelection *rows,
 						PgBatchColumnPhase phase,
 						PgBatchDatumVector *result)
 {
@@ -1184,7 +1201,7 @@ get_output_datum_column(PgBatch *batch, int column,
 	bms_free(columns);
 	MemoryContextSwitchTo(oldcontext);
 	output = &state->output_columns[column];
-	missing = rows[0] & ~output->datum_rows;
+	missing = rows->words[0] & ~output->datum_rows;
 	while (missing != 0)
 	{
 		int			row = pg_rightmost_one_pos64(missing);
@@ -1199,9 +1216,29 @@ get_output_datum_column(PgBatch *batch, int column,
 	}
 	result->values = output->datums;
 	result->isnull = output->isnull;
-	result->valid_rows = &output->datum_rows;
-	result->nwords = 1;
+	result->nrows = batch->selection.nrows;
 }
+
+static bool
+get_output_int4_column(PgBatch *batch, int column,
+					   PgBatchInt4Vector *result)
+{
+	BatchHashJoinState *state = batch->private_data;
+	OutputColumn *output;
+
+	if (column < 0 || column >= state->noutput_columns)
+		elog(ERROR, "pg_batch hash join output column is out of range");
+	output = &state->output_columns[column];
+	pg_batch_int4_vector_init_packed(result, output->values,
+		output->validity, 0);
+	return true;
+}
+
+static const PgBatchInt4VectorInterface output_int4_interface = {
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_INT4_VECTOR_INTERFACE_VERSION,
+		PgBatchInt4VectorInterface),
+	.get_column = get_output_int4_column,
+};
 
 static void
 get_output_arrow_column(PgBatch *batch, int column,
@@ -1233,6 +1270,9 @@ static const PgBatchArrowInterface output_arrow_interface = {
 static const PgBatchNativeInterface *
 get_output_native_interface(const PgBatchNativeType *type)
 {
+	if (type->abi_version == PG_BATCH_INT4_VECTOR_INTERFACE_VERSION &&
+		strcmp(type->name, PG_BATCH_INT4_VECTOR_INTERFACE_NAME) == 0)
+		return (const PgBatchNativeInterface *) &output_int4_interface;
 	if (type->abi_version == PG_BATCH_ARROW_INTERFACE_VERSION &&
 		strcmp(type->name, PG_BATCH_ARROW_INTERFACE_NAME) == 0)
 		return (const PgBatchNativeInterface *) &output_arrow_interface;
@@ -1272,16 +1312,16 @@ publish_output(BatchHashJoinState *state)
 	state->output_selection = pg_batch_nrows_mask(state->output_count);
 	state->output_batch.abi_version = PG_BATCH_ABI_VERSION;
 	state->output_batch.struct_size = sizeof(PgBatch);
-	state->output_batch.nrows = state->output_count;
-	state->output_batch.nwords = 1;
-	state->output_batch.selection = &state->output_selection;
+	state->output_batch.selection.nrows = state->output_count;
+	state->output_batch.selection.nwords = 1;
+	state->output_batch.selection.words = &state->output_selection;
 	state->output_batch.table_oid = InvalidOid;
 	state->output_batch.ops = &hash_join_batch_ops;
 	state->output_batch.private_data = state;
 	pg_batch_output_publish(state->output, &state->output_batch);
 	state->output_published = true;
 	state->output_rows += state->output_count;
-	if (state->output_request->return_batch &&
+	if (state->output_request->spec.output_mode == PG_BATCH_OUTPUT_BATCH &&
 		state->css.ss.ps.instrument != NULL)
 		state->css.ss.ps.instrument->tuplecount += state->output_count - 1;
 	return state->output_slot;
@@ -1342,10 +1382,10 @@ clear_published_output(BatchHashJoinState *state, bool require_consumed)
 {
 	if (!state->output_published)
 		return;
-	if (require_consumed && !pg_batch_api->batch_finished(
+	if (require_consumed && !pg_batch_api->finished(
 			pg_batch_output_binding(state->output)))
 		elog(ERROR, "pg_batch hash join parent requested a new batch too early");
-	pg_batch_output_reset(state->output);
+	pg_batch_output_clear(state->output);
 	state->output_published = false;
 }
 
@@ -1450,8 +1490,13 @@ configure_output_slot(BatchHashJoinState *state, EState *estate)
 	layout.ntargets = state->noutput_columns;
 	state->output = pg_batch_output_create(estate->es_query_cxt,
 		state->output_slot, &layout);
-	pg_batch_output_set_request(state->output, NULL, survivors, false,
-		PG_BATCH_SIZE);
+	pg_batch_output_set_request(state->output,
+		&(PgBatchRequestSpec) {
+			.struct_size = sizeof(PgBatchRequestSpec),
+			.project_columns = survivors,
+			.output_mode = PG_BATCH_OUTPUT_ROWS,
+			.max_rows = PG_BATCH_SIZE
+		});
 	state->output_request = pg_batch_output_request(state->output);
 	bms_free(survivors);
 }
@@ -1495,20 +1540,27 @@ hash_join_begin(CustomScanState *node, EState *estate, int eflags)
 {
 	BatchHashJoinState *state = (BatchHashJoinState *) node;
 	CustomScan *cscan = castNode(CustomScan, node->ss.ps.plan);
-	List	   *outer_columns = linitial(cscan->custom_private);
-	List	   *inner_columns = lsecond(cscan->custom_private);
-	List	   *outer_keys = lthird(cscan->custom_private);
-	List	   *inner_keys = lfourth(cscan->custom_private);
-	const char *outer_producer_name =
-		strVal(list_nth(cscan->custom_private, 5));
-	const char *inner_producer_name =
-		strVal(list_nth(cscan->custom_private, 6));
+	PgBatchHashPlanData data;
+	List	   *outer_columns;
+	List	   *inner_columns;
+	List	   *outer_keys;
+	List	   *inner_keys;
+	const char *outer_node_name;
+	const char *inner_node_name;
 	int			position = 0;
+
+	pg_batch_read_hash_plan(cscan, &data);
+	outer_columns = data.outer_columns;
+	inner_columns = data.inner_columns;
+	outer_keys = data.outer_keys;
+	inner_keys = data.inner_keys;
+	outer_node_name = data.outer_name;
+	inner_node_name = data.inner_name;
 
 	state->nouter_columns = list_length(outer_columns);
 	state->ninner_columns = list_length(inner_columns);
 	state->nkeys = list_length(outer_keys);
-	state->planned_partitions = intVal(list_nth(cscan->custom_private, 4));
+	state->planned_partitions = data.planned_partitions;
 	state->memory_limit = get_hash_memory_limit();
 	state->raw_slot = node->ss.ss_ScanTupleSlot;
 	state->join_context = AllocSetContextCreate(CurrentMemoryContext,
@@ -1544,9 +1596,9 @@ hash_join_begin(CustomScanState *node, EState *estate, int eflags)
 	state->outer_plan = linitial(node->custom_ps);
 	state->inner_plan = lsecond(node->custom_ps);
 	state->outer_input = pg_batch_input_create(state->join_context,
-		state->outer_plan, outer_producer_name);
+		state->outer_plan, outer_node_name);
 	state->inner_input = pg_batch_input_create(state->join_context,
-		state->inner_plan, inner_producer_name);
+		state->inner_plan, inner_node_name);
 	for (int key = 0; key < state->nkeys; key++)
 	{
 		state->outer_key_columns = bms_add_member(state->outer_key_columns,
@@ -1589,7 +1641,7 @@ hash_join_exec(CustomScanState *node)
 
 	if (!state->built)
 		build_hash_table(state);
-	if (state->output_request->return_batch)
+	if (state->output_request->spec.output_mode == PG_BATCH_OUTPUT_BATCH)
 		return exec_batch(state);
 	return exec_row(state);
 }

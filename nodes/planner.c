@@ -38,6 +38,113 @@ typedef struct SourceLayout
 	int			nfilter_columns;
 } SourceLayout;
 
+static List *
+make_base_path_data(PgBatchHeapScanMode mode)
+{
+	PgBatchPlanWriter *writer = pg_batch_plan_writer_create("base_path",
+		PG_BATCH_PLAN_DATA_VERSION);
+
+	pg_batch_plan_write_int(writer, "heap_scan_mode", mode);
+	return pg_batch_plan_writer_finish(writer);
+}
+
+static PgBatchHeapScanMode
+read_base_path_data(const CustomPath *path)
+{
+	PgBatchPlanReader *reader = pg_batch_plan_reader_create(
+		path->custom_private, "base_path", PG_BATCH_PLAN_DATA_VERSION);
+	PgBatchHeapScanMode mode = pg_batch_plan_read_int(reader,
+		"heap_scan_mode");
+
+	pg_batch_plan_reader_finish(reader);
+	return mode;
+}
+
+static List *
+make_project_path_data(const char *child_name)
+{
+	PgBatchPlanWriter *writer = pg_batch_plan_writer_create("project_path",
+		PG_BATCH_PLAN_DATA_VERSION);
+
+	pg_batch_plan_write_string(writer, "child_name", child_name);
+	return pg_batch_plan_writer_finish(writer);
+}
+
+static const char *
+read_project_path_data(const CustomPath *path)
+{
+	PgBatchPlanReader *reader = pg_batch_plan_reader_create(
+		path->custom_private, "project_path", PG_BATCH_PLAN_DATA_VERSION);
+	const char *child_name = pg_batch_plan_read_string(reader, "child_name");
+
+	pg_batch_plan_reader_finish(reader);
+	return child_name;
+}
+
+static List *
+make_hash_path_data(List *hash_quals, int planned_partitions,
+					const char *outer_name, const char *inner_name)
+{
+	PgBatchPlanWriter *writer = pg_batch_plan_writer_create("hash_path",
+		PG_BATCH_PLAN_DATA_VERSION);
+
+	pg_batch_plan_write_list(writer, "hash_quals", hash_quals);
+	pg_batch_plan_write_int(writer, "planned_partitions", planned_partitions);
+	pg_batch_plan_write_string(writer, "outer_name", outer_name);
+	pg_batch_plan_write_string(writer, "inner_name", inner_name);
+	return pg_batch_plan_writer_finish(writer);
+}
+
+static void
+read_hash_path_data(const CustomPath *path, List **hash_quals,
+	int *planned_partitions, const char **outer_name, const char **inner_name)
+{
+	PgBatchPlanReader *reader = pg_batch_plan_reader_create(
+		path->custom_private, "hash_path", PG_BATCH_PLAN_DATA_VERSION);
+
+	*hash_quals = pg_batch_plan_read_list(reader, "hash_quals");
+	*planned_partitions = pg_batch_plan_read_int(reader,
+		"planned_partitions");
+	*outer_name = pg_batch_plan_read_string(reader, "outer_name");
+	*inner_name = pg_batch_plan_read_string(reader, "inner_name");
+	pg_batch_plan_reader_finish(reader);
+}
+
+static List *
+make_agg_path_data(const char *child_name, List *specs)
+{
+	PgBatchPlanWriter *writer = pg_batch_plan_writer_create("aggregate_path",
+		PG_BATCH_PLAN_DATA_VERSION);
+	List	   *kinds = NIL;
+	List	   *expressions = NIL;
+
+	foreach_ptr(List, spec, specs)
+	{
+		kinds = lappend_int(kinds, intVal(linitial(spec)));
+		expressions = lappend(expressions, copyObject(lsecond(spec)));
+	}
+
+	pg_batch_plan_write_string(writer, "child_name", child_name);
+	pg_batch_plan_write_int_list(writer, "kinds", kinds);
+	pg_batch_plan_write_list(writer, "expressions", expressions);
+	return pg_batch_plan_writer_finish(writer);
+}
+
+static void
+read_agg_path_data(const CustomPath *path, const char **child_name,
+	List **kinds, List **expressions)
+{
+	PgBatchPlanReader *reader = pg_batch_plan_reader_create(
+		path->custom_private, "aggregate_path", PG_BATCH_PLAN_DATA_VERSION);
+
+	*child_name = pg_batch_plan_read_string(reader, "child_name");
+	*kinds = pg_batch_plan_read_int_list(reader, "kinds");
+	*expressions = pg_batch_plan_read_list(reader, "expressions");
+	if (list_length(*kinds) != list_length(*expressions))
+		elog(ERROR, "pg_batch aggregate path fields are misaligned");
+	pg_batch_plan_reader_finish(reader);
+}
+
 static Plan *plan_base(PlannerInfo *root, RelOptInfo *rel,
 					   CustomPath *best_path, List *tlist,
 					   List *clauses, List *custom_plans);
@@ -117,7 +224,7 @@ nodes_supports_batch_path(const Path *path)
 
 	if (!IsA(path, CustomPath))
 		return false;
-	custom = castNode(CustomPath, path);
+	custom = (const CustomPath *) path;
 	return custom->methods == &pg_batch_base_path_methods ||
 		custom->methods == &pg_batch_hash_join_path_methods ||
 		custom->methods == &pg_batch_pack_path_methods ||
@@ -146,14 +253,17 @@ nodes_get_layout(const Plan *plan, PgBatchLayout *result)
 	int			column = 0;
 
 	if (result == NULL || result->struct_size < PG_BATCH_LAYOUT_MIN_SIZE)
-		elog(ERROR, "pg_batch producer received an incompatible output layout");
+		elog(ERROR, "pg_batch node received an incompatible output layout");
 	if (!IsA(plan, CustomScan))
-		elog(ERROR, "pg_batch producer expected a custom plan");
-	scan = castNode(CustomScan, plan);
+		elog(ERROR, "pg_batch node expected a custom plan");
+	scan = (const CustomScan *) plan;
 	columns = palloc_array(int, list_length(plan->targetlist));
 	if (scan->methods == &pg_batch_scan_plan_methods)
 	{
-		result->ncolumns = list_length(linitial(scan->custom_private));
+		PgBatchScanPlanData data;
+
+		pg_batch_read_scan_plan(scan, &data);
+		result->ncolumns = list_length(data.source_attnums);
 		while (column < list_length(plan->targetlist))
 		{
 			columns[column] = column;
@@ -162,7 +272,11 @@ nodes_get_layout(const Plan *plan, PgBatchLayout *result)
 	}
 	else if (scan->methods == &pg_batch_filter_plan_methods)
 	{
-		List	   *source_attnums = linitial(scan->custom_private);
+		PgBatchFilterPlanData data;
+		List	   *source_attnums;
+
+		pg_batch_read_filter_plan(scan, &data);
+		source_attnums = data.source_attnums;
 
 		result->ncolumns = list_length(source_attnums);
 
@@ -191,7 +305,7 @@ nodes_get_layout(const Plan *plan, PgBatchLayout *result)
 		}
 	}
 	else
-		elog(ERROR, "pg_batch producer received an unknown custom plan");
+		elog(ERROR, "pg_batch node received an unknown custom plan");
 	result->ntargets = column;
 	result->target_columns = columns;
 }
@@ -199,18 +313,18 @@ nodes_get_layout(const Plan *plan, PgBatchLayout *result)
 static PgBatchBinding *
 nodes_get_request_binding(PlanState *planstate)
 {
-	TupleTableSlot *slot = pg_batch_result_batch_slot(planstate);
+	TupleTableSlot *slot = pg_batch_result_slot(planstate);
 	PgBatchBinding *binding = pg_batch_api->find_binding(slot);
 
 	if (binding == NULL)
-		elog(ERROR, "pg_batch producer has no request binding");
+		elog(ERROR, "pg_batch node has no request binding");
 	return binding;
 }
 
-const PgBatchProducerOps pg_batch_producer_ops = {
-	PG_BATCH_ABI_INITIALIZER(PG_BATCH_PRODUCER_OPS_ABI_VERSION,
-		PgBatchProducerOps),
-	.producer_name = PG_BATCH_PRODUCER_NAME,
+const PgBatchNodeOps pg_batch_node_ops = {
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_NODE_OPS_ABI_VERSION,
+		PgBatchNodeOps),
+	.node_name = PG_BATCH_NODE_NAME,
 	.supports_path = nodes_supports_batch_path,
 	.get_layout = nodes_get_layout,
 	.get_request_binding = nodes_get_request_binding,
@@ -324,7 +438,7 @@ relation_supported(PlannerInfo *root, RelOptInfo *rel,
 				   RangeTblEntry *rte)
 {
 	Relation	relation;
-	const PgBatchProviderOps *provider;
+	const PgBatchSourceOps *source;
 	bool		result = true;
 
 	if (!pg_batch_enable || root->parse->commandType != CMD_SELECT ||
@@ -333,13 +447,11 @@ relation_supported(PlannerInfo *root, RelOptInfo *rel,
 		rel->lateral_relids != NULL)
 		return false;
 	relation = table_open(rte->relid, NoLock);
-	provider = pg_batch_api->find_provider(relation);
+	source = pg_batch_api->find_source(relation);
 	if (relation->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
-		result = provider != NULL &&
-			PG_BATCH_ABI_HAS_FIELD(provider, PgBatchProviderOps, next_batch) &&
-			provider->next_batch != NULL;
+		result = source != NULL && source->delivery == PG_BATCH_SOURCE_PULL;
 	else if (relation->rd_rel->relkind != RELKIND_RELATION ||
-			 (relation->rd_rel->relam != HEAP_TABLE_AM_OID && provider == NULL))
+			 (relation->rd_rel->relam != HEAP_TABLE_AM_OID && source == NULL))
 		result = false;
 	for (int i = 0; result && i < RelationGetNumberOfAttributes(relation); i++)
 	{
@@ -489,7 +601,7 @@ make_base_path(RelOptInfo *rel, PgBatchHeapScanMode mode)
 	path->path.parent = rel;
 	path->path.pathtarget = rel->reltarget;
 	path->flags = CUSTOMPATH_SUPPORT_PROJECTION;
-	path->custom_private = list_make1(makeInteger(mode));
+	path->custom_private = make_base_path_data(mode);
 	path->methods = &pg_batch_base_path_methods;
 	return path;
 }
@@ -617,7 +729,7 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		path->path.disabled_nodes = foreign_path->disabled_nodes;
 		path->path.startup_cost = foreign_path->startup_cost;
 		path->path.total_cost = foreign_path->total_cost;
-		/* The direct provider does not promise the FDW path's ordering. */
+		/* The direct source does not promise the FDW path's ordering. */
 		path->path.pathkeys = NIL;
 	}
 	else
@@ -667,7 +779,7 @@ can_make_batch_input(PlannerInfo *root, Path *path)
 	RelOptInfo *rel = path->parent;
 	RangeTblEntry *rte;
 
-	if (pg_batch_api->find_producer(path) != NULL)
+	if (pg_batch_api->find_node(path) != NULL)
 		return true;
 	if (rel->reloptkind != RELOPT_BASEREL || path->param_info != NULL ||
 		path->parallel_aware)
@@ -790,20 +902,20 @@ make_pack_input(Path *source)
 }
 
 static Path *
-make_join_input(PlannerInfo *root, Path *source, const char **producer_name)
+make_join_input(PlannerInfo *root, Path *source, const char **node_name)
 {
-	const PgBatchProducerOps *producer =
-		pg_batch_api->find_producer(source);
+	const PgBatchNodeOps *node =
+		pg_batch_api->find_node(source);
 	CustomPath *path;
 
-	if (producer != NULL)
+	if (node != NULL)
 	{
-		*producer_name = producer->producer_name;
+		*node_name = node->node_name;
 		return source;
 	}
 	if (!can_make_batch_input(root, source))
 	{
-		*producer_name = PG_BATCH_PRODUCER_NAME;
+		*node_name = PG_BATCH_NODE_NAME;
 		return make_pack_input(source);
 	}
 	Assert(source->pathtype == T_SeqScan || IsA(source, ForeignPath));
@@ -814,10 +926,10 @@ make_join_input(PlannerInfo *root, Path *source, const char **producer_name)
 	path->path.startup_cost = source->startup_cost;
 	path->path.total_cost = source->total_cost;
 	path->path.pathkeys = source->pathkeys;
-	producer = pg_batch_api->find_producer(&path->path);
-	if (producer == NULL)
-		elog(ERROR, "pg_batch batch input has no registered producer");
-	*producer_name = producer->producer_name;
+	node = pg_batch_api->find_node(&path->path);
+	if (node == NULL)
+		elog(ERROR, "pg_batch batch input has no registered node");
+	*node_name = node->node_name;
 	return &path->path;
 }
 
@@ -830,8 +942,8 @@ set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 	CustomPath *path;
 	Path	   *outer_input;
 	Path	   *inner_input;
-	const char *outer_producer;
-	const char *inner_producer;
+	const char *outer_node_name;
+	const char *inner_node_name;
 
 	if (previous_set_join_pathlist_hook != NULL)
 		previous_set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
@@ -863,16 +975,13 @@ set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 	path->path.total_cost *= 0.85;
 	path->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	outer_input = make_join_input(root, best->jpath.outerjoinpath,
-								  &outer_producer);
+								  &outer_node_name);
 	inner_input = make_join_input(root, best->jpath.innerjoinpath,
-								  &inner_producer);
+								  &inner_node_name);
 	path->custom_paths = list_make2(outer_input, inner_input);
 	path->custom_restrictinfo = copyObject(best->jpath.joinrestrictinfo);
-	path->custom_private =
-		list_make4(copyObject(best->path_hashclauses),
-				   makeInteger(best->num_batches),
-				   makeString(pstrdup(outer_producer)),
-				   makeString(pstrdup(inner_producer)));
+	path->custom_private = make_hash_path_data(best->path_hashclauses,
+		best->num_batches, outer_node_name, inner_node_name);
 	path->methods = &pg_batch_hash_join_path_methods;
 	add_path(joinrel, &path->path);
 }
@@ -984,26 +1093,26 @@ query_aggregate_specs(PlannerInfo *root)
 }
 
 static Path *
-find_batch_path(RelOptInfo *input_rel, const char **producer_name)
+find_batch_path(RelOptInfo *input_rel, const char **node_name)
 {
 	Path	   *best = NULL;
-	const PgBatchProducerOps *best_producer = NULL;
+	const PgBatchNodeOps *best_node = NULL;
 	ListCell   *lc;
 
 	foreach(lc, input_rel->pathlist)
 	{
 		Path	   *path = lfirst(lc);
-		const PgBatchProducerOps *producer =
-			pg_batch_api->find_producer(path);
+		const PgBatchNodeOps *node =
+			pg_batch_api->find_node(path);
 
-		if (producer != NULL &&
+		if (node != NULL &&
 			(best == NULL || path->total_cost < best->total_cost))
 		{
 			best = path;
-			best_producer = producer;
+			best_node = node;
 		}
 	}
-	*producer_name = best_producer == NULL ? NULL : best_producer->producer_name;
+	*node_name = best_node == NULL ? NULL : best_node->node_name;
 	return best;
 }
 
@@ -1015,7 +1124,7 @@ create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	Path	   *child;
 	CustomPath *path;
 	List	   *agg_specs;
-	const char *producer_name;
+	const char *node_name;
 	bool		needs_project = false;
 
 	if (previous_create_upper_paths_hook != NULL)
@@ -1026,7 +1135,7 @@ create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	agg_specs = query_aggregate_specs(root);
 	if (agg_specs == NIL)
 		return;
-	child = find_batch_path(input_rel, &producer_name);
+	child = find_batch_path(input_rel, &node_name);
 	if (child == NULL)
 		return;
 	foreach_ptr(List, spec, agg_specs)
@@ -1074,11 +1183,10 @@ create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		project->path.disabled_nodes = child->disabled_nodes;
 		project->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 		project->custom_paths = list_make1(child);
-		project->custom_private =
-			list_make1(makeString(pstrdup(producer_name)));
+		project->custom_private = make_project_path_data(node_name);
 		project->methods = &pg_batch_project_path_methods;
 		child = &project->path;
-		producer_name = PG_BATCH_PRODUCER_NAME;
+		node_name = PG_BATCH_NODE_NAME;
 	}
 
 	path = makeNode(CustomPath);
@@ -1100,8 +1208,7 @@ create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 	path->path.total_cost = child->total_cost + cpu_operator_cost * child->rows;
 	path->path.disabled_nodes = child->disabled_nodes;
 	path->custom_paths = list_make1(child);
-	path->custom_private =
-		list_make2(makeString(pstrdup(producer_name)), agg_specs);
+	path->custom_private = make_agg_path_data(node_name, agg_specs);
 	path->methods = &pg_batch_agg_path_methods;
 	add_path(output_rel, &path->path);
 }
@@ -1225,8 +1332,7 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	SourceLayout layout;
 	PgBatchSourcePlanResult source_result =
 		PG_BATCH_STRUCT_INITIALIZER(PgBatchSourcePlanResult);
-	PgBatchHeapScanMode heap_scan_mode =
-		intVal(linitial(best_path->custom_private));
+	PgBatchHeapScanMode heap_scan_mode = read_base_path_data(best_path);
 	CustomScan *scan;
 	CustomScan *filter;
 	List	   *quals = extract_actual_clauses(clauses, false);
@@ -1238,7 +1344,8 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *bitmapqualorig = NIL;
 	List	   *source_exprs = NIL;
 	Node	   *source_private = (Node *) NIL;
-	const char *provider_name = "";
+	PgBatchPlanWriter *plan_data;
+	const char *source_name = "";
 	bool		dense_prefix = true;
 	int			qualno = 0;
 
@@ -1264,10 +1371,10 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	{
 		RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
 		Relation	relation = table_open(rte->relid, NoLock);
-		const PgBatchProviderOps *provider =
-			pg_batch_api->find_provider(relation);
+		const PgBatchSourceOps *source =
+			pg_batch_api->find_source(relation);
 
-		if (provider != NULL)
+		if (source != NULL)
 		{
 			PgBatchSourcePlanRequest request =
 				PG_BATCH_STRUCT_INITIALIZER(PgBatchSourcePlanRequest);
@@ -1286,11 +1393,11 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			request.restrictinfos = restrictinfos;
 			request.filter_attnums = filter_attnums;
 			request.project_attnums = project_attnums;
-			provider->plan_scan(&request, &source_result);
+			source->plan_scan(&request, &source_result);
 			if (source_result.nquals != list_length(quals) ||
 				source_result.qual_support == NULL)
-				elog(ERROR, "pg_batch provider returned an invalid qualification plan");
-			provider_name = provider->provider_name;
+				elog(ERROR, "pg_batch source returned an invalid qualification plan");
+			source_name = source->source_name;
 			source_exprs = source_result.source_exprs;
 			source_private = source_result.source_private;
 			bms_free(filter_attnums);
@@ -1346,18 +1453,22 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 									 copyObject(batch_quals));
 	scan->custom_plans = custom_plans;
 	/* Compact layout, source plan, and exact-page recheck metadata. */
-	scan->custom_private =
-		list_make5(copyObject(layout.source_attnums),
-				   makeInteger(layout.nfilter_columns),
-				   makeInteger(heap_scan_mode),
-				   makeString(pstrdup(provider_name)),
-				   copyObject(source_private));
-	scan->custom_private = lappend(scan->custom_private,
-								   makeInteger(list_length(source_exprs)));
-	scan->custom_private = lappend(scan->custom_private,
-								   batch_recheck_flags);
-	scan->custom_private = lappend(scan->custom_private,
-								   layout.exact_filter_columns);
+	plan_data = pg_batch_plan_writer_create("scan",
+		PG_BATCH_PLAN_DATA_VERSION);
+	pg_batch_plan_write_int_list(plan_data, "source_attnums",
+		layout.source_attnums);
+	pg_batch_plan_write_int(plan_data, "nfilter_columns",
+		layout.nfilter_columns);
+	pg_batch_plan_write_int(plan_data, "heap_scan_mode", heap_scan_mode);
+	pg_batch_plan_write_string(plan_data, "source_name", source_name);
+	pg_batch_plan_write_node(plan_data, "source_private", source_private);
+	pg_batch_plan_write_int(plan_data, "nsource_exprs",
+		list_length(source_exprs));
+	pg_batch_plan_write_int_list(plan_data, "batch_recheck_flags",
+		batch_recheck_flags);
+	pg_batch_plan_write_int_list(plan_data, "exact_filter_columns",
+		layout.exact_filter_columns);
+	scan->custom_private = pg_batch_plan_writer_finish(plan_data);
 	scan->custom_scan_tlist = copyObject(layout.targetlist);
 	scan->custom_relids = bms_copy(rel->relids);
 
@@ -1366,11 +1477,16 @@ plan_base(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	filter->scan.plan.targetlist = tlist;
 	filter->scan.plan.qual = residual;
 	filter->custom_plans = list_make1(scan);
-	/* layout plus columns needed only for surviving rows */
-	filter->custom_private =
-		list_make3(layout.source_attnums,
-				   makeInteger(layout.nfilter_columns),
-				   layout.project_columns);
+	/* Layout plus columns needed only for surviving rows. */
+	plan_data = pg_batch_plan_writer_create("filter",
+		PG_BATCH_PLAN_DATA_VERSION);
+	pg_batch_plan_write_int_list(plan_data, "source_attnums",
+		layout.source_attnums);
+	pg_batch_plan_write_int(plan_data, "nfilter_columns",
+		layout.nfilter_columns);
+	pg_batch_plan_write_int_list(plan_data, "project_columns",
+		layout.project_columns);
+	filter->custom_private = pg_batch_plan_writer_finish(plan_data);
 	filter->custom_scan_tlist = layout.targetlist;
 	filter->custom_relids = bms_copy(rel->relids);
 	list_free(local_quals);
@@ -1386,7 +1502,10 @@ plan_pack(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	Plan	   *child;
 
 	Assert(list_length(custom_plans) == 1);
-	Assert(clauses == NIL);
+	/*
+	 * Core derives clauses from the parent relation for every CustomPath.
+	 * This node wraps a complete child path, which already enforces them.
+	 */
 	child = linitial(custom_plans);
 	pack = make_custom_scan(&pg_batch_pack_plan_methods);
 	pack->scan.plan.targetlist = tlist;
@@ -1402,24 +1521,25 @@ plan_project(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 {
 	CustomScan *project;
 	Plan	   *child;
-	const char *producer_name = strVal(linitial(best_path->custom_private));
-	const PgBatchProducerOps *producer;
+	const char *node_name = read_project_path_data(best_path);
+	const PgBatchNodeOps *node;
 	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
+	PgBatchPlanWriter *plan_data;
 	List	   *input_columns = NIL;
 	List	   *expressions = NIL;
 
 	Assert(list_length(custom_plans) == 1);
-	Assert(clauses == NIL);
+	/* The complete child path already enforces the clauses supplied by core. */
 	child = linitial(custom_plans);
-	producer = pg_batch_api->get_producer(producer_name);
-	if (producer == NULL)
-		elog(ERROR, "pg_batch producer \"%s\" is not registered",
-			 producer_name);
-	producer->get_layout(child, &layout);
+	node = pg_batch_api->get_node(node_name);
+	if (node == NULL)
+		elog(ERROR, "pg_batch node \"%s\" is not registered",
+			 node_name);
+	node->get_layout(child, &layout);
 	pg_batch_check_layout(&layout);
 	if (layout.ntargets != list_length(child->targetlist))
-		elog(ERROR, "pg_batch producer \"%s\" returned an invalid output layout",
-			 producer_name);
+		elog(ERROR, "pg_batch node \"%s\" returned an invalid output layout",
+			 node_name);
 	for (int position = 0; position < layout.ntargets; position++)
 		input_columns = lappend_int(input_columns,
 									pg_batch_layout_column(&layout, position));
@@ -1431,8 +1551,11 @@ plan_project(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	project->scan.plan.targetlist = tlist;
 	project->custom_plans = custom_plans;
 	project->custom_exprs = expressions;
-	project->custom_private =
-		list_make2(makeString(pstrdup(producer_name)), input_columns);
+	plan_data = pg_batch_plan_writer_create("project",
+		PG_BATCH_PLAN_DATA_VERSION);
+	pg_batch_plan_write_string(plan_data, "child_name", node_name);
+	pg_batch_plan_write_int_list(plan_data, "input_columns", input_columns);
+	project->custom_private = pg_batch_plan_writer_finish(plan_data);
 	project->custom_scan_tlist = copyObject(child->targetlist);
 	project->custom_relids = bms_copy(rel->relids);
 	return &project->scan.plan;
@@ -1454,22 +1577,22 @@ target_expression_position(List *targetlist, Node *expr)
 }
 
 static List *
-append_side_layout(Plan *child, const char *producer_name, List **raw_tlist)
+append_side_layout(Plan *child, const char *node_name, List **raw_tlist)
 {
-	const PgBatchProducerOps *producer =
-		pg_batch_api->get_producer(producer_name);
+	const PgBatchNodeOps *node =
+		pg_batch_api->get_node(node_name);
 	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
 	List	   *batch_columns = NIL;
 	int			position = 0;
 
-	if (producer == NULL)
-		elog(ERROR, "pg_batch producer \"%s\" is not registered",
-			 producer_name);
-	producer->get_layout(child, &layout);
+	if (node == NULL)
+		elog(ERROR, "pg_batch node \"%s\" is not registered",
+			 node_name);
+	node->get_layout(child, &layout);
 	pg_batch_check_layout(&layout);
 	if (layout.ntargets != list_length(child->targetlist))
-		elog(ERROR, "pg_batch producer \"%s\" returned an invalid output layout",
-			 producer_name);
+		elog(ERROR, "pg_batch node \"%s\" returned an invalid output layout",
+			 node_name);
 	foreach_ptr(TargetEntry, tle, child->targetlist)
 	{
 		Node	   *expr = pg_batch_strip_relabel((Node *) tle->expr);
@@ -1478,8 +1601,8 @@ append_side_layout(Plan *child, const char *producer_name, List **raw_tlist)
 		if (exprType(expr) != INT4OID)
 			elog(ERROR, "pg_batch hash join child produced a non-int4 column");
 		if (pg_batch_layout_column(&layout, position) < 0)
-			elog(ERROR, "pg_batch producer \"%s\" omitted an output column",
-				 producer_name);
+			elog(ERROR, "pg_batch node \"%s\" omitted an output column",
+				 node_name);
 		raw = makeTargetEntry((Expr *) copyObject(tle->expr),
 							  list_length(*raw_tlist) + 1,
 							  NULL, false);
@@ -1497,9 +1620,11 @@ plan_hash_join(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 {
 	CustomScan *join;
 	Path	   *outer_path = linitial(best_path->custom_paths);
-	List	   *hash_rinfos = linitial(best_path->custom_private);
-	const char *outer_producer = strVal(lthird(best_path->custom_private));
-	const char *inner_producer = strVal(lfourth(best_path->custom_private));
+	List	   *hash_rinfos;
+	const char *outer_node_name;
+	const char *inner_node_name;
+	int			planned_partitions;
+	PgBatchPlanWriter *plan_data;
 	List	   *all_quals;
 	List	   *hash_quals;
 	List	   *residual;
@@ -1514,11 +1639,12 @@ plan_hash_join(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	Plan	   *inner_plan;
 
 	Assert(list_length(custom_plans) == 2);
-	Assert(list_length(best_path->custom_private) == 4);
+	read_hash_path_data(best_path, &hash_rinfos, &planned_partitions,
+		&outer_node_name, &inner_node_name);
 	outer_plan = linitial(custom_plans);
 	inner_plan = lsecond(custom_plans);
-	outer_columns = append_side_layout(outer_plan, outer_producer, &raw_tlist);
-	inner_columns = append_side_layout(inner_plan, inner_producer, &raw_tlist);
+	outer_columns = append_side_layout(outer_plan, outer_node_name, &raw_tlist);
+	inner_columns = append_side_layout(inner_plan, inner_node_name, &raw_tlist);
 
 	foreach_ptr(RestrictInfo, rinfo, hash_rinfos)
 	{
@@ -1569,13 +1695,17 @@ plan_hash_join(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	join->scan.plan.qual = scalar_residual;
 	join->custom_plans = custom_plans;
 	join->custom_exprs = batch_residual;
-	join->custom_private =
-		list_make5(outer_columns, inner_columns, outer_keys, inner_keys,
-				   copyObject(lsecond(best_path->custom_private)));
-	join->custom_private = lappend(join->custom_private,
-								  makeString(pstrdup(outer_producer)));
-	join->custom_private = lappend(join->custom_private,
-								  makeString(pstrdup(inner_producer)));
+	plan_data = pg_batch_plan_writer_create("hash_join",
+		PG_BATCH_PLAN_DATA_VERSION);
+	pg_batch_plan_write_int_list(plan_data, "outer_columns", outer_columns);
+	pg_batch_plan_write_int_list(plan_data, "inner_columns", inner_columns);
+	pg_batch_plan_write_int_list(plan_data, "outer_keys", outer_keys);
+	pg_batch_plan_write_int_list(plan_data, "inner_keys", inner_keys);
+	pg_batch_plan_write_int(plan_data, "planned_partitions",
+		planned_partitions);
+	pg_batch_plan_write_string(plan_data, "outer_name", outer_node_name);
+	pg_batch_plan_write_string(plan_data, "inner_name", inner_node_name);
+	join->custom_private = pg_batch_plan_writer_finish(plan_data);
 	join->custom_scan_tlist = raw_tlist;
 	join->custom_relids = bms_copy(rel->relids);
 	return &join->scan.plan;
@@ -1587,29 +1717,32 @@ plan_aggregate(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 {
 	CustomScan *agg;
 	Plan	   *child;
-	const char *producer_name = strVal(linitial(best_path->custom_private));
-	List	   *agg_specs = lsecond_node(List, best_path->custom_private);
-	const PgBatchProducerOps *producer;
+	const char *node_name;
+	List	   *agg_kinds;
+	List	   *agg_exprs;
+	ListCell   *kind_cell;
+	ListCell   *expr_cell;
+	const PgBatchNodeOps *node;
 	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
-	List	   *runtime_specs = NIL;
+	PgBatchPlanWriter *plan_data;
+	List	   *runtime_columns = NIL;
 
 	Assert(list_length(custom_plans) == 1);
-	Assert(list_length(best_path->custom_private) == 2);
 	Assert(clauses == NIL);
+	read_agg_path_data(best_path, &node_name, &agg_kinds, &agg_exprs);
 	child = linitial(custom_plans);
-	producer = pg_batch_api->get_producer(producer_name);
-	if (producer == NULL)
-		elog(ERROR, "pg_batch producer \"%s\" is not registered",
-			 producer_name);
-	producer->get_layout(child, &layout);
+	node = pg_batch_api->get_node(node_name);
+	if (node == NULL)
+		elog(ERROR, "pg_batch node \"%s\" is not registered",
+			 node_name);
+	node->get_layout(child, &layout);
 	pg_batch_check_layout(&layout);
 	if (layout.ntargets != list_length(child->targetlist))
-		elog(ERROR, "pg_batch producer \"%s\" returned an invalid output layout",
-			 producer_name);
-	foreach_ptr(List, spec, agg_specs)
+		elog(ERROR, "pg_batch node \"%s\" returned an invalid output layout",
+			 node_name);
+	forboth(kind_cell, agg_kinds, expr_cell, agg_exprs)
 	{
-		PgBatchAggKind kind = intVal(linitial(spec));
-		Node	   *expr = lsecond(spec);
+		Node	   *expr = lfirst(expr_cell);
 		int			column = -1;
 
 		if (expr != NULL)
@@ -1622,15 +1755,17 @@ plan_aggregate(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			if (column < 0)
 				elog(ERROR, "pg_batch aggregate input is missing from child target");
 		}
-		runtime_specs = lappend(runtime_specs,
-								 list_make2(makeInteger(kind),
-											makeInteger(column)));
+		runtime_columns = lappend_int(runtime_columns, column);
 	}
 	agg = make_custom_scan(&pg_batch_agg_plan_methods);
 	agg->scan.plan.targetlist = copyObject(tlist);
 	agg->custom_plans = custom_plans;
-	agg->custom_private =
-		list_make2(makeString(pstrdup(producer_name)), runtime_specs);
+	plan_data = pg_batch_plan_writer_create("aggregate",
+		PG_BATCH_PLAN_DATA_VERSION);
+	pg_batch_plan_write_string(plan_data, "child_name", node_name);
+	pg_batch_plan_write_int_list(plan_data, "kinds", agg_kinds);
+	pg_batch_plan_write_int_list(plan_data, "columns", runtime_columns);
+	agg->custom_private = pg_batch_plan_writer_finish(plan_data);
 	agg->custom_scan_tlist = copyObject(tlist);
 	return &agg->scan.plan;
 }

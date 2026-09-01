@@ -24,7 +24,6 @@ pg_batch_spill_test(PG_FUNCTION_ARGS)
 	Datum		second_values[8];
 	bool		first_nulls[8] = {false};
 	bool		second_nulls[8] = {false};
-	uint64		valid_rows = UINT64CONST(0xff);
 	PgBatchInt4Vector columns[2];
 	uint32		hashes[8];
 	uint64		selection;
@@ -47,19 +46,19 @@ pg_batch_spill_test(PG_FUNCTION_ARGS)
 		hashes[row] = row + 100;
 	}
 	second_nulls[2] = true;
-	pg_batch_int4_vector_init_datum(&columns[0], first_values, first_nulls,
-		&valid_rows, 1);
-	pg_batch_int4_vector_init_datum(&columns[1], second_values, second_nulls,
-		&valid_rows, 1);
+	pg_batch_int4_vector_init_datum(&columns[0], first_values, first_nulls);
+	pg_batch_int4_vector_init_datum(&columns[1], second_values, second_nulls);
 
 	/* One writer block forces eviction as writes alternate partitions. */
 	set = pg_batch_spill_create(context, desc, 2, 2, 1);
 	selection = UINT64CONST(0x0d);
-	pg_batch_spill_write(set, 0, columns, 8, &selection, hashes);
+	pg_batch_spill_write(set, 0, columns,
+		&(PgBatchSelection) {8, 1, &selection}, hashes);
 	pg_batch_spill_write_dense(set, 1, 2, dense_hashes, dense_values, 2,
 		dense_validity);
 	selection = UINT64CONST(0x22);
-	pg_batch_spill_write(set, 0, columns, 8, &selection, hashes);
+	pg_batch_spill_write(set, 0, columns,
+		&(PgBatchSelection) {8, 1, &selection}, hashes);
 	pg_batch_spill_finish(set, true);
 	if (pg_batch_spill_partition_rows(set, 0) != 5 ||
 		pg_batch_spill_partition_rows(set, 1) != 2)

@@ -36,7 +36,7 @@ check_column(PgBatchExprProjection *projection, int column)
 
 static void
 prepare_one(PgBatchExprProjection *projection, int column,
-			const uint64 *rows, PgBatchColumnPhase phase)
+			const PgBatchSelection *rows, PgBatchColumnPhase phase)
 {
 	ProjectionColumn *output;
 
@@ -52,7 +52,8 @@ prepare_one(PgBatchExprProjection *projection, int column,
 
 static void
 projection_prepare_columns(PgBatch *batch,
-						   const Bitmapset *columns, const uint64 *rows,
+						   const Bitmapset *columns,
+						   const PgBatchSelection *rows,
 						   PgBatchColumnPhase phase)
 {
 	PgBatchExprProjection *projection = batch->private_data;
@@ -70,7 +71,7 @@ projection_get_int4(PgBatch *batch, int column,
 	PgBatchExprProjection *projection = batch->private_data;
 	ProjectionColumn *output;
 
-	prepare_one(projection, column, batch->selection,
+	prepare_one(projection, column, &batch->selection,
 				PG_BATCH_COLUMN_PROJECT);
 	output = &projection->columns[column];
 	*result = output->vector;
@@ -97,8 +98,8 @@ ensure_datum_capacity(PgBatchExprProjection *projection,
 					  ProjectionColumn *output)
 {
 	MemoryContext oldcontext;
-	int			nrows = projection->batch.nrows;
-	int			nwords = projection->batch.nwords;
+	int			nrows = projection->batch.selection.nrows;
+	int			nwords = projection->batch.selection.nwords;
 
 	if (output->datum_capacity >= nrows &&
 		output->datum_nword_capacity >= nwords)
@@ -126,7 +127,7 @@ ensure_datum_capacity(PgBatchExprProjection *projection,
 
 static void
 projection_get_datum_column(PgBatch *batch, int column,
-							const uint64 *rows,
+							const PgBatchSelection *rows,
 							PgBatchColumnPhase phase,
 							PgBatchDatumVector *result)
 {
@@ -137,9 +138,9 @@ projection_get_datum_column(PgBatch *batch, int column,
 	prepare_one(projection, column, rows, phase);
 	output = &projection->columns[column];
 	ensure_datum_capacity(projection, output);
-	for (int word = 0; word < batch->nwords; word++)
+	for (int word = 0; word < batch->selection.nwords; word++)
 	{
-		uint64		missing = rows[word] & ~output->datum_rows[word];
+		uint64		missing = rows->words[word] & ~output->datum_rows[word];
 
 		while (missing != 0)
 		{
@@ -157,8 +158,7 @@ projection_get_datum_column(PgBatch *batch, int column,
 	}
 	result->values = output->datum_values;
 	result->isnull = output->datum_nulls;
-	result->valid_rows = output->datum_rows;
-	result->nwords = batch->nwords;
+	result->nrows = batch->selection.nrows;
 }
 
 static const PgBatchOps projection_batch_ops = {
@@ -223,9 +223,9 @@ pg_batch_expr_projection_bind(PgBatchExprProjection *projection,
 		pg_batch_expr_bind(output->expr, input, econtext,
 						   PG_BATCH_COLUMN_PROJECT);
 	}
-	projection->batch.nrows = input->nrows;
-	projection->batch.nwords = input->nwords;
-	projection->batch.selection = input->selection;
+	projection->batch.selection.nrows = input->selection.nrows;
+	projection->batch.selection.nwords = input->selection.nwords;
+	projection->batch.selection.words = input->selection.words;
 	projection->batch.table_oid = input->table_oid;
 	return &projection->batch;
 }

@@ -6,7 +6,7 @@
 #include "internal.h"
 
 TupleTableSlot *
-pg_batch_result_batch_slot(PlanState *planstate)
+pg_batch_result_slot(PlanState *planstate)
 {
 	TupleTableSlot *slot = planstate->ps_ResultTupleSlot;
 

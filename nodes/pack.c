@@ -18,7 +18,7 @@ typedef struct BatchPackState
 	PlanState  *child;
 	PgBatchOutput *output;
 	const PgBatchRequest *request;
-	PgBatchDatumBuffer *buffer;
+	PgBatchBuilder *builder;
 	int			ncolumns;
 	bool		published;
 	uint64		packed_batches;
@@ -64,8 +64,14 @@ pack_begin(CustomScanState *node, EState *estate, int eflags)
 	pg_batch_init_children(node, estate, eflags);
 	state->child = linitial(node->custom_ps);
 	state->ncolumns = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor->natts;
-	state->buffer = pg_batch_datum_buffer_create(estate->es_query_cxt,
-		ExecGetResultType(state->child), state->ncolumns, PG_BATCH_SIZE);
+	state->builder = pg_batch_builder_create(
+		&(PgBatchBuilderConfig) {
+			.struct_size = sizeof(PgBatchBuilderConfig),
+			.parent_context = estate->es_query_cxt,
+			.tuple_desc = ExecGetResultType(state->child),
+			.ncolumns = state->ncolumns,
+			.capacity = PG_BATCH_SIZE
+		});
 	layout.ncolumns = state->ncolumns;
 	layout.ntargets = state->ncolumns;
 	state->output = pg_batch_output_create(estate->es_query_cxt,
@@ -76,21 +82,21 @@ pack_begin(CustomScanState *node, EState *estate, int eflags)
 static PgBatch *
 fill_batch(BatchPackState *state)
 {
-	int			limit = state->request->max_rows > 0 ?
-		Min(state->request->max_rows, PG_BATCH_SIZE) : PG_BATCH_SIZE;
+	int			limit = state->request->spec.max_rows > 0 ?
+		Min(state->request->spec.max_rows, PG_BATCH_SIZE) : PG_BATCH_SIZE;
 	int			nrows = 0;
 
-	pg_batch_datum_buffer_reset(state->buffer);
-	while (nrows < limit && !pg_batch_datum_buffer_is_full(state->buffer))
+	pg_batch_builder_reset(state->builder);
+	while (nrows < limit && !pg_batch_builder_is_full(state->builder))
 	{
 		TupleTableSlot *slot = ExecProcNode(state->child);
 
 		if (TupIsNull(slot))
 			break;
-		pg_batch_datum_buffer_append_slot(state->buffer, slot);
+		pg_batch_builder_append_slot(state->builder, slot);
 		nrows++;
 	}
-	return pg_batch_datum_buffer_finish(state->buffer, InvalidOid);
+	return pg_batch_builder_finish(state->builder, InvalidOid);
 }
 
 static TupleTableSlot *
@@ -100,29 +106,29 @@ pack_exec(CustomScanState *node)
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	PgBatch *batch;
 
-	if (!state->request->return_batch)
+	if (state->request->spec.output_mode == PG_BATCH_OUTPUT_ROWS)
 		elog(ERROR, "pg_batch pack requires a batch-aware parent");
 	if (state->published)
 	{
-		if (!pg_batch_api->batch_finished(
+		if (!pg_batch_api->finished(
 				pg_batch_output_binding(state->output)))
 			elog(ERROR, "pg_batch parent requested a new packed batch too early");
-		pg_batch_output_reset(state->output);
+		pg_batch_output_clear(state->output);
 		state->published = false;
 	}
 	batch = fill_batch(state);
 	if (batch == NULL)
 	{
-		pg_batch_output_reset(state->output);
+		pg_batch_output_clear(state->output);
 		return ExecClearTuple(slot);
 	}
 
 	pg_batch_output_publish(state->output, batch);
 	state->published = true;
 	state->packed_batches++;
-	state->packed_rows += batch->nrows;
+	state->packed_rows += batch->selection.nrows;
 	if (node->ss.ps.instrument != NULL)
-		node->ss.ps.instrument->tuplecount += batch->nrows - 1;
+		node->ss.ps.instrument->tuplecount += batch->selection.nrows - 1;
 	return slot;
 }
 
@@ -131,8 +137,8 @@ pack_end(CustomScanState *node)
 {
 	BatchPackState *state = (BatchPackState *) node;
 
-	pg_batch_output_reset(state->output);
-	pg_batch_datum_buffer_reset(state->buffer);
+	pg_batch_output_clear(state->output);
+	pg_batch_builder_reset(state->builder);
 	state->published = false;
 	pg_batch_end_children(node);
 }
@@ -142,8 +148,8 @@ pack_rescan(CustomScanState *node)
 {
 	BatchPackState *state = (BatchPackState *) node;
 
-	pg_batch_output_reset(state->output);
-	pg_batch_datum_buffer_reset(state->buffer);
+	pg_batch_output_clear(state->output);
+	pg_batch_builder_reset(state->builder);
 	state->published = false;
 	state->packed_batches = 0;
 	state->packed_rows = 0;

@@ -36,14 +36,14 @@ _PG_init(void)
 							 "Decode Arrow columns only when a consumer requests them.",
 							 NULL, &pg_batch_fdw_column_pruning, true,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
-	pg_batch_fdw_api->register_provider(&pg_batch_fdw_provider_ops);
+	pg_batch_fdw_api->register_source(&pg_batch_fdw_source_ops);
 }
 
 void
 _PG_fini(void)
 {
 	if (pg_batch_fdw_api != NULL)
-		pg_batch_fdw_api->unregister_provider(PG_BATCH_FDW_PROVIDER_NAME);
+		pg_batch_fdw_api->unregister_source(PG_BATCH_FDW_SOURCE_NAME);
 }
 
 Datum

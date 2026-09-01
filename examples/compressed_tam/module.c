@@ -34,13 +34,13 @@ _PG_init(void)
 							 NULL, &pg_batch_tam_scan_mode,
 							 PG_BATCH_TAM_BATCH, pg_batch_tam_scan_modes,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
-	pg_batch_tam_api->register_provider(&pg_batch_tam_provider_ops);
+	pg_batch_tam_api->register_source(&pg_batch_tam_source_ops);
 }
 
 void
 _PG_fini(void)
 {
 	if (pg_batch_tam_api != NULL)
-		pg_batch_tam_api->unregister_provider(PG_BATCH_TAM_PROVIDER_NAME);
+		pg_batch_tam_api->unregister_source(PG_BATCH_TAM_SOURCE_NAME);
 	pg_batch_compressed_fini();
 }

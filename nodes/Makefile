@@ -2,6 +2,7 @@ MODULE_big = pg_batch
 OBJS = \
 	module.o \
 	planner.o \
+	plan_data.o \
 	slot.o \
 	executor.o \
 	scan.o \

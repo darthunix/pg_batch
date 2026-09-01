@@ -18,6 +18,7 @@
 #include "runtime.h"
 #include "kernels.h"
 #include "expr.h"
+#include "plan.h"
 
 #define PG_BATCH_SIZE 64
 #define PG_BATCH_ALL_ROWS UINT64_MAX
@@ -26,6 +27,68 @@
 #define PG_BATCH_PROJECT_PHASE PG_BATCH_COLUMN_PROJECT
 
 typedef PgBatchColumnPhase PgBatchMaterializePhase;
+
+typedef enum PgBatchHeapScanMode
+{
+	PG_BATCH_HEAP_SEQ,
+	PG_BATCH_HEAP_BITMAP
+} PgBatchHeapScanMode;
+
+#define PG_BATCH_PLAN_DATA_VERSION 1
+
+typedef struct PgBatchScanPlanData
+{
+	List	   *source_attnums;
+	int			nfilter_columns;
+	PgBatchHeapScanMode heap_scan_mode;
+	const char *source_name;
+	Node	   *source_private;
+	int			nsource_exprs;
+	List	   *batch_recheck_flags;
+	List	   *exact_filter_columns;
+} PgBatchScanPlanData;
+
+typedef struct PgBatchFilterPlanData
+{
+	List	   *source_attnums;
+	int			nfilter_columns;
+	List	   *project_columns;
+} PgBatchFilterPlanData;
+
+typedef struct PgBatchProjectPlanData
+{
+	const char *child_name;
+	List	   *input_columns;
+} PgBatchProjectPlanData;
+
+typedef struct PgBatchHashPlanData
+{
+	List	   *outer_columns;
+	List	   *inner_columns;
+	List	   *outer_keys;
+	List	   *inner_keys;
+	int			planned_partitions;
+	const char *outer_name;
+	const char *inner_name;
+} PgBatchHashPlanData;
+
+typedef struct PgBatchAggPlanData
+{
+	const char *child_name;
+	List	   *kinds;
+	List	   *columns;
+} PgBatchAggPlanData;
+
+extern void pg_batch_read_scan_plan(const CustomScan *scan,
+	PgBatchScanPlanData *result);
+extern void pg_batch_read_filter_plan(const CustomScan *scan,
+	PgBatchFilterPlanData *result);
+extern void pg_batch_read_project_plan(const CustomScan *scan,
+	PgBatchProjectPlanData *result);
+extern void pg_batch_read_hash_plan(const CustomScan *scan,
+	PgBatchHashPlanData *result);
+extern void pg_batch_read_agg_plan(const CustomScan *scan,
+	PgBatchAggPlanData *result);
 
 typedef struct PgBatchColumn
 {
@@ -76,12 +139,6 @@ typedef enum PgBatchAggKind
 	PG_BATCH_AGG_MAX_INT4
 } PgBatchAggKind;
 
-typedef enum PgBatchHeapScanMode
-{
-	PG_BATCH_HEAP_SEQ,
-	PG_BATCH_HEAP_BITMAP
-} PgBatchHeapScanMode;
-
 extern bool pg_batch_enable;
 extern bool pg_batch_enable_hash_join;
 extern bool pg_batch_enable_simd;
@@ -124,23 +181,19 @@ pg_batch_get_batch(TupleTableSlot *slot)
 }
 
 static inline void
-pg_batch_finish_batch(TupleTableSlot *slot)
+pg_batch_slot_finish(TupleTableSlot *slot)
 {
 	PgBatchBinding *binding = pg_batch_api->find_binding(slot);
 
 	if (binding == NULL)
 		elog(ERROR, "pg_batch expected a batch binding");
-	pg_batch_api->finish_batch(binding);
+	pg_batch_api->finish(binding);
 }
 
 extern void pg_batch_configure_slot(PgBatchSlot *bslot,
 									TupleDesc source_desc,
 									List *source_attnums,
 									int nfilter_columns);
-extern void pg_batch_set_request(TupleTableSlot *slot,
-								 const Bitmapset *filter_columns,
-								 const Bitmapset *project_columns,
-								 bool return_batch);
 extern void pg_batch_load_batch(PgBatchSlot *bslot, Buffer buffer,
 								BlockNumber block, Oid table_oid,
 								const OffsetNumber *item_offsets, int nrows);
@@ -155,7 +208,7 @@ extern TupleTableSlot *pg_batch_hash_join_output_slot(CustomScanState *state);
 extern Node *pg_batch_create_agg_state(CustomScan *cscan);
 
 /* Return the batch-producing slot of a pg_batch plan node. */
-extern TupleTableSlot *pg_batch_result_batch_slot(PlanState *planstate);
+extern TupleTableSlot *pg_batch_result_slot(PlanState *planstate);
 
 extern void pg_batch_init_children(CustomScanState *css, EState *estate,
 								   int eflags);
@@ -165,8 +218,8 @@ extern void pg_batch_rescan_children(CustomScanState *css);
 extern void pg_batch_planner_init(void);
 extern void pg_batch_planner_fini(void);
 
-extern const PgBatchProducerOps pg_batch_producer_ops;
+extern const PgBatchNodeOps pg_batch_node_ops;
 
-#define PG_BATCH_PRODUCER_NAME "pg_batch_nodes"
+#define PG_BATCH_NODE_NAME "pg_batch_nodes"
 
 #endif							/* PG_BATCH_H */

@@ -1,7 +1,7 @@
 MODULE_big = pg_batch_tam
 OBJS = \
 	module.o \
-	provider.o \
+	source.o \
 	compressed.o \
 	tableam.o
 

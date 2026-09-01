@@ -19,6 +19,7 @@
 #include "source.h"
 #include "arrow.h"
 #include "kernels.h"
+#include "plan.h"
 #include "runtime.h"
 #include "expr.h"
 
@@ -32,7 +33,9 @@ typedef struct ArrowIpcOutputStream ArrowIpcOutputStream;
 typedef struct ArrowIpcWriter ArrowIpcWriter;
 typedef struct ArrowSchema ArrowSchema;
 
-#define PG_BATCH_FDW_PROVIDER_NAME "pg_batch_arrow_fdw"
+#define PG_BATCH_FDW_SOURCE_NAME "pg_batch_arrow_fdw"
+#define PG_BATCH_FDW_SOURCE_PLAN_KIND "PgBatchArrowSource"
+#define PG_BATCH_FDW_SOURCE_PLAN_VERSION 1
 #define PG_BATCH_FDW_BATCH_SIZE 64
 
 typedef struct PgBatchFdwStats
@@ -53,7 +56,7 @@ typedef struct PgBatchFdwScan PgBatchFdwScan;
 extern bool pg_batch_fdw_pushdown;
 extern bool pg_batch_fdw_column_pruning;
 extern const PgBatchAPI *pg_batch_fdw_api;
-extern const PgBatchProviderOps pg_batch_fdw_provider_ops;
+extern const PgBatchSourceOps pg_batch_fdw_source_ops;
 
 extern FdwRoutine *pg_batch_fdw_routine(void);
 extern char *pg_batch_fdw_get_filename(Oid relation_oid);

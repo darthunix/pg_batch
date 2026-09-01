@@ -12,6 +12,7 @@
 
 #include "access/tupdesc.h"
 
+#include "batch.h"
 #include "vector.h"
 
 #define PG_BATCH_SPILL_BLOCK_ROWS 64
@@ -57,8 +58,8 @@ extern PgBatchSpillSet *pg_batch_spill_create(
 
 /* Append selected vector rows to one partition, densely and in row order. */
 extern void pg_batch_spill_write(PgBatchSpillSet *set, int partition,
-	const PgBatchInt4Vector *columns, int nrows,
-	const uint64 *selection, const uint32 *hashes);
+	const PgBatchInt4Vector *columns, const PgBatchSelection *selection,
+	const uint32 *hashes);
 
 /* Append an already dense block; values use value_stride rows per column. */
 extern void pg_batch_spill_write_dense(PgBatchSpillSet *set, int partition,

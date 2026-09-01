@@ -18,6 +18,7 @@ struct PgBatchExpr
 {
 	MemoryContext context;
 	int			column;
+	Bitmapset  *column_mask;
 	ExprState  *scalar_value;
 	ArithmeticStep *steps;
 	int			nsteps;
@@ -298,6 +299,8 @@ compile_expression(Node *node, bool filter, PlanState *parent,
 	else if (!pg_batch_expr_supports_int4(node, 0))
 		elog(ERROR, "pg_batch received an unsupported int4 expression");
 	compile_value(expr, value, parent, resolve_var, resolve_context);
+	if (expr->column >= 0)
+		expr->column_mask = bms_make_singleton(expr->column);
 	return expr;
 }
 
@@ -339,26 +342,26 @@ ensure_capacity(PgBatchExpr *expr)
 {
 	MemoryContext oldcontext;
 
-	if (expr->capacity >= expr->batch->nrows)
+	if (expr->capacity >= expr->batch->selection.nrows)
 		return;
 	oldcontext = MemoryContextSwitchTo(expr->context);
 	for (int i = 0; i < (expr->nsteps > 1 ? 2 : 1); i++)
 	{
 		if (expr->values[i] == NULL)
 		{
-			expr->values[i] = palloc_array(int32, expr->batch->nrows);
-			expr->validity[i] = palloc0((expr->batch->nrows + 7) / 8);
+			expr->values[i] = palloc_array(int32, expr->batch->selection.nrows);
+			expr->validity[i] = palloc0((expr->batch->selection.nrows + 7) / 8);
 		}
 		else
 		{
 			expr->values[i] = repalloc_array(expr->values[i], int32,
-										expr->batch->nrows);
+										expr->batch->selection.nrows);
 			expr->validity[i] = repalloc0(expr->validity[i],
 									   (expr->capacity + 7) / 8,
-									   (expr->batch->nrows + 7) / 8);
+									   (expr->batch->selection.nrows + 7) / 8);
 		}
 	}
-	expr->capacity = expr->batch->nrows;
+	expr->capacity = expr->batch->selection.nrows;
 	MemoryContextSwitchTo(oldcontext);
 }
 
@@ -369,7 +372,7 @@ build_scalar_vector(PgBatchExpr *expr, PgBatchInt4Vector *result)
 	Datum		value;
 
 	ensure_capacity(expr);
-	MemSet(expr->validity[0], 0, (expr->batch->nrows + 7) / 8);
+	MemSet(expr->validity[0], 0, (expr->batch->selection.nrows + 7) / 8);
 	if (!pg_batch_has_rows(expr->batch))
 	{
 		pg_batch_int4_vector_init_packed(result, expr->values[0],
@@ -379,7 +382,7 @@ build_scalar_vector(PgBatchExpr *expr, PgBatchInt4Vector *result)
 	value = ExecEvalExpr(expr->scalar_value, expr->econtext, &isnull);
 	if (!isnull)
 	{
-		for (int word = 0; word < expr->batch->nwords; word++)
+		for (int word = 0; word < expr->batch->selection.nwords; word++)
 		{
 			uint64		rows = pg_batch_selection_word(expr->batch, word);
 
@@ -415,8 +418,10 @@ pg_batch_expr_get_int4(PgBatchExpr *expr, PgBatchInt4Vector *result)
 		build_scalar_vector(expr, &input);
 	else
 	{
-		pg_batch_get_int4_vector(expr->batch, expr->column,
-							 expr->batch->selection, expr->phase, &input);
+		PgBatchColumnAccess access;
+		pg_batch_column_access_init(&access, expr->batch, expr->column_mask,
+			&expr->batch->selection, expr->phase);
+		pg_batch_column_get_int4(&access, expr->column, &input);
 	}
 
 	if (expr->nsteps > 0)
@@ -432,11 +437,10 @@ pg_batch_expr_get_int4(PgBatchExpr *expr, PgBatchInt4Vector *result)
 									&scalar_isnull);
 		if (scalar_isnull)
 			MemSet(expr->validity[buffer], 0,
-				   (expr->batch->nrows + 7) / 8);
+				   (expr->batch->selection.nrows + 7) / 8);
 		else
-			pg_batch_int4_arithmetic_scalar(&input, expr->batch->nrows,
-										 expr->batch->nwords,
-										 expr->batch->selection, step->op,
+			pg_batch_int4_arithmetic_scalar(&input, &expr->batch->selection,
+										 step->op,
 										 DatumGetInt32(scalar_value),
 										 step->scalar_on_left,
 										 expr->values[buffer],
@@ -465,11 +469,10 @@ pg_batch_expr_apply_filter(PgBatchExpr *expr, bool enable_simd)
 	scalar = ExecEvalExpr(expr->comparison_scalar, expr->econtext, &isnull);
 	if (isnull)
 	{
-		MemSet(expr->batch->selection, 0,
-			   sizeof(uint64) * expr->batch->nwords);
+		MemSet(expr->batch->selection.words, 0,
+			   sizeof(uint64) * expr->batch->selection.nwords);
 		return;
 	}
-	pg_batch_filter_int4(&value, expr->batch->nrows, expr->batch->nwords,
-						 expr->batch->selection, expr->comparison,
+	pg_batch_filter_int4(&value, &expr->batch->selection, expr->comparison,
 						 DatumGetInt32(scalar), enable_simd);
 }

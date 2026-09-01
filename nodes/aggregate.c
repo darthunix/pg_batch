@@ -153,32 +153,35 @@ agg_begin(CustomScanState *node, EState *estate, int eflags)
 {
 	BatchAggState *state = (BatchAggState *) node;
 	CustomScan *cscan = castNode(CustomScan, node->ss.ps.plan);
-	const char *producer_name = strVal(linitial(cscan->custom_private));
-	List	   *specs = lsecond_node(List, cscan->custom_private);
-	ListCell   *lc;
+	PgBatchAggPlanData data;
+	const char *node_name;
+	ListCell   *kind_cell;
+	ListCell   *column_cell;
 	PgBatchBinding *request_binding;
 	const		PgBatchRequest *request;
 	Bitmapset  *project_columns;
 	int			i = 0;
 
+	pg_batch_read_agg_plan(cscan, &data);
+	node_name = data.child_name;
+
 	pg_batch_init_children(node, estate, eflags);
 	state->child = linitial(node->custom_ps);
 	state->input = pg_batch_input_create(estate->es_query_cxt,
-		state->child, producer_name);
+		state->child, node_name);
 	request_binding = pg_batch_input_request_binding(state->input);
 	request = pg_batch_api->get_request(request_binding);
-	project_columns = bms_copy(request->project_columns);
+	project_columns = bms_copy(request->spec.project_columns);
 
-	state->naggs = list_length(specs);
+	state->naggs = list_length(data.kinds);
 	state->aggs = palloc0_array(AggSpec, state->naggs);
 	state->inputs = palloc0_array(AggInput, state->naggs);
-	foreach(lc, specs)
+	forboth(kind_cell, data.kinds, column_cell, data.columns)
 	{
-		List	   *item = lfirst_node(List, lc);
 		AggSpec    *agg = &state->aggs[i++];
-		int			column = intVal(lsecond(item));
+		int			column = lfirst_int(column_cell);
 
-		agg->kind = intVal(linitial(item));
+		agg->kind = lfirst_int(kind_cell);
 		agg->input = -1;
 		if (agg->kind == PG_BATCH_AGG_COUNT_STAR)
 		{
@@ -217,8 +220,14 @@ agg_begin(CustomScanState *node, EState *estate, int eflags)
 		else
 			state->inputs[agg->input].flags |= aggregate_flag(agg->kind);
 	}
-	pg_batch_api->set_request(request_binding, request->filter_columns,
-						 project_columns, true, PG_BATCH_SIZE);
+	pg_batch_api->set_request(request_binding,
+		&(PgBatchRequestSpec) {
+			.struct_size = sizeof(PgBatchRequestSpec),
+			.filter_columns = request->spec.filter_columns,
+			.project_columns = project_columns,
+			.output_mode = PG_BATCH_OUTPUT_BATCH,
+			.max_rows = PG_BATCH_SIZE
+		});
 	bms_free(project_columns);
 	if (state->grouped)
 	{
@@ -369,11 +378,12 @@ load_group_vectors(BatchAggState *state, PgBatch *batch)
 	for (int inputno = 0; inputno < state->ninputs; inputno++)
 	{
 		AggInput   *input = &state->inputs[inputno];
+		PgBatchColumnAccess access;
 
-		pg_batch_prepare_columns(batch, input->column_mask,
-			batch->selection, PG_BATCH_PROJECT_PHASE);
-		pg_batch_get_int4_vector(batch, input->column, batch->selection,
-			PG_BATCH_PROJECT_PHASE, &state->batch_vectors[inputno]);
+		pg_batch_column_access_init(&access, batch, input->column_mask,
+			&batch->selection, PG_BATCH_PROJECT_PHASE);
+		pg_batch_column_get_int4(&access, input->column,
+			&state->batch_vectors[inputno]);
 	}
 }
 
@@ -407,11 +417,11 @@ advance_grouped_batch(BatchAggState *state, PgBatch *batch)
 	uint64		rows;
 	const PgBatchInt4Vector *key;
 
-	if (batch->nwords != 1 || batch->nrows > PG_BATCH_SIZE)
+	if (batch->selection.nwords != 1 || batch->selection.nrows > PG_BATCH_SIZE)
 		elog(ERROR, "pg_batch grouped aggregate requires batches of at most 64 rows");
 	load_group_vectors(state, batch);
 	key = &state->batch_vectors[state->group_input];
-	rows = batch->selection[0];
+	rows = batch->selection.words[0];
 	while (rows != 0)
 	{
 		int			row = pg_rightmost_one_pos64(rows);
@@ -443,9 +453,14 @@ advance_grouped_batch(BatchAggState *state, PgBatch *batch)
 	for (int partition = 0; partition < 32; partition++)
 	{
 		if (partition_rows[partition] != 0)
+		{
+			PgBatchSelection selected = {
+				batch->selection.nrows, 1, &partition_rows[partition]
+			};
+
 			pg_batch_spill_write(state->initial_spill, partition,
-				state->batch_vectors, batch->nrows,
-				&partition_rows[partition], state->hashes);
+				state->batch_vectors, &selected, state->hashes);
+		}
 	}
 }
 
@@ -459,15 +474,15 @@ advance_aggregates(BatchAggState *state,
 	for (int i = 0; i < state->ninputs; i++)
 	{
 		AggInput   *input = &state->inputs[i];
+		PgBatchColumnAccess access;
 		PgBatchInt4Vector column;
 		PgBatchInt4Reduction partial;
 
-		pg_batch_prepare_columns(batch, input->column_mask,
-								 batch->selection, PG_BATCH_PROJECT_PHASE);
-		pg_batch_get_int4_vector(batch, input->column, batch->selection,
-								 PG_BATCH_PROJECT_PHASE, &column);
-		pg_batch_reduce_int4(&column, batch->nrows, batch->nwords,
-							 batch->selection, input->flags, &partial);
+		pg_batch_column_access_init(&access, batch, input->column_mask,
+			&batch->selection, PG_BATCH_PROJECT_PHASE);
+		pg_batch_column_get_int4(&access, input->column, &column);
+		pg_batch_reduce_int4(&column, &batch->selection, input->flags,
+			&partial);
 		merge_reduction(input, &partial);
 	}
 }
@@ -571,9 +586,14 @@ repartition_spill(BatchAggState *state, SpillWork *work)
 		for (int partition = 0; partition < npartitions; partition++)
 		{
 			if (partition_rows[partition] != 0)
+			{
+				PgBatchSelection selected = {
+					block.nrows, 1, &partition_rows[partition]
+				};
+
 				pg_batch_spill_write(child, partition,
-					state->spill_vectors, block.nrows,
-					&partition_rows[partition], block.hashes);
+					state->spill_vectors, &selected, block.hashes);
+			}
 		}
 	}
 	pg_batch_spill_reader_close(reader);
@@ -680,7 +700,7 @@ agg_exec_grouped(BatchAggState *state)
 	{
 		for (;;)
 		{
-			PgBatchInputBatch input;
+			PgBatchInputResult input;
 			int			selected;
 
 			if (!pg_batch_input_next(state->input, &input))
@@ -719,7 +739,7 @@ agg_exec(CustomScanState *node)
 		return ExecClearTuple(result);
 	for (;;)
 	{
-		PgBatchInputBatch input;
+		PgBatchInputResult input;
 		PgBatch *batch;
 		int			selected;
 

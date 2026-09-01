@@ -4,18 +4,6 @@
 
 #include "runtime.h"
 
-const PgBatchNativeType pg_batch_int4_vector_type = {
-	.name = PG_BATCH_INT4_VECTOR_INTERFACE_NAME,
-	.abi_version = PG_BATCH_INT4_VECTOR_INTERFACE_VERSION,
-	.min_size = PG_BATCH_INT4_VECTOR_INTERFACE_MIN_SIZE,
-};
-
-const PgBatchNativeType pg_batch_arrow_type = {
-	.name = PG_BATCH_ARROW_INTERFACE_NAME,
-	.abi_version = PG_BATCH_ARROW_INTERFACE_VERSION,
-	.min_size = PG_BATCH_ARROW_INTERFACE_MIN_SIZE,
-};
-
 typedef struct NativeCacheEntry
 {
 	const PgBatchOps *ops;
@@ -87,77 +75,18 @@ pg_batch_get_native_interface(PgBatch *batch, const PgBatchNativeType *type)
 void
 pg_batch_materialize_columns(PgBatch *batch,
 							 const Bitmapset *columns,
-							 const uint64 *selected_rows,
+							 const PgBatchSelection *selected_rows,
 							 PgBatchColumnPhase phase)
 {
+	PgBatchColumnAccess access;
 	int			column = -1;
 
+	pg_batch_column_access_init(&access, batch, columns, selected_rows, phase);
 	while (columns != NULL &&
 		   (column = bms_next_member(columns, column)) >= 0)
 	{
 		PgBatchDatumVector ignored;
 
-		pg_batch_get_datum_column(batch, column, selected_rows, phase,
-							  &ignored);
-	}
-}
-
-bool
-pg_batch_get_arrow_column(PgBatch *batch, int column,
-						  PgBatchArrowView *result)
-{
-	const PgBatchArrowInterface *arrow;
-
-	arrow = (const PgBatchArrowInterface *) pg_batch_get_native_interface(
-		batch, &pg_batch_arrow_type);
-	if (arrow == NULL)
-		return false;
-	*result = (PgBatchArrowView) PG_BATCH_STRUCT_INITIALIZER(PgBatchArrowView);
-	arrow->get_column(batch, column, result);
-	if (result->struct_size < PG_BATCH_ARROW_VIEW_MIN_SIZE ||
-		result->array == NULL || result->schema == NULL)
-		elog(ERROR, "pg_batch source returned an incompatible Arrow view");
-	return true;
-}
-
-void
-pg_batch_get_int4_vector(PgBatch *batch, int column,
-						 const uint64 *selected_rows,
-						 PgBatchColumnPhase phase,
-						 PgBatchInt4Vector *result)
-{
-	const PgBatchInt4VectorInterface *native = NULL;
-	PgBatchArrowView arrow;
-
-	native = (const PgBatchInt4VectorInterface *)
-		pg_batch_get_native_interface(batch, &pg_batch_int4_vector_type);
-	if (native != NULL)
-	{
-		*result = (PgBatchInt4Vector) {0};
-		result->struct_size = sizeof(*result);
-		if (native->get_column(batch, column, result))
-		{
-			if (result->struct_size < PG_BATCH_INT4_VECTOR_MIN_SIZE)
-				elog(ERROR, "pg_batch source returned an incompatible int4 vector");
-			return;
-		}
-	}
-
-	if (pg_batch_get_arrow_column(batch, column, &arrow))
-	{
-		const struct ArrowArray *array = arrow.array;
-
-		if (strcmp(arrow.schema->format, "i") != 0)
-			elog(ERROR, "pg_batch int4 kernel received a non-int4 Arrow column");
-		pg_batch_int4_vector_init_packed(result, array->buffers[1],
-			array->null_count == 0 ? NULL : array->buffers[0], array->offset);
-	}
-	else
-	{
-		PgBatchDatumVector datum;
-
-		pg_batch_get_datum_column(batch, column, selected_rows, phase, &datum);
-		pg_batch_int4_vector_init_datum(result, datum.values, datum.isnull,
-								 datum.valid_rows, datum.nwords);
+		pg_batch_column_get_datum(&access, column, &ignored);
 	}
 }

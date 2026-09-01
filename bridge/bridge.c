@@ -31,76 +31,75 @@ struct PgBatchBinding
 	PgBatchRequest request;
 	PgBatchLayout *layout;
 	const PgBatchConsumerOps *consumer_ops;
-	const char *provider_name;
-	void	   *provider_state;
+	void	   *consumer_state;
+	const char *source_name;
+	void	   *source_state;
 	PgBatch *batch;
 	const PgBatchOps *validated_ops;
 	bool		request_sealed;
-	bool		batch_finished;
+	bool		finished;
 };
 
 static HTAB *slot_entries;
-static List *providers;
-static List *producers;
+static List *sources;
+static List *nodes;
 static uint64 next_batch_generation = 1;
 
-static void register_provider(const PgBatchProviderOps *provider);
-static void unregister_provider(const char *provider_name);
-static const PgBatchProviderOps *find_provider(Relation relation);
-static const PgBatchProviderOps *get_provider(const char *provider_name);
-static void register_producer(const PgBatchProducerOps *producer);
-static void unregister_producer(const char *producer_name);
-static const PgBatchProducerOps *find_producer(const Path *path);
-static const PgBatchProducerOps *get_producer(const char *producer_name);
+static void register_source(const PgBatchSourceOps *source);
+static void unregister_source(const char *source_name);
+static const PgBatchSourceOps *find_source(Relation relation);
+static const PgBatchSourceOps *get_source(const char *source_name);
+static void register_node(const PgBatchNodeOps *node);
+static void unregister_node(const char *node_name);
+static const PgBatchNodeOps *find_node(const Path *path);
+static const PgBatchNodeOps *get_node(const char *node_name);
 static PgBatchBinding *find_binding(TupleTableSlot *slot);
 static PgBatchBinding *attach_slot(TupleTableSlot *slot,
 									 const PgBatchLayout *layout,
-									 const PgBatchConsumerOps *consumer_ops);
+									 const PgBatchConsumerOps *consumer_ops,
+									 void *consumer_state);
 static void set_request(PgBatchBinding *binding,
-						const Bitmapset *filter_columns,
-						const Bitmapset *project_columns,
-						bool return_batch,
-						int max_rows);
-static void set_provider(PgBatchBinding *binding,
-						 const char *provider_name,
-						 void *provider_state);
-static void *get_bound_provider(PgBatchBinding *binding,
-								const char **provider_name);
+						const PgBatchRequestSpec *spec);
+static void set_source(PgBatchBinding *binding,
+						 const char *source_name,
+						 void *source_state);
+static void *get_bound_source(PgBatchBinding *binding,
+								const char **source_name);
 static const PgBatchRequest *seal_request(PgBatchBinding *binding);
 static const PgBatchRequest *get_request(PgBatchBinding *binding);
 static void publish_batch(PgBatchBinding *binding,
 						  PgBatch *batch);
 static PgBatch *get_batch(PgBatchBinding *binding);
 static void select_row(PgBatchBinding *binding, int row);
-static void finish_batch(PgBatchBinding *binding);
-static bool batch_finished(PgBatchBinding *binding);
-static void clear_batch(PgBatchBinding *binding);
+static void finish(PgBatchBinding *binding);
+static bool finished(PgBatchBinding *binding);
+static void clear(PgBatchBinding *binding);
 static void detach_binding(PgBatchBinding *binding);
 static void get_row_view(PgBatchBinding *binding, PgBatchRowView *result);
 
 static const PgBatchAPI bridge_api = {
 	PG_BATCH_ABI_INITIALIZER(PG_BATCH_API_ABI_VERSION, PgBatchAPI),
-	.register_provider = register_provider,
-	.unregister_provider = unregister_provider,
-	.find_provider = find_provider,
-	.get_provider = get_provider,
-	.register_producer = register_producer,
-	.unregister_producer = unregister_producer,
-	.find_producer = find_producer,
-	.get_producer = get_producer,
+	.register_source = register_source,
+	.unregister_source = unregister_source,
+	.find_source = find_source,
+	.get_source = get_source,
+	.register_node = register_node,
+	.unregister_node = unregister_node,
+	.find_node = find_node,
+	.get_node = get_node,
 	.find_binding = find_binding,
 	.attach_slot = attach_slot,
 	.set_request = set_request,
-	.set_provider = set_provider,
-	.get_bound_provider = get_bound_provider,
+	.set_source = set_source,
+	.get_bound_source = get_bound_source,
 	.seal_request = seal_request,
 	.get_request = get_request,
 	.publish_batch = publish_batch,
 	.get_batch = get_batch,
 	.select_row = select_row,
-	.finish_batch = finish_batch,
-	.batch_finished = batch_finished,
-	.clear_batch = clear_batch,
+	.finish = finish,
+	.finished = finished,
+	.clear = clear,
 	.detach_binding = detach_binding,
 	.get_row_view = get_row_view,
 };
@@ -131,7 +130,7 @@ release_batch(PgBatchBinding *binding)
 	if (batch == NULL)
 		return;
 	binding->batch = NULL;
-	binding->batch_finished = false;
+	binding->finished = false;
 	batch->generation = 0;
 	if (PG_BATCH_ABI_HAS_FIELD(batch->ops, PgBatchOps, release) &&
 		batch->ops->release != NULL)
@@ -174,152 +173,161 @@ validate_abi(uint32 version, Size struct_size, uint32 expected_version,
 }
 
 static void
-register_provider(const PgBatchProviderOps *provider)
+register_source(const PgBatchSourceOps *source)
 {
 	MemoryContext oldcontext;
 
-	if (provider == NULL)
-		elog(ERROR, "pg_batch cannot register a null provider");
-	validate_abi(provider->abi_version, provider->struct_size,
-				 PG_BATCH_PROVIDER_OPS_ABI_VERSION,
-				 "provider", PG_BATCH_PROVIDER_OPS_MIN_SIZE);
-	if (provider->provider_name == NULL || provider->provider_name[0] == '\0')
-		elog(ERROR, "pg_batch provider must have a name");
-	if (provider->supports_relation == NULL || provider->plan_scan == NULL ||
-		provider->begin_scan == NULL || provider->rescan == NULL ||
-		provider->end_scan == NULL)
-		elog(ERROR, "pg_batch provider \"%s\" has incomplete operations",
-			 provider->provider_name);
-	foreach_ptr(const PgBatchProviderOps, existing, providers)
+	if (source == NULL)
+		elog(ERROR, "pg_batch cannot register a null source");
+	validate_abi(source->abi_version, source->struct_size,
+				 PG_BATCH_SOURCE_OPS_ABI_VERSION,
+				 "source", PG_BATCH_SOURCE_OPS_MIN_SIZE);
+	if (source->source_name == NULL || source->source_name[0] == '\0')
+		elog(ERROR, "pg_batch source must have a name");
+	if (source->delivery != PG_BATCH_SOURCE_SLOT &&
+		source->delivery != PG_BATCH_SOURCE_PULL)
+		elog(ERROR, "pg_batch source \"%s\" has an invalid delivery mode",
+			 source->source_name);
+	if (source->supports_relation == NULL || source->plan_scan == NULL ||
+		source->begin_scan == NULL || source->rescan == NULL ||
+		source->end_scan == NULL)
+		elog(ERROR, "pg_batch source \"%s\" has incomplete operations",
+			 source->source_name);
+	if (source->delivery == PG_BATCH_SOURCE_PULL &&
+		(!PG_BATCH_ABI_HAS_FIELD(source, PgBatchSourceOps, next_batch) ||
+		 source->next_batch == NULL))
+		elog(ERROR, "pg_batch pull source \"%s\" has no next operation",
+			 source->source_name);
+	foreach_ptr(const PgBatchSourceOps, existing, sources)
 	{
-		if (strcmp(existing->provider_name, provider->provider_name) == 0)
+		if (strcmp(existing->source_name, source->source_name) == 0)
 		{
-			if (existing == provider)
+			if (existing == source)
 				return;
-			elog(ERROR, "pg_batch provider \"%s\" is already registered",
-				 provider->provider_name);
+			elog(ERROR, "pg_batch source \"%s\" is already registered",
+				 source->source_name);
 		}
 	}
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-	providers = lappend(providers, (void *) provider);
+	sources = lappend(sources, (void *) source);
 	MemoryContextSwitchTo(oldcontext);
 }
 
 static void
-unregister_provider(const char *provider_name)
+unregister_source(const char *source_name)
 {
 	ListCell   *lc;
 
-	foreach(lc, providers)
+	foreach(lc, sources)
 	{
-		const PgBatchProviderOps *provider = lfirst(lc);
+		const PgBatchSourceOps *source = lfirst(lc);
 
-		if (strcmp(provider->provider_name, provider_name) == 0)
+		if (strcmp(source->source_name, source_name) == 0)
 		{
-			providers = foreach_delete_current(providers, lc);
+			sources = foreach_delete_current(sources, lc);
 			return;
 		}
 	}
 }
 
-static const PgBatchProviderOps *
-find_provider(Relation relation)
+static const PgBatchSourceOps *
+find_source(Relation relation)
 {
-	const PgBatchProviderOps *result = NULL;
+	const PgBatchSourceOps *result = NULL;
 
-	foreach_ptr(const PgBatchProviderOps, provider, providers)
+	foreach_ptr(const PgBatchSourceOps, source, sources)
 	{
-		if (!provider->supports_relation(relation))
+		if (!source->supports_relation(relation))
 			continue;
 		if (result != NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
-					 errmsg("multiple pg_batch providers support relation \"%s\"",
+					 errmsg("multiple pg_batch sources support relation \"%s\"",
 							RelationGetRelationName(relation)),
-					 errdetail("Providers \"%s\" and \"%s\" both claimed the relation.",
-							   result->provider_name, provider->provider_name)));
-		result = provider;
+					 errdetail("Sources \"%s\" and \"%s\" both claimed the relation.",
+							   result->source_name, source->source_name)));
+		result = source;
 	}
 	return result;
 }
 
-static const PgBatchProviderOps *
-get_provider(const char *provider_name)
+static const PgBatchSourceOps *
+get_source(const char *source_name)
 {
-	foreach_ptr(const PgBatchProviderOps, provider, providers)
+	foreach_ptr(const PgBatchSourceOps, source, sources)
 	{
-		if (strcmp(provider->provider_name, provider_name) == 0)
-			return provider;
+		if (strcmp(source->source_name, source_name) == 0)
+			return source;
 	}
 	return NULL;
 }
 
 static void
-register_producer(const PgBatchProducerOps *producer)
+register_node(const PgBatchNodeOps *node)
 {
 	MemoryContext oldcontext;
 
-	if (producer == NULL)
-		elog(ERROR, "pg_batch cannot register a null producer");
-	validate_abi(producer->abi_version, producer->struct_size,
-				 PG_BATCH_PRODUCER_OPS_ABI_VERSION,
-				 "producer", PG_BATCH_PRODUCER_OPS_MIN_SIZE);
-	if (producer->producer_name == NULL || producer->producer_name[0] == '\0' ||
-		producer->supports_path == NULL ||
-		producer->get_layout == NULL ||
-		producer->get_request_binding == NULL)
-		elog(ERROR, "invalid pg_batch producer registration");
-	foreach_ptr(const PgBatchProducerOps, existing, producers)
+	if (node == NULL)
+		elog(ERROR, "pg_batch cannot register a null node");
+	validate_abi(node->abi_version, node->struct_size,
+				 PG_BATCH_NODE_OPS_ABI_VERSION,
+				 "node", PG_BATCH_NODE_OPS_MIN_SIZE);
+	if (node->node_name == NULL || node->node_name[0] == '\0' ||
+		node->supports_path == NULL ||
+		node->get_layout == NULL ||
+		node->get_request_binding == NULL)
+		elog(ERROR, "invalid pg_batch node registration");
+	foreach_ptr(const PgBatchNodeOps, existing, nodes)
 	{
-		if (strcmp(existing->producer_name, producer->producer_name) == 0)
+		if (strcmp(existing->node_name, node->node_name) == 0)
 		{
-			if (existing == producer)
+			if (existing == node)
 				return;
-			elog(ERROR, "pg_batch producer \"%s\" is already registered",
-				 producer->producer_name);
+			elog(ERROR, "pg_batch node \"%s\" is already registered",
+				 node->node_name);
 		}
 	}
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-	producers = lappend(producers, (void *) producer);
+	nodes = lappend(nodes, (void *) node);
 	MemoryContextSwitchTo(oldcontext);
 }
 
 static void
-unregister_producer(const char *producer_name)
+unregister_node(const char *node_name)
 {
-	const PgBatchProducerOps *producer = get_producer(producer_name);
+	const PgBatchNodeOps *node = get_node(node_name);
 
-	if (producer != NULL)
-		producers = list_delete_ptr(producers, (void *) producer);
+	if (node != NULL)
+		nodes = list_delete_ptr(nodes, (void *) node);
 }
 
-static const PgBatchProducerOps *
-find_producer(const Path *path)
+static const PgBatchNodeOps *
+find_node(const Path *path)
 {
-	const PgBatchProducerOps *result = NULL;
+	const PgBatchNodeOps *result = NULL;
 
-	foreach_ptr(const PgBatchProducerOps, producer, producers)
+	foreach_ptr(const PgBatchNodeOps, node, nodes)
 	{
-		if (!producer->supports_path(path))
+		if (!node->supports_path(path))
 			continue;
 		if (result != NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
-					 errmsg("multiple pg_batch producers support one plan path"),
-					 errdetail("Producers \"%s\" and \"%s\" both claimed the path.",
-							   result->producer_name, producer->producer_name)));
-		result = producer;
+					 errmsg("multiple pg_batch nodes support one plan path"),
+					 errdetail("Nodes \"%s\" and \"%s\" both claimed the path.",
+							   result->node_name, node->node_name)));
+		result = node;
 	}
 	return result;
 }
 
-static const PgBatchProducerOps *
-get_producer(const char *producer_name)
+static const PgBatchNodeOps *
+get_node(const char *node_name)
 {
-	foreach_ptr(const PgBatchProducerOps, producer, producers)
+	foreach_ptr(const PgBatchNodeOps, node, nodes)
 	{
-		if (strcmp(producer->producer_name, producer_name) == 0)
-			return producer;
+		if (strcmp(node->node_name, node_name) == 0)
+			return node;
 	}
 	return NULL;
 }
@@ -339,7 +347,8 @@ find_binding(TupleTableSlot *slot)
 static PgBatchBinding *
 attach_slot(TupleTableSlot *slot,
 			const PgBatchLayout *layout,
-			const PgBatchConsumerOps *consumer_ops)
+			const PgBatchConsumerOps *consumer_ops,
+			void *consumer_state)
 {
 	SlotKey		key = {slot};
 	SlotEntry  *entry;
@@ -380,7 +389,9 @@ attach_slot(TupleTableSlot *slot,
 	binding->layout->target_columns = target_columns;
 	binding->request.struct_size = sizeof(PgBatchRequest);
 	binding->request.layout = binding->layout;
+	binding->request.spec.struct_size = sizeof(PgBatchRequestSpec);
 	binding->consumer_ops = consumer_ops;
+	binding->consumer_state = consumer_state;
 	binding->cleanup.func = slot_reset;
 	binding->cleanup.arg = binding;
 	MemoryContextRegisterResetCallback(slot->tts_mcxt,
@@ -390,60 +401,61 @@ attach_slot(TupleTableSlot *slot,
 
 static void
 set_request(PgBatchBinding *binding,
-			const Bitmapset *filter_columns,
-			const Bitmapset *project_columns,
-			bool return_batch,
-			int max_rows)
+			const PgBatchRequestSpec *spec)
 {
 	MemoryContext oldcontext;
 	Bitmapset  *new_filter;
 	Bitmapset  *new_survivor;
 	int			column;
 
-	if (binding == NULL)
-		elog(ERROR, "pg_batch cannot configure a null binding");
+	if (binding == NULL || spec == NULL ||
+		spec->struct_size < PG_BATCH_REQUEST_SPEC_MIN_SIZE)
+		elog(ERROR, "pg_batch received an invalid request specification");
 	if (binding->request_sealed)
 		elog(ERROR, "pg_batch request is already sealed");
-	if (max_rows < 0)
+	if (spec->max_rows < 0)
 		elog(ERROR, "pg_batch maximum row count cannot be negative");
-	column = bms_next_member(filter_columns,
+	if (spec->output_mode != PG_BATCH_OUTPUT_ROWS &&
+		spec->output_mode != PG_BATCH_OUTPUT_BATCH)
+		elog(ERROR, "pg_batch request has an invalid output mode");
+	column = bms_next_member(spec->filter_columns,
 							 binding->layout->ncolumns - 1);
 	if (column >= 0)
 		elog(ERROR, "pg_batch filter column %d is out of range", column);
-	column = bms_next_member(project_columns,
+	column = bms_next_member(spec->project_columns,
 							 binding->layout->ncolumns - 1);
 	if (column >= 0)
 		elog(ERROR, "pg_batch project column %d is out of range", column);
 
 	oldcontext = MemoryContextSwitchTo(binding->owner);
-	new_filter = bms_copy(filter_columns);
-	new_survivor = bms_copy(project_columns);
+	new_filter = bms_copy(spec->filter_columns);
+	new_survivor = bms_copy(spec->project_columns);
 	MemoryContextSwitchTo(oldcontext);
 
-	bms_free((Bitmapset *) binding->request.filter_columns);
-	bms_free((Bitmapset *) binding->request.project_columns);
-	binding->request.filter_columns = new_filter;
-	binding->request.project_columns = new_survivor;
-	binding->request.return_batch = return_batch;
-	binding->request.max_rows = max_rows;
+	bms_free((Bitmapset *) binding->request.spec.filter_columns);
+	bms_free((Bitmapset *) binding->request.spec.project_columns);
+	binding->request.spec.filter_columns = new_filter;
+	binding->request.spec.project_columns = new_survivor;
+	binding->request.spec.output_mode = spec->output_mode;
+	binding->request.spec.max_rows = spec->max_rows;
 }
 
 static void
-set_provider(PgBatchBinding *binding,
-			 const char *provider_name, void *provider_state)
+set_source(PgBatchBinding *binding,
+			 const char *source_name, void *source_state)
 {
 	if (binding == NULL)
 		elog(ERROR, "pg_batch cannot configure a null binding");
-	binding->provider_name = provider_name;
-	binding->provider_state = provider_state;
+	binding->source_name = source_name;
+	binding->source_state = source_state;
 }
 
 static void *
-get_bound_provider(PgBatchBinding *binding, const char **provider_name)
+get_bound_source(PgBatchBinding *binding, const char **source_name)
 {
-	if (provider_name != NULL)
-		*provider_name = binding == NULL ? NULL : binding->provider_name;
-	return binding == NULL ? NULL : binding->provider_state;
+	if (source_name != NULL)
+		*source_name = binding == NULL ? NULL : binding->source_name;
+	return binding == NULL ? NULL : binding->source_state;
 }
 
 static const PgBatchRequest *
@@ -473,17 +485,17 @@ publish_batch(PgBatchBinding *binding,
 		elog(ERROR, "pg_batch source published an invalid batch");
 	validate_abi(batch->abi_version, batch->struct_size,
 				 PG_BATCH_ABI_VERSION, "batch", PG_BATCH_MIN_SIZE);
-	if (batch->ops == NULL || batch->selection == NULL ||
-		batch->nrows <= 0 || batch->nwords != (batch->nrows + 63) / 64)
+	if (batch->ops == NULL || batch->selection.words == NULL ||
+		batch->selection.nrows <= 0 || batch->selection.nwords != (batch->selection.nrows + 63) / 64)
 		elog(ERROR, "pg_batch source published an invalid batch");
 	if (batch->generation != 0)
 		elog(ERROR, "pg_batch source published a batch that is already active");
-	if (binding->request.max_rows > 0 &&
-		batch->nrows > binding->request.max_rows)
+	if (binding->request.spec.max_rows > 0 &&
+		batch->selection.nrows > binding->request.spec.max_rows)
 		elog(ERROR, "pg_batch source exceeded the requested batch size");
-	if (batch->nrows % 64 != 0 &&
-		(batch->selection[batch->nwords - 1] &
-		 (UINT64_MAX << (batch->nrows % 64))) != 0)
+	if (batch->selection.nrows % 64 != 0 &&
+		(batch->selection.words[batch->selection.nwords - 1] &
+		 (UINT64_MAX << (batch->selection.nrows % 64))) != 0)
 		elog(ERROR, "pg_batch source selected rows beyond the end of its batch");
 	if (batch->ops != binding->validated_ops)
 	{
@@ -505,8 +517,9 @@ publish_batch(PgBatchBinding *binding,
 	}
 	batch->generation = generation;
 	binding->batch = batch;
-	binding->batch_finished = false;
-	binding->consumer_ops->accept_batch(binding->slot, batch);
+	binding->finished = false;
+	binding->consumer_ops->accept_batch(binding->consumer_state,
+		binding->slot, batch);
 }
 
 static PgBatch *
@@ -518,32 +531,33 @@ get_batch(PgBatchBinding *binding)
 static void
 select_row(PgBatchBinding *binding, int row)
 {
-	if (binding->batch == NULL || binding->batch_finished ||
-		row < 0 || row >= binding->batch->nrows ||
-		!pg_batch_row_selected(binding->batch, row))
+	if (binding->batch == NULL || binding->finished ||
+		row < 0 || row >= binding->batch->selection.nrows ||
+		!pg_batch_selection_contains(&binding->batch->selection, row))
 		elog(ERROR, "pg_batch cannot select row %d", row);
-	binding->consumer_ops->select_row(binding->slot, binding->batch, row);
+	binding->consumer_ops->select_row(binding->consumer_state, binding->slot,
+		binding->batch, row);
 }
 
 static void
-finish_batch(PgBatchBinding *binding)
+finish(PgBatchBinding *binding)
 {
-	if (binding->batch == NULL || binding->batch_finished)
+	if (binding->batch == NULL || binding->finished)
 		elog(ERROR, "pg_batch cannot finish a slot without an active batch");
 	binding->batch->generation = 0;
-	binding->batch_finished = true;
+	binding->finished = true;
 }
 
 static bool
-batch_finished(PgBatchBinding *binding)
+finished(PgBatchBinding *binding)
 {
 	if (binding == NULL)
 		elog(ERROR, "pg_batch cannot inspect a null binding");
-	return binding->batch == NULL || binding->batch_finished;
+	return binding->batch == NULL || binding->finished;
 }
 
 static void
-clear_batch(PgBatchBinding *binding)
+clear(PgBatchBinding *binding)
 {
 	if (binding != NULL)
 		release_batch(binding);
@@ -560,8 +574,8 @@ detach_binding(PgBatchBinding *binding)
 	release_batch(binding);
 	MemoryContextUnregisterResetCallback(binding->owner,
 										 &binding->cleanup);
-	bms_free((Bitmapset *) binding->request.filter_columns);
-	bms_free((Bitmapset *) binding->request.project_columns);
+	bms_free((Bitmapset *) binding->request.spec.filter_columns);
+	bms_free((Bitmapset *) binding->request.spec.project_columns);
 	if (binding->layout->target_columns != NULL)
 		pfree((void *) binding->layout->target_columns);
 	pfree(binding->layout);
@@ -574,11 +588,12 @@ get_row_view(PgBatchBinding *binding, PgBatchRowView *result)
 {
 	if (result == NULL || result->struct_size < PG_BATCH_ROW_VIEW_MIN_SIZE)
 		elog(ERROR, "pg_batch received an incompatible row view");
-	if (binding == NULL || binding->batch == NULL || binding->batch_finished)
+	if (binding == NULL || binding->batch == NULL || binding->finished)
 		elog(ERROR, "pg_batch binding has no active batch");
 	result->slot = binding->slot;
 	result->batch = binding->batch;
 	result->generation = binding->batch->generation;
+	result->consumer_state = binding->consumer_state;
 	result->select_row = binding->consumer_ops->select_row;
 }
 

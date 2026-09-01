@@ -24,10 +24,9 @@ typedef enum PgBatchInt4Layout
 /*
  * Borrowed view of one int4 column.
  *
- * Datum values are indexed from zero. available marks rows that the source
- * has materialized. Packed values and validity are indexed from offset;
- * validity uses one for a non-NULL row and may be NULL when all rows are
- * valid.
+ * Datum values are indexed from zero. Packed values and validity are indexed
+ * from offset. Validity uses one for a non-NULL row and may be NULL when all
+ * rows are valid.
  */
 typedef struct PgBatchInt4Vector
 {
@@ -39,8 +38,6 @@ typedef struct PgBatchInt4Vector
 		{
 			const Datum *values;
 			const bool *isnull;
-			const uint64 *available;
-			int			nwords;
 		} datum;
 		struct
 		{
@@ -79,15 +76,12 @@ typedef struct PgBatchInt4VectorInterface
 /* Initialize a borrowed view over PostgreSQL Datum arrays. */
 static inline void
 pg_batch_int4_vector_init_datum(PgBatchInt4Vector *column,
-								const Datum *values, const bool *isnull,
-								const uint64 *available, int nwords)
+								const Datum *values, const bool *isnull)
 {
 	column->struct_size = sizeof(*column);
 	column->layout = PG_BATCH_INT4_DATUM;
 	column->data.datum.values = values;
 	column->data.datum.isnull = isnull;
-	column->data.datum.available = available;
-	column->data.datum.nwords = nwords;
 }
 
 /* Initialize a borrowed view over packed int32 values and validity bits. */
@@ -104,19 +98,8 @@ pg_batch_int4_vector_init_packed(PgBatchInt4Vector *column,
 }
 
 static inline bool
-pg_batch_int4_row_available(const PgBatchInt4Vector *column, int row)
-{
-	if (column->layout == PG_BATCH_INT4_PACKED)
-		return true;
-	return row / 64 < column->data.datum.nwords &&
-		(column->data.datum.available[row / 64] &
-		 (UINT64CONST(1) << (row % 64))) != 0;
-}
-
-static inline bool
 pg_batch_int4_row_is_null(const PgBatchInt4Vector *column, int row)
 {
-	Assert(pg_batch_int4_row_available(column, row));
 	if (column->layout == PG_BATCH_INT4_DATUM)
 		return column->data.datum.isnull[row];
 	if (column->data.packed.validity == NULL)
@@ -129,7 +112,6 @@ pg_batch_int4_row_is_null(const PgBatchInt4Vector *column, int row)
 static inline int32
 pg_batch_int4_row_value(const PgBatchInt4Vector *column, int row)
 {
-	Assert(pg_batch_int4_row_available(column, row));
 	if (column->layout == PG_BATCH_INT4_DATUM)
 		return DatumGetInt32(column->data.datum.values[row]);
 	return column->data.packed.values[column->data.packed.offset + row];

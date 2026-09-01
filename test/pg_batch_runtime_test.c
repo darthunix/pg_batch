@@ -8,10 +8,11 @@
 #include "utils/memutils.h"
 
 #include "runtime.h"
+#include "plan.h"
 
 PG_MODULE_MAGIC;
 
-PG_FUNCTION_INFO_V1(pg_batch_datum_buffer_test);
+PG_FUNCTION_INFO_V1(pg_batch_builder_test);
 PG_FUNCTION_INFO_V1(pg_batch_input_api_test);
 PG_FUNCTION_INFO_V1(pg_batch_output_test);
 PG_FUNCTION_INFO_V1(pg_batch_output_double_finish_test);
@@ -20,17 +21,48 @@ PG_FUNCTION_INFO_V1(pg_batch_output_over_max_test);
 PG_FUNCTION_INFO_V1(pg_batch_output_select_after_finish_test);
 PG_FUNCTION_INFO_V1(pg_batch_binding_request_test);
 PG_FUNCTION_INFO_V1(pg_batch_request_after_seal_test);
+PG_FUNCTION_INFO_V1(pg_batch_plan_data_test);
+
+Datum
+pg_batch_plan_data_test(PG_FUNCTION_ARGS)
+{
+	PgBatchPlanWriter *writer = pg_batch_plan_writer_create("test", 1);
+	PgBatchPlanReader *reader;
+	List	   *data;
+	List	   *items = list_make3_int(2, 5, 9);
+	Bitmapset  *columns = bms_add_member(NULL, 7);
+	Bitmapset  *decoded;
+	bool		ok;
+
+	columns = bms_add_member(columns, 11);
+	pg_batch_plan_write_int_list(writer, "items", items);
+	pg_batch_plan_write_string(writer, "name", "example");
+	pg_batch_plan_write_int(writer, "count", 42);
+	pg_batch_plan_write_bitmap(writer, "columns", columns);
+	data = copyObject(pg_batch_plan_writer_finish(writer));
+	reader = pg_batch_plan_reader_create(data, "test", 1);
+	ok = pg_batch_plan_read_int(reader, "count") == 42 &&
+		strcmp(pg_batch_plan_read_string(reader, "name"), "example") == 0 &&
+		equal(pg_batch_plan_read_int_list(reader, "items"), items);
+	decoded = pg_batch_plan_read_bitmap(reader, "columns");
+	ok = ok && bms_equal(decoded, columns);
+	pg_batch_plan_reader_finish(reader);
+	PG_RETURN_BOOL(ok);
+}
 
 static void
-accept_nothing(TupleTableSlot *slot, PgBatch *batch)
+accept_nothing(void *consumer_state, TupleTableSlot *slot, PgBatch *batch)
 {
+	(void) consumer_state;
 	(void) slot;
 	(void) batch;
 }
 
 static void
-select_nothing(TupleTableSlot *slot, PgBatch *batch, int row)
+select_nothing(void *consumer_state, TupleTableSlot *slot,
+			   PgBatch *batch, int row)
 {
+	(void) consumer_state;
 	(void) slot;
 	(void) batch;
 	(void) row;
@@ -51,16 +83,16 @@ pg_batch_input_api_test(PG_FUNCTION_ARGS)
 		pg_batch_input_create;
 	PgBatchBinding *(*volatile binding_fn) (PgBatchInput *) =
 		pg_batch_input_request_binding;
-	void		(*volatile request_fn) (PgBatchInput *, const Bitmapset *,
-		const Bitmapset *, bool, int) = pg_batch_input_set_request;
-	bool		(*volatile next_fn) (PgBatchInput *, PgBatchInputBatch *) =
+	void		(*volatile request_fn) (PgBatchInput *,
+		const PgBatchRequestSpec *) = pg_batch_input_set_request;
+	bool		(*volatile next_fn) (PgBatchInput *, PgBatchInputResult *) =
 		pg_batch_input_next;
 	TupleTableSlot *(*volatile select_fn) (PgBatchInput *, int) =
 		pg_batch_input_select_row;
 	const PgBatchRowView *(*volatile view_fn) (PgBatchInput *) =
 		pg_batch_input_row_view;
 	bool		(*volatile finished_fn) (PgBatchInput *) =
-		pg_batch_input_batch_finished;
+		pg_batch_input_finished;
 	void		(*volatile finish_fn) (PgBatchInput *) = pg_batch_input_finish;
 	void		(*volatile rescan_fn) (PgBatchInput *) = pg_batch_input_rescan;
 
@@ -105,14 +137,14 @@ store_test_row(TupleTableSlot *slot, int row)
 }
 
 Datum
-pg_batch_datum_buffer_test(PG_FUNCTION_ARGS)
+pg_batch_builder_test(PG_FUNCTION_ARGS)
 {
 	MemoryContext test_context;
 	MemoryContext row_context;
 	MemoryContext oldcontext;
 	TupleDesc	desc;
 	TupleTableSlot *slot;
-	PgBatchDatumBuffer *buffer;
+	PgBatchBuilder *buffer;
 	PgBatch *batch;
 	PgBatchDatumVector numbers =
 		PG_BATCH_STRUCT_INITIALIZER(PgBatchDatumVector);
@@ -133,7 +165,14 @@ pg_batch_datum_buffer_test(PG_FUNCTION_ARGS)
 	TupleDescFinalize(desc);
 	desc = BlessTupleDesc(desc);
 	slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
-	buffer = pg_batch_datum_buffer_create(test_context, desc, 2, 70);
+	buffer = pg_batch_builder_create(
+		&(PgBatchBuilderConfig) {
+			.struct_size = sizeof(PgBatchBuilderConfig),
+			.parent_context = test_context,
+			.tuple_desc = desc,
+			.ncolumns = 2,
+			.capacity = 70
+		});
 
 	for (int row = 0; row < 70; row++)
 	{
@@ -142,28 +181,24 @@ pg_batch_datum_buffer_test(PG_FUNCTION_ARGS)
 		row_oldcontext = MemoryContextSwitchTo(row_context);
 		store_test_row(slot, row);
 		MemoryContextSwitchTo(row_oldcontext);
-		pg_batch_datum_buffer_append_slot(buffer, slot);
+		pg_batch_builder_append_slot(buffer, slot);
 		MemoryContextReset(row_context);
 	}
-	batch = pg_batch_datum_buffer_finish(buffer, InvalidOid);
-	if (batch == NULL || batch->nrows != 70 || batch->nwords != 2 ||
-		batch->selection[0] != UINT64_MAX ||
-		batch->selection[1] != UINT64CONST(0x3f) ||
-		!pg_batch_datum_buffer_is_full(buffer))
+	batch = pg_batch_builder_finish(buffer, InvalidOid);
+	if (batch == NULL || batch->selection.nrows != 70 || batch->selection.nwords != 2 ||
+		batch->selection.words[0] != UINT64_MAX ||
+		batch->selection.words[1] != UINT64CONST(0x3f) ||
+		!pg_batch_builder_is_full(buffer))
 		ok = false;
 	if (ok)
 	{
-		batch->ops->get_datum_column(batch, 0, batch->selection,
+		batch->ops->get_datum_column(batch, 0, &batch->selection,
 									PG_BATCH_COLUMN_FILTER,
 									&numbers);
-		batch->ops->get_datum_column(batch, 1, batch->selection,
+		batch->ops->get_datum_column(batch, 1, &batch->selection,
 									PG_BATCH_COLUMN_PROJECT,
 									&strings);
-		if (numbers.nwords != 2 || strings.nwords != 2 ||
-			numbers.valid_rows[0] != UINT64_MAX ||
-			numbers.valid_rows[1] != UINT64CONST(0x3f) ||
-			strings.valid_rows[0] != UINT64_MAX ||
-			strings.valid_rows[1] != UINT64CONST(0x3f))
+		if (numbers.nrows != 70 || strings.nrows != 70)
 			ok = false;
 	}
 	for (int row = 0; ok && row < 70; row++)
@@ -178,24 +213,26 @@ pg_batch_datum_buffer_test(PG_FUNCTION_ARGS)
 	if (ok)
 	{
 		uint64		keep[2] = {UINT64CONST(0x5), UINT64CONST(0x2)};
+		uint64		all[2] = {UINT64_MAX, UINT64_MAX};
+		PgBatchSelection keep_rows = {70, 2, keep};
+		PgBatchSelection all_rows = {70, 2, all};
 
-		pg_batch_intersect_selection(batch, keep);
-		pg_batch_intersect_selection(batch,
-			(uint64[2]) {UINT64_MAX, UINT64_MAX});
-		if (batch->selection[0] != keep[0] ||
-			batch->selection[1] != keep[1])
+		pg_batch_selection_intersect(&batch->selection, &keep_rows);
+		pg_batch_selection_intersect(&batch->selection, &all_rows);
+		if (batch->selection.words[0] != keep[0] ||
+			batch->selection.words[1] != keep[1])
 			ok = false;
 	}
 
-	pg_batch_datum_buffer_reset(buffer);
+	pg_batch_builder_reset(buffer);
 	for (int row = 0; row < 3; row++)
 	{
 		store_test_row(slot, row + 100);
-		pg_batch_datum_buffer_append_slot(buffer, slot);
+		pg_batch_builder_append_slot(buffer, slot);
 	}
-	batch = pg_batch_datum_buffer_finish(buffer, 42);
-	if (batch == NULL || batch->nrows != 3 || batch->nwords != 1 ||
-		batch->selection[0] != UINT64CONST(0x7) || batch->table_oid != 42)
+	batch = pg_batch_builder_finish(buffer, 42);
+	if (batch == NULL || batch->selection.nrows != 3 || batch->selection.nwords != 1 ||
+		batch->selection.words[0] != UINT64CONST(0x7) || batch->table_oid != 42)
 		ok = false;
 
 	ExecDropSingleTupleTableSlot(slot);
@@ -218,6 +255,13 @@ pg_batch_binding_request_test(PG_FUNCTION_ARGS)
 	int			target_columns[2] = {0, 2};
 	Bitmapset  *filters = bms_make_singleton(0);
 	Bitmapset  *projects = bms_make_singleton(2);
+	PgBatchRequestSpec spec = {
+		.struct_size = sizeof(PgBatchRequestSpec),
+		.filter_columns = filters,
+		.project_columns = projects,
+		.output_mode = PG_BATCH_OUTPUT_BATCH,
+		.max_rows = 17
+	};
 	bool		ok;
 
 	context = AllocSetContextCreate(CurrentMemoryContext,
@@ -232,18 +276,19 @@ pg_batch_binding_request_test(PG_FUNCTION_ARGS)
 	layout.ncolumns = 3;
 	layout.ntargets = 2;
 	layout.target_columns = target_columns;
-	binding = api->attach_slot(slot, &layout, &test_consumer_ops);
+	binding = api->attach_slot(slot, &layout, &test_consumer_ops, NULL);
 	/* The binding owns its copy of the target mapping. */
 	target_columns[1] = 1;
-	api->set_request(binding, filters, projects, true, 17);
+	api->set_request(binding, &spec);
 	request = api->seal_request(binding);
 	ok = binding == api->find_binding(slot) &&
 		request->struct_size >= PG_BATCH_REQUEST_MIN_SIZE &&
 		request->layout->ncolumns == 3 && request->layout->ntargets == 2 &&
 		pg_batch_layout_column(request->layout, 1) == 2 &&
-		request->return_batch && request->max_rows == 17 &&
-		bms_equal(request->filter_columns, filters) &&
-		bms_equal(request->project_columns, projects) &&
+		request->spec.output_mode == PG_BATCH_OUTPUT_BATCH &&
+		request->spec.max_rows == 17 &&
+		bms_equal(request->spec.filter_columns, filters) &&
+		bms_equal(request->spec.project_columns, projects) &&
 		api->get_batch(binding) == NULL;
 	bms_free(filters);
 	bms_free(projects);
@@ -268,9 +313,13 @@ pg_batch_request_after_seal_test(PG_FUNCTION_ARGS)
 	slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
 	layout.ncolumns = 1;
 	layout.ntargets = 1;
-	binding = api->attach_slot(slot, &layout, &test_consumer_ops);
+	binding = api->attach_slot(slot, &layout, &test_consumer_ops, NULL);
 	api->seal_request(binding);
-	api->set_request(binding, NULL, NULL, false, 0);
+	api->set_request(binding,
+		&(PgBatchRequestSpec) {
+			.struct_size = sizeof(PgBatchRequestSpec),
+			.output_mode = PG_BATCH_OUTPUT_ROWS
+		});
 	PG_RETURN_VOID();
 }
 
@@ -280,15 +329,17 @@ pg_batch_output_test(PG_FUNCTION_ARGS)
 	MemoryContext context;
 	MemoryContext oldcontext;
 	TupleDesc	desc;
+	TupleDesc	output_desc;
 	TupleTableSlot *input_slot;
 	TupleTableSlot *output_slot;
-	PgBatchDatumBuffer *buffer;
+	PgBatchBuilder *buffer;
 	PgBatchOutput *output;
 	PgBatchBinding *binding;
 	PgBatch *batch;
 	PgBatchRowView view = PG_BATCH_STRUCT_INITIALIZER(PgBatchRowView);
 	const PgBatchAPI *api = pg_batch_api_get();
 	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
+	int			target_columns[2] = {1, 0};
 	bool		ok = true;
 
 	context = AllocSetContextCreate(CurrentMemoryContext,
@@ -299,39 +350,57 @@ pg_batch_output_test(PG_FUNCTION_ARGS)
 	TupleDescInitEntry(desc, 2, "label", TEXTOID, -1, 0);
 	TupleDescFinalize(desc);
 	desc = BlessTupleDesc(desc);
+	output_desc = CreateTemplateTupleDesc(2);
+	TupleDescInitEntry(output_desc, 1, "label", TEXTOID, -1, 0);
+	TupleDescInitEntry(output_desc, 2, "number", INT4OID, -1, 0);
+	TupleDescFinalize(output_desc);
+	output_desc = BlessTupleDesc(output_desc);
 	input_slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
-	output_slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
-	buffer = pg_batch_datum_buffer_create(context, desc, 2, 3);
+	output_slot = MakeSingleTupleTableSlot(output_desc, &TTSOpsVirtual);
+	buffer = pg_batch_builder_create(
+		&(PgBatchBuilderConfig) {
+			.struct_size = sizeof(PgBatchBuilderConfig),
+			.parent_context = context,
+			.tuple_desc = desc,
+			.ncolumns = 2,
+			.capacity = 3
+		});
 	for (int row = 0; row < 3; row++)
 	{
 		store_test_row(input_slot, row);
-		pg_batch_datum_buffer_append_slot(buffer, input_slot);
+		pg_batch_builder_append_slot(buffer, input_slot);
 	}
-	batch = pg_batch_datum_buffer_finish(buffer, 42);
+	batch = pg_batch_builder_finish(buffer, 42);
 	layout.ncolumns = 2;
 	layout.ntargets = 2;
+	layout.target_columns = target_columns;
 	output = pg_batch_output_create(context, output_slot, &layout);
 	binding = pg_batch_output_binding(output);
-	pg_batch_output_set_request(output, NULL, NULL, false, 3);
+	pg_batch_output_set_request(output,
+		&(PgBatchRequestSpec) {
+			.struct_size = sizeof(PgBatchRequestSpec),
+			.output_mode = PG_BATCH_OUTPUT_ROWS,
+			.max_rows = 3
+		});
 	if (pg_batch_output_publish(output, batch) != output_slot ||
-		DatumGetInt32(output_slot->tts_values[0]) != 1 ||
-		!output_slot->tts_isnull[1])
+		!output_slot->tts_isnull[0] ||
+		DatumGetInt32(output_slot->tts_values[1]) != 1)
 		ok = false;
 	pg_batch_output_select(output, 2);
-	if (DatumGetInt32(output_slot->tts_values[0]) != 3 ||
-		output_slot->tts_isnull[1] ||
-		!text_matches(output_slot->tts_values[1], 2))
+	if (output_slot->tts_isnull[0] ||
+		!text_matches(output_slot->tts_values[0], 2) ||
+		DatumGetInt32(output_slot->tts_values[1]) != 3)
 		ok = false;
 	api->get_row_view(binding, &view);
 	pg_batch_row_view_select(&view, 1);
-	if (DatumGetInt32(output_slot->tts_values[0]) != 2 ||
-		output_slot->tts_isnull[1] ||
-		!text_matches(output_slot->tts_values[1], 1))
+	if (output_slot->tts_isnull[0] ||
+		!text_matches(output_slot->tts_values[0], 1) ||
+		DatumGetInt32(output_slot->tts_values[1]) != 2)
 		ok = false;
 	pg_batch_output_finish(output);
-	if (!api->batch_finished(binding))
+	if (!api->finished(binding))
 		ok = false;
-	pg_batch_output_reset(output);
+	pg_batch_output_clear(output);
 	if (api->get_batch(binding) != NULL || !TupIsNull(output_slot))
 		ok = false;
 	ExecDropSingleTupleTableSlot(output_slot);
@@ -349,7 +418,7 @@ pg_batch_output_over_max_test(PG_FUNCTION_ARGS)
 	TupleDesc	desc = CreateTemplateTupleDesc(2);
 	TupleTableSlot *input_slot;
 	TupleTableSlot *output_slot;
-	PgBatchDatumBuffer *buffer;
+	PgBatchBuilder *buffer;
 	PgBatchOutput *output;
 	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
 
@@ -359,18 +428,30 @@ pg_batch_output_over_max_test(PG_FUNCTION_ARGS)
 	desc = BlessTupleDesc(desc);
 	input_slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
 	output_slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
-	buffer = pg_batch_datum_buffer_create(context, desc, 2, 2);
+	buffer = pg_batch_builder_create(
+		&(PgBatchBuilderConfig) {
+			.struct_size = sizeof(PgBatchBuilderConfig),
+			.parent_context = context,
+			.tuple_desc = desc,
+			.ncolumns = 2,
+			.capacity = 2
+		});
 	for (int row = 0; row < 2; row++)
 	{
 		store_test_row(input_slot, row);
-		pg_batch_datum_buffer_append_slot(buffer, input_slot);
+		pg_batch_builder_append_slot(buffer, input_slot);
 	}
 	layout.ncolumns = 2;
 	layout.ntargets = 2;
 	output = pg_batch_output_create(context, output_slot, &layout);
-	pg_batch_output_set_request(output, NULL, NULL, true, 1);
+	pg_batch_output_set_request(output,
+		&(PgBatchRequestSpec) {
+			.struct_size = sizeof(PgBatchRequestSpec),
+			.output_mode = PG_BATCH_OUTPUT_BATCH,
+			.max_rows = 1
+		});
 	pg_batch_output_publish(output,
-		pg_batch_datum_buffer_finish(buffer, InvalidOid));
+		pg_batch_builder_finish(buffer, InvalidOid));
 	PG_RETURN_VOID();
 }
 
@@ -380,7 +461,7 @@ make_active_output(MemoryContext context)
 	TupleDesc	desc;
 	TupleTableSlot *input_slot;
 	TupleTableSlot *output_slot;
-	PgBatchDatumBuffer *buffer;
+	PgBatchBuilder *buffer;
 	PgBatchOutput *output;
 	PgBatch *batch;
 	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
@@ -392,10 +473,17 @@ make_active_output(MemoryContext context)
 	desc = BlessTupleDesc(desc);
 	input_slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
 	output_slot = MakeSingleTupleTableSlot(desc, &TTSOpsVirtual);
-	buffer = pg_batch_datum_buffer_create(context, desc, 2, 1);
+	buffer = pg_batch_builder_create(
+		&(PgBatchBuilderConfig) {
+			.struct_size = sizeof(PgBatchBuilderConfig),
+			.parent_context = context,
+			.tuple_desc = desc,
+			.ncolumns = 2,
+			.capacity = 1
+		});
 	store_test_row(input_slot, 0);
-	pg_batch_datum_buffer_append_slot(buffer, input_slot);
-	batch = pg_batch_datum_buffer_finish(buffer, InvalidOid);
+	pg_batch_builder_append_slot(buffer, input_slot);
+	batch = pg_batch_builder_finish(buffer, InvalidOid);
 	layout.ncolumns = 2;
 	layout.ntargets = 2;
 	output = pg_batch_output_create(context, output_slot, &layout);

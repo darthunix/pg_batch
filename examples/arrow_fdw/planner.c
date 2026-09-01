@@ -56,8 +56,18 @@ supports_relation(Relation relation)
 	return strcmp(wrapper->fdwname, "pg_batch_fdw") == 0;
 }
 
+static Node *
+make_source_plan(List *filter_exprs)
+{
+	PgBatchPlanWriter *writer = pg_batch_plan_writer_create(
+		PG_BATCH_FDW_SOURCE_PLAN_KIND, PG_BATCH_FDW_SOURCE_PLAN_VERSION);
+
+	pg_batch_plan_write_int_list(writer, "filter_exprs", filter_exprs);
+	return (Node *) pg_batch_plan_writer_finish(writer);
+}
+
 static void
-provider_plan_scan(const PgBatchSourcePlanRequest *request,
+source_plan_scan(const PgBatchSourcePlanRequest *request,
 				   PgBatchSourcePlanResult *result)
 {
 	List	   *source_exprs = NIL;
@@ -74,11 +84,11 @@ provider_plan_scan(const PgBatchSourcePlanRequest *request,
 	classify_quals(request->rel, request->clauses, request->restrictinfos,
 				   result->qual_support, &source_exprs, &specs);
 	result->source_exprs = source_exprs;
-	result->source_private = (Node *) specs;
+	result->source_private = make_source_plan(specs);
 }
 
 static void *
-provider_begin_scan(const PgBatchSourceExecRequest *request)
+source_begin_scan(const PgBatchSourceExecRequest *request)
 {
 	if (request->struct_size < PG_BATCH_SOURCE_EXEC_REQUEST_MIN_SIZE)
 		elog(ERROR, "pg_batch_fdw received an incompatible execution request");
@@ -92,40 +102,41 @@ provider_begin_scan(const PgBatchSourceExecRequest *request)
 }
 
 static PgBatch *
-provider_next_batch(void *provider_state)
+source_next_batch(void *source_state)
 {
-	return pg_batch_fdw_scan_next(provider_state);
+	return pg_batch_fdw_scan_next(source_state);
 }
 
 static void
-provider_rescan(void *provider_state)
+source_rescan(void *source_state)
 {
-	pg_batch_fdw_scan_rescan(provider_state);
+	pg_batch_fdw_scan_rescan(source_state);
 }
 
 static void
-provider_end_scan(void *provider_state)
+source_end_scan(void *source_state)
 {
-	pg_batch_fdw_scan_end(provider_state);
+	pg_batch_fdw_scan_end(source_state);
 }
 
 static void
-provider_explain(void *provider_state, ExplainState *es)
+source_explain(void *source_state, ExplainState *es)
 {
-	pg_batch_fdw_scan_explain(provider_state, es);
+	pg_batch_fdw_scan_explain(source_state, es);
 }
 
-const PgBatchProviderOps pg_batch_fdw_provider_ops = {
-	PG_BATCH_ABI_INITIALIZER(PG_BATCH_PROVIDER_OPS_ABI_VERSION,
-		PgBatchProviderOps),
-	.provider_name = PG_BATCH_FDW_PROVIDER_NAME,
+const PgBatchSourceOps pg_batch_fdw_source_ops = {
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_SOURCE_OPS_ABI_VERSION,
+		PgBatchSourceOps),
+	.source_name = PG_BATCH_FDW_SOURCE_NAME,
+	.delivery = PG_BATCH_SOURCE_PULL,
 	.supports_relation = supports_relation,
-	.plan_scan = provider_plan_scan,
-	.begin_scan = provider_begin_scan,
-	.next_batch = provider_next_batch,
-	.rescan = provider_rescan,
-	.end_scan = provider_end_scan,
-	.explain = provider_explain,
+	.plan_scan = source_plan_scan,
+	.begin_scan = source_begin_scan,
+	.next_batch = source_next_batch,
+	.rescan = source_rescan,
+	.end_scan = source_end_scan,
+	.explain = source_explain,
 };
 
 static void
@@ -183,7 +194,8 @@ get_foreign_plan(PlannerInfo *root, RelOptInfo *baserel,
 	list_free(clauses);
 	list_free(restrictinfos);
 	return make_foreignscan(tlist, local_exprs, baserel->relid,
-							source_exprs, specs, NIL, remote_exprs, outer_plan);
+							source_exprs, (List *) make_source_plan(specs), NIL,
+							remote_exprs, outer_plan);
 }
 
 FdwRoutine *

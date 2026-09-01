@@ -72,7 +72,7 @@ SELECT c1, c8 FROM pg_batch_fdw_foreign WHERE c2 < 100 OFFSET 17 LIMIT 65;
          ->  Custom Scan (PgBatchScan) on pg_batch_fdw_foreign
                Batch Size: 64
                Batch Source: pg_batch_arrow_fdw
-               Batch Provider: pg_batch_arrow_fdw
+               Batch Source: pg_batch_arrow_fdw
 (6 rows)
 
 SELECT NOT EXISTS (
@@ -243,7 +243,7 @@ WHERE c2 < 50 AND (c1 + c3) % 5 = 0;
    ->  Custom Scan (PgBatchScan) on pg_batch_fdw_foreign (actual rows=42.00 loops=1)
          Batch Size: 64
          Batch Source: pg_batch_arrow_fdw
-         Batch Provider: pg_batch_arrow_fdw
+         Batch Source: pg_batch_arrow_fdw
          Batches: 1
          Source Rows: 64
          Filter Datums: 0
@@ -282,7 +282,7 @@ WHERE c2 < 50;
          ->  Custom Scan (PgBatchScan) on pg_batch_fdw_foreign (actual rows=42.00 loops=1)
                Batch Size: 64
                Batch Source: pg_batch_arrow_fdw
-               Batch Provider: pg_batch_arrow_fdw
+               Batch Source: pg_batch_arrow_fdw
                Batches: 3
                Source Rows: 130
                Filter Datums: 0
@@ -322,7 +322,7 @@ WHERE c2 < 50;
          ->  Custom Scan (PgBatchScan) on pg_batch_fdw_foreign (actual rows=42.00 loops=1)
                Batch Size: 64
                Batch Source: pg_batch_arrow_fdw
-               Batch Provider: pg_batch_arrow_fdw
+               Batch Source: pg_batch_arrow_fdw
                Batches: 1
                Source Rows: 64
                Filter Datums: 0

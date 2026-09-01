@@ -9,6 +9,25 @@
 
 #include "internal.h"
 
+#define SOURCE_PLAN_KIND "PgBatchCompressedSource"
+#define SOURCE_QUAL_KIND "PgBatchCompressedSourceQual"
+#define SOURCE_PLAN_VERSION 1
+
+static List *
+make_qual_plan(int filter_exprno, AttrNumber attnum, PgBatchInt4Op op,
+			   int scalar_exprno, bool prunable)
+{
+	PgBatchPlanWriter *writer = pg_batch_plan_writer_create(
+		SOURCE_QUAL_KIND, SOURCE_PLAN_VERSION);
+
+	pg_batch_plan_write_int(writer, "filter_expr", filter_exprno);
+	pg_batch_plan_write_int(writer, "attribute", attnum);
+	pg_batch_plan_write_int(writer, "operator", op);
+	pg_batch_plan_write_int(writer, "scalar_expr", scalar_exprno);
+	pg_batch_plan_write_int(writer, "prunable", prunable);
+	return pg_batch_plan_writer_finish(writer);
+}
+
 static bool
 supports_relation(Relation relation)
 {
@@ -69,19 +88,23 @@ plan_scan(const PgBatchSourcePlanRequest *request,
 			scalar_exprno = exprno++;
 			source_exprs = lappend(source_exprs, copyObject(scalar));
 		}
-		specs = lappend(specs,
-			list_make5(makeInteger(filter_exprno), makeInteger(attnum),
-					   makeInteger(op), makeInteger(scalar_exprno),
-					   makeInteger(direct)));
+		specs = lappend(specs, make_qual_plan(filter_exprno, attnum, op,
+										 scalar_exprno, direct));
 		result->qual_support[qualno] = exact ?
 			PG_BATCH_QUAL_EXACT : PG_BATCH_QUAL_PRUNE_ONLY;
 next:
 		qualno++;
 	}
 done:
+	{
+		PgBatchPlanWriter *writer = pg_batch_plan_writer_create(
+			SOURCE_PLAN_KIND, SOURCE_PLAN_VERSION);
+
+		pg_batch_plan_write_int(writer, "mode", pg_batch_tam_scan_mode);
+		pg_batch_plan_write_list(writer, "quals", specs);
+		result->source_private = (Node *) pg_batch_plan_writer_finish(writer);
+	}
 	result->source_exprs = source_exprs;
-	result->source_private = (Node *)
-		list_make2(makeInteger(pg_batch_tam_scan_mode), specs);
 }
 
 static int
@@ -115,8 +138,9 @@ scan_cleanup(void *arg)
 static void *
 begin_scan(const PgBatchSourceExecRequest *request)
 {
-	List	   *private = castNode(List, request->source_private);
-	List	   *specs = lsecond_node(List, private);
+	PgBatchPlanReader *plan_reader;
+	List	   *specs;
+	SourceScanMode scan_mode;
 	MemoryContext context;
 	MemoryContext oldcontext;
 	CompressedScan *scan;
@@ -124,6 +148,12 @@ begin_scan(const PgBatchSourceExecRequest *request)
 
 	if (request->struct_size < PG_BATCH_SOURCE_EXEC_REQUEST_MIN_SIZE)
 		elog(ERROR, "pg_batch TAM received an incompatible execution request");
+	plan_reader = pg_batch_plan_reader_create(
+		castNode(List, request->source_private), SOURCE_PLAN_KIND,
+		SOURCE_PLAN_VERSION);
+	scan_mode = pg_batch_plan_read_int(plan_reader, "mode");
+	specs = pg_batch_plan_read_list(plan_reader, "quals");
+	pg_batch_plan_reader_finish(plan_reader);
 
 	context = AllocSetContextCreate(request->query_context,
 									"pg_batch TAM scan",
@@ -148,18 +178,23 @@ begin_scan(const PgBatchSourceExecRequest *request)
 	scan->source_attnums = request->source_attnums;
 	scan->ncolumns = request->nsource_columns;
 	scan->econtext = request->parent->ps_ExprContext;
-	scan->mode = intVal(linitial(private));
+	scan->mode = scan_mode;
 	scan->nquals = list_length(specs);
 	scan->quals = palloc0_array(SourceQual, scan->nquals);
 	foreach_ptr(List, spec, specs)
 	{
-		int			filter_exprno = intVal(linitial(spec));
-		int			scalar_exprno = intVal(lfourth(spec));
+		PgBatchPlanReader *qual_reader = pg_batch_plan_reader_create(spec,
+			SOURCE_QUAL_KIND, SOURCE_PLAN_VERSION);
+		int			filter_exprno = pg_batch_plan_read_int(qual_reader,
+			"filter_expr");
+		int			scalar_exprno;
 		SourceQual *qual = &scan->quals[qualno++];
 
-		qual->attnum = intVal(lsecond(spec));
-		qual->op = intVal(lthird(spec));
-		qual->prunable = intVal(list_nth(spec, 4)) != 0;
+		qual->attnum = pg_batch_plan_read_int(qual_reader, "attribute");
+		qual->op = pg_batch_plan_read_int(qual_reader, "operator");
+		scalar_exprno = pg_batch_plan_read_int(qual_reader, "scalar_expr");
+		qual->prunable = pg_batch_plan_read_int(qual_reader, "prunable") != 0;
+		pg_batch_plan_reader_finish(qual_reader);
 		if (filter_exprno >= 0)
 		{
 			qual->expr = pg_batch_expr_compile_filter(
@@ -177,9 +212,9 @@ begin_scan(const PgBatchSourceExecRequest *request)
 }
 
 static void
-rescan(void *provider_state)
+rescan(void *source_state)
 {
-	CompressedScan *scan = provider_state;
+	CompressedScan *scan = source_state;
 
 	scan->group_index = 0;
 	scan->batch_index = 0;
@@ -189,9 +224,9 @@ rescan(void *provider_state)
 }
 
 static void
-end_scan(void *provider_state)
+end_scan(void *source_state)
 {
-	CompressedScan *scan = provider_state;
+	CompressedScan *scan = source_state;
 	MemoryContext context = scan->context;
 
 	MemoryContextUnregisterResetCallback(context, &scan->cleanup);
@@ -200,9 +235,9 @@ end_scan(void *provider_state)
 }
 
 static void
-explain_scan(void *provider_state, ExplainState *es)
+explain_scan(void *source_state, ExplainState *es)
 {
-	CompressedScan *scan = provider_state;
+	CompressedScan *scan = source_state;
 	const char *mode = scan->mode == PG_BATCH_TAM_FILTER ? "filter" :
 		scan->mode == PG_BATCH_TAM_PRUNE ? "prune" : "batch";
 
@@ -232,10 +267,11 @@ explain_scan(void *provider_state, ExplainState *es)
 						   scan->stats.project_datums, es);
 }
 
-const PgBatchProviderOps pg_batch_tam_provider_ops = {
-	PG_BATCH_ABI_INITIALIZER(PG_BATCH_PROVIDER_OPS_ABI_VERSION,
-		PgBatchProviderOps),
-	.provider_name = PG_BATCH_TAM_PROVIDER_NAME,
+const PgBatchSourceOps pg_batch_tam_source_ops = {
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_SOURCE_OPS_ABI_VERSION,
+		PgBatchSourceOps),
+	.source_name = PG_BATCH_TAM_SOURCE_NAME,
+	.delivery = PG_BATCH_SOURCE_SLOT,
 	.supports_relation = supports_relation,
 	.plan_scan = plan_scan,
 	.begin_scan = begin_scan,

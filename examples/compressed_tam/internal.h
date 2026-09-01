@@ -9,10 +9,11 @@
 #include "source.h"
 #include "arrow.h"
 #include "kernels.h"
+#include "plan.h"
 #include "runtime.h"
 #include "expr.h"
 
-#define PG_BATCH_TAM_PROVIDER_NAME "pg_batch_compressed_tam"
+#define PG_BATCH_TAM_SOURCE_NAME "pg_batch_compressed_tam"
 #define PG_BATCH_SIZE 64
 #define PG_BATCH_ALL_ROWS UINT64_MAX
 
@@ -78,7 +79,7 @@ typedef struct CompressedScan
 extern bool pg_batch_tam_enable;
 extern int	pg_batch_tam_scan_mode;
 extern const PgBatchAPI *pg_batch_tam_api;
-extern const PgBatchProviderOps pg_batch_tam_provider_ops;
+extern const PgBatchSourceOps pg_batch_tam_source_ops;
 
 extern bool pg_batch_relation_uses_tableam(Relation relation);
 extern bool pg_batch_compressed_available(Relation relation);

@@ -11,7 +11,7 @@
 typedef struct BatchLimitState
 {
 	CustomScanState css;
-	PgBatchPass *pass;
+	PgBatchUnary *unary;
 	ExprState  *offset_expr;
 	ExprState  *count_expr;
 	int64		offset_remaining;
@@ -41,14 +41,14 @@ pg_batch_limit_request_binding(PlanState *planstate)
 	if (!IsA(planstate, CustomScanState))
 		elog(ERROR, "pg_batch_limit expected a custom plan state");
 	state = (BatchLimitState *) planstate;
-	if (state->css.methods != &limit_exec_methods || state->pass == NULL)
+	if (state->css.methods != &limit_exec_methods || state->unary == NULL)
 		elog(ERROR, "pg_batch_limit has no request binding");
-	return pg_batch_pass_binding(state->pass);
+	return pg_batch_unary_binding(state->unary);
 }
 
 static int
 trim_batch(void *private_data, PgBatchInput *input,
-		   PgBatchInputBatch *input_batch, int input_rows)
+		   PgBatchInputResult *input_batch, int input_rows)
 {
 	BatchLimitState *state = private_data;
 	PgBatch    *batch = input_batch->batch;
@@ -57,15 +57,15 @@ trim_batch(void *private_data, PgBatchInput *input,
 
 	(void) input;
 	(void) input_rows;
-	while ((row = pg_batch_next_selected(batch, row)) >= 0)
+	while ((row = pg_batch_selection_next(&batch->selection, row)) >= 0)
 	{
 		if (state->offset_remaining > 0)
 		{
-			pg_batch_clear_row(batch, row);
+			pg_batch_selection_clear(&batch->selection, row);
 			state->offset_remaining--;
 		}
 		else if (!state->no_count && state->count_remaining == 0)
-			pg_batch_clear_row(batch, row);
+			pg_batch_selection_clear(&batch->selection, row);
 		else if (!state->no_count)
 		{
 			state->count_remaining--;
@@ -75,44 +75,51 @@ trim_batch(void *private_data, PgBatchInput *input,
 			remaining++;
 	}
 	if (!state->no_count && state->count_remaining == 0)
-		pg_batch_pass_stop(state->pass);
+		pg_batch_unary_stop(state->unary);
 	return remaining;
 }
-
-static const PgBatchPassOps limit_ops = {
-	PG_BATCH_ABI_INITIALIZER(PG_BATCH_PASS_OPS_ABI_VERSION, PgBatchPassOps),
-	.process_batch = trim_batch,
-};
 
 static void
 limit_begin(CustomScanState *node, EState *estate, int eflags)
 {
 	BatchLimitState *state = (BatchLimitState *) node;
 	CustomScan *scan = castNode(CustomScan, node->ss.ps.plan);
-	const char *producer_name = strVal(linitial(scan->custom_private));
-	List	   *columns = lsecond_node(List, scan->custom_private);
+	PgBatchLimitPlanData data;
 	Bitmapset  *project_columns = NULL;
 	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
+	PgBatchUnaryConfig config;
 	int			position = 0;
 
 	if (eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("pg_batch_limit supports only forward scans")));
+					 errmsg("pg_batch_limit supports only forward scans")));
 	Assert(list_length(scan->custom_exprs) == 2);
-	layout.ncolumns = intVal(lthird(scan->custom_private));
-	layout.ntargets = list_length(columns);
+	pg_batch_limit_read_plan(scan, &data);
+	layout.ncolumns = data.column_count;
+	layout.ntargets = list_length(data.output_columns);
 	layout.target_columns = palloc_array(int, layout.ntargets);
-	foreach_int(column, columns)
+	foreach_int(column, data.output_columns)
 	{
 		if (column < 0 || column >= layout.ncolumns)
 			elog(ERROR, "pg_batch_limit received an invalid column layout");
 		project_columns = bms_add_member(project_columns, column);
 		((int *) layout.target_columns)[position++] = column;
 	}
-	state->pass = pg_batch_pass_create(estate->es_query_cxt, node, estate,
-		eflags, producer_name, &layout, NULL, project_columns, 0,
-		PG_BATCH_PASS_COPY_ROW, &limit_ops, state);
+	config = (PgBatchUnaryConfig) {
+		.struct_size = sizeof(config),
+		.parent_context = estate->es_query_cxt,
+		.node = node,
+		.estate = estate,
+		.eflags = eflags,
+		.child_name = data.node_name,
+		.layout = &layout,
+		.project_columns = project_columns,
+		.row_mode = PG_BATCH_UNARY_COPY_ROW,
+		.process = trim_batch,
+		.private_data = state,
+	};
+	state->unary = pg_batch_unary_create(&config);
 	bms_free(project_columns);
 	pfree((void *) layout.target_columns);
 	if (linitial(scan->custom_exprs) != NULL)
@@ -153,14 +160,14 @@ compute_limits(BatchLimitState *state)
 					 errmsg("LIMIT must not be negative")));
 	}
 	if (!state->no_count && state->count_remaining == 0)
-		pg_batch_pass_stop(state->pass);
+		pg_batch_unary_stop(state->unary);
 	state->limits_ready = true;
 	if (state->no_count ||
 		state->count_remaining > PG_INT64_MAX - state->offset_remaining)
-		ExecSetTupleBound(-1, pg_batch_pass_child(state->pass));
+		ExecSetTupleBound(-1, pg_batch_unary_child(state->unary));
 	else
 		ExecSetTupleBound(state->offset_remaining + state->count_remaining,
-			pg_batch_pass_child(state->pass));
+			pg_batch_unary_child(state->unary));
 }
 
 static TupleTableSlot *
@@ -170,13 +177,13 @@ limit_exec(CustomScanState *node)
 
 	if (!state->limits_ready)
 		compute_limits(state);
-	return pg_batch_pass_exec(state->pass);
+	return pg_batch_unary_exec(state->unary);
 }
 
 static void
 limit_end(CustomScanState *node)
 {
-	pg_batch_pass_end(((BatchLimitState *) node)->pass);
+	pg_batch_unary_end(((BatchLimitState *) node)->unary);
 }
 
 static void
@@ -184,7 +191,7 @@ limit_rescan(CustomScanState *node)
 {
 	BatchLimitState *state = (BatchLimitState *) node;
 
-	pg_batch_pass_rescan(state->pass);
+	pg_batch_unary_rescan(state->unary);
 	state->limits_ready = false;
 }
 
@@ -192,7 +199,7 @@ static void
 limit_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
 	BatchLimitState *state = (BatchLimitState *) node;
-	const PgBatchPassStats *stats = pg_batch_pass_stats(state->pass);
+	const PgBatchUnaryStats *stats = pg_batch_unary_stats(state->unary);
 
 	if (es->analyze)
 	{

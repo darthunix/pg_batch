@@ -13,6 +13,7 @@
 typedef struct InputColumn
 {
 	bool		prepared;
+	uint64		available_rows;
 	PgBatchInt4Vector vector;
 } InputColumn;
 
@@ -57,6 +58,9 @@ typedef struct SpillBlock
 	uint32	   *hashes;
 	int32	   *values;
 	uint8	   *validity;
+	Datum	   *datum_values;
+	bool	   *datum_nulls;
+	uint64	   *datum_rows;
 	const void **buffers;
 	struct ArrowArray *arrays;
 	struct ArrowSchema *schemas;
@@ -253,7 +257,7 @@ hash_join_spill_value_valid(const SpillBlock *block, int column, int row)
 
 /* Services implemented by hash_join.c and used by the spill subsystem. */
 extern void hash_join_load_input_column(PgBatch *batch, int column,
-										const uint64 *rows,
+										const PgBatchSelection *rows,
 										PgBatchMaterializePhase phase,
 										InputColumn *result,
 										MemoryContext scratch_context);
