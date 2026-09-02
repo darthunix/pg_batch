@@ -60,13 +60,18 @@ project_begin(CustomScanState *node, EState *estate, int eflags)
 	int			ncolumns;
 
 	pg_batch_read_project_plan(cscan, &data);
-	node_name = data.child_name;
+	if (data.plan.nchildren != 1 || data.plan.child_names[0] == NULL)
+		elog(ERROR, "pg_batch project expected one batch-aware child");
+	node_name = data.plan.child_names[0];
 
 	pg_batch_init_children(node, estate, eflags);
 	state->child = linitial(node->custom_ps);
 	state->input_columns = data.input_columns;
 	state->input = pg_batch_input_create(estate->es_query_cxt,
 		state->child, node_name);
+	pfree(data.plan.child_names);
+	if (data.plan.layout.target_columns != NULL)
+		pfree((void *) data.plan.layout.target_columns);
 	state->projection = pg_batch_expr_projection_create(
 		estate->es_query_cxt, cscan->custom_exprs, &node->ss.ps,
 		resolve_project_var, state->input_columns);

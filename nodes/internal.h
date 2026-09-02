@@ -19,6 +19,7 @@
 #include "kernels.h"
 #include "expr.h"
 #include "plan.h"
+#include "planner.h"
 
 #define PG_BATCH_SIZE 64
 #define PG_BATCH_ALL_ROWS UINT64_MAX
@@ -57,24 +58,23 @@ typedef struct PgBatchFilterPlanData
 
 typedef struct PgBatchProjectPlanData
 {
-	const char *child_name;
+	PgBatchPlanInfo plan;
 	List	   *input_columns;
 } PgBatchProjectPlanData;
 
 typedef struct PgBatchHashPlanData
 {
+	PgBatchPlanInfo plan;
 	List	   *outer_columns;
 	List	   *inner_columns;
 	List	   *outer_keys;
 	List	   *inner_keys;
 	int			planned_partitions;
-	const char *outer_name;
-	const char *inner_name;
 } PgBatchHashPlanData;
 
 typedef struct PgBatchAggPlanData
 {
-	const char *child_name;
+	PgBatchPlanInfo plan;
 	List	   *kinds;
 	List	   *columns;
 	bool		partial;

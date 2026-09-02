@@ -50,6 +50,14 @@ CREATE FUNCTION pg_batch_plan_data_test()
 RETURNS boolean
 AS :'runtime_test', 'pg_batch_plan_data_test'
 LANGUAGE C;
+CREATE FUNCTION pg_batch_planner_api_test()
+RETURNS boolean
+AS :'runtime_test', 'pg_batch_planner_api_test'
+LANGUAGE C;
+CREATE FUNCTION pg_batch_planner_invalid_test(integer)
+RETURNS void
+AS :'runtime_test', 'pg_batch_planner_invalid_test'
+LANGUAGE C STRICT;
 CREATE FUNCTION pg_batch_output_test()
 RETURNS boolean
 AS :'runtime_test', 'pg_batch_output_test'
@@ -91,6 +99,9 @@ SELECT pg_batch_expr_api_test() AS installed_expr_api_ok;
 SELECT pg_batch_builder_test() AS installed_builder_ok;
 SELECT pg_batch_input_api_test() AS installed_input_api_ok;
 SELECT pg_batch_plan_data_test() AS installed_plan_data_ok;
+SELECT pg_batch_planner_api_test() AS planner_api_ok;
+SELECT pg_batch_planner_invalid_test(0);
+SELECT pg_batch_planner_invalid_test(1);
 SELECT pg_batch_output_test() AS installed_output_ok;
 SELECT pg_batch_output_over_max_test();
 SELECT pg_batch_binding_request_test() AS installed_binding_request_ok;

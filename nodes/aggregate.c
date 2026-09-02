@@ -164,13 +164,18 @@ agg_begin(CustomScanState *node, EState *estate, int eflags)
 	int			i = 0;
 
 	pg_batch_read_agg_plan(cscan, &data);
-	node_name = data.child_name;
+	if (data.plan.nchildren != 1 || data.plan.child_names[0] == NULL)
+		elog(ERROR, "pg_batch aggregate expected one batch-aware child");
+	node_name = data.plan.child_names[0];
 	state->partial = data.partial;
 
 	pg_batch_init_children(node, estate, eflags);
 	state->child = linitial(node->custom_ps);
 	state->input = pg_batch_input_create(estate->es_query_cxt,
 		state->child, node_name);
+	pfree(data.plan.child_names);
+	if (data.plan.layout.target_columns != NULL)
+		pfree((void *) data.plan.layout.target_columns);
 	request_binding = pg_batch_input_request_binding(state->input);
 	request = pg_batch_api->get_request(request_binding);
 	project_columns = bms_copy(request->spec.project_columns);

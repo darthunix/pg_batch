@@ -84,27 +84,23 @@ limit_begin(CustomScanState *node, EState *estate, int eflags)
 {
 	BatchLimitState *state = (BatchLimitState *) node;
 	CustomScan *scan = castNode(CustomScan, node->ss.ps.plan);
-	PgBatchLimitPlanData data;
+	PgBatchPlanInfo plan = PG_BATCH_STRUCT_INITIALIZER(PgBatchPlanInfo);
 	Bitmapset  *project_columns = NULL;
-	PgBatchLayout layout = PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
 	PgBatchUnaryConfig config;
-	int			position = 0;
 
 	if (eflags & (EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("pg_batch_limit supports only forward scans")));
 	Assert(list_length(scan->custom_exprs) == 2);
-	pg_batch_limit_read_plan(scan, &data);
-	layout.ncolumns = data.column_count;
-	layout.ntargets = list_length(data.output_columns);
-	layout.target_columns = palloc_array(int, layout.ntargets);
-	foreach_int(column, data.output_columns)
+	pg_batch_plan_get_info(scan, &plan);
+	if (plan.nchildren != 1 || plan.child_names[0] == NULL)
+		elog(ERROR, "pg_batch_limit expected one batch-aware child");
+	for (int target = 0; target < plan.layout.ntargets; target++)
 	{
-		if (column < 0 || column >= layout.ncolumns)
-			elog(ERROR, "pg_batch_limit received an invalid column layout");
+		int			column = pg_batch_layout_column(&plan.layout, target);
+
 		project_columns = bms_add_member(project_columns, column);
-		((int *) layout.target_columns)[position++] = column;
 	}
 	config = (PgBatchUnaryConfig) {
 		.struct_size = sizeof(config),
@@ -112,8 +108,8 @@ limit_begin(CustomScanState *node, EState *estate, int eflags)
 		.node = node,
 		.estate = estate,
 		.eflags = eflags,
-		.child_name = data.node_name,
-		.layout = &layout,
+		.child_name = plan.child_names[0],
+		.layout = &plan.layout,
 		.project_columns = project_columns,
 		.row_mode = PG_BATCH_UNARY_COPY_ROW,
 		.process = trim_batch,
@@ -121,7 +117,9 @@ limit_begin(CustomScanState *node, EState *estate, int eflags)
 	};
 	state->unary = pg_batch_unary_create(&config);
 	bms_free(project_columns);
-	pfree((void *) layout.target_columns);
+	pfree(plan.child_names);
+	if (plan.layout.target_columns != NULL)
+		pfree((void *) plan.layout.target_columns);
 	if (linitial(scan->custom_exprs) != NULL)
 		state->offset_expr = ExecInitExpr(linitial(scan->custom_exprs),
 			&node->ss.ps);

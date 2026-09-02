@@ -48,6 +48,14 @@ CREATE FUNCTION pg_batch_plan_data_test()
 RETURNS boolean
 AS :'runtime_test', 'pg_batch_plan_data_test'
 LANGUAGE C;
+CREATE FUNCTION pg_batch_planner_api_test()
+RETURNS boolean
+AS :'runtime_test', 'pg_batch_planner_api_test'
+LANGUAGE C;
+CREATE FUNCTION pg_batch_planner_invalid_test(integer)
+RETURNS void
+AS :'runtime_test', 'pg_batch_planner_invalid_test'
+LANGUAGE C STRICT;
 CREATE FUNCTION pg_batch_output_test()
 RETURNS boolean
 AS :'runtime_test', 'pg_batch_output_test'
@@ -121,6 +129,16 @@ SELECT pg_batch_plan_data_test() AS installed_plan_data_ok;
  t
 (1 row)
 
+SELECT pg_batch_planner_api_test() AS planner_api_ok;
+ planner_api_ok 
+----------------
+ t
+(1 row)
+
+SELECT pg_batch_planner_invalid_test(0);
+ERROR:  pg_batch path and plan child counts differ
+SELECT pg_batch_planner_invalid_test(1);
+ERROR:  pg_batch cannot preserve a row-only child layout
 SELECT pg_batch_output_test() AS installed_output_ok;
  installed_output_ok 
 ---------------------

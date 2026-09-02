@@ -1610,12 +1610,15 @@ hash_join_begin(CustomScanState *node, EState *estate, int eflags)
 	int			position = 0;
 
 	pg_batch_read_hash_plan(cscan, &data);
+	if (data.plan.nchildren != 2 || data.plan.child_names[0] == NULL ||
+		data.plan.child_names[1] == NULL)
+		elog(ERROR, "pg_batch hash join expected two batch-aware children");
 	outer_columns = data.outer_columns;
 	inner_columns = data.inner_columns;
 	outer_keys = data.outer_keys;
 	inner_keys = data.inner_keys;
-	outer_node_name = data.outer_name;
-	inner_node_name = data.inner_name;
+	outer_node_name = data.plan.child_names[0];
+	inner_node_name = data.plan.child_names[1];
 
 	state->nouter_columns = list_length(outer_columns);
 	state->ninner_columns = list_length(inner_columns);
@@ -1659,6 +1662,9 @@ hash_join_begin(CustomScanState *node, EState *estate, int eflags)
 		state->outer_plan, outer_node_name);
 	state->inner_input = pg_batch_input_create(state->join_context,
 		state->inner_plan, inner_node_name);
+	pfree(data.plan.child_names);
+	if (data.plan.layout.target_columns != NULL)
+		pfree((void *) data.plan.layout.target_columns);
 	for (int key = 0; key < state->nkeys; key++)
 	{
 		state->outer_key_columns = bms_add_member(state->outer_key_columns,

@@ -11,6 +11,18 @@ plan_reader(const CustomScan *scan, const char *kind)
 		PG_BATCH_PLAN_DATA_VERSION);
 }
 
+static PgBatchPlanReader *
+common_plan_reader(const CustomScan *scan, const char *kind,
+				   PgBatchPlanInfo *info)
+{
+	*info = (PgBatchPlanInfo) PG_BATCH_STRUCT_INITIALIZER(PgBatchPlanInfo);
+	pg_batch_plan_get_info(scan, info);
+	if (info->node_data == NULL || !IsA(info->node_data, List))
+		elog(ERROR, "pg_batch %s plan has no provider data", kind);
+	return pg_batch_plan_reader_create((List *) info->node_data, kind,
+		PG_BATCH_PLAN_DATA_VERSION);
+}
+
 void
 pg_batch_read_scan_plan(const CustomScan *scan, PgBatchScanPlanData *result)
 {
@@ -50,9 +62,9 @@ void
 pg_batch_read_project_plan(const CustomScan *scan,
 						   PgBatchProjectPlanData *result)
 {
-	PgBatchPlanReader *reader = plan_reader(scan, "project");
+	PgBatchPlanReader *reader = common_plan_reader(scan, "project",
+		&result->plan);
 
-	result->child_name = pg_batch_plan_read_string(reader, "child_name");
 	result->input_columns = pg_batch_plan_read_int_list(reader,
 		"input_columns");
 	pg_batch_plan_reader_finish(reader);
@@ -61,7 +73,8 @@ pg_batch_read_project_plan(const CustomScan *scan,
 void
 pg_batch_read_hash_plan(const CustomScan *scan, PgBatchHashPlanData *result)
 {
-	PgBatchPlanReader *reader = plan_reader(scan, "hash_join");
+	PgBatchPlanReader *reader = common_plan_reader(scan, "hash_join",
+		&result->plan);
 
 	result->outer_columns = pg_batch_plan_read_int_list(reader,
 		"outer_columns");
@@ -71,17 +84,15 @@ pg_batch_read_hash_plan(const CustomScan *scan, PgBatchHashPlanData *result)
 	result->inner_keys = pg_batch_plan_read_int_list(reader, "inner_keys");
 	result->planned_partitions = pg_batch_plan_read_int(reader,
 		"planned_partitions");
-	result->outer_name = pg_batch_plan_read_string(reader, "outer_name");
-	result->inner_name = pg_batch_plan_read_string(reader, "inner_name");
 	pg_batch_plan_reader_finish(reader);
 }
 
 void
 pg_batch_read_agg_plan(const CustomScan *scan, PgBatchAggPlanData *result)
 {
-	PgBatchPlanReader *reader = plan_reader(scan, "aggregate");
+	PgBatchPlanReader *reader = common_plan_reader(scan, "aggregate",
+		&result->plan);
 
-	result->child_name = pg_batch_plan_read_string(reader, "child_name");
 	result->kinds = pg_batch_plan_read_int_list(reader, "kinds");
 	result->columns = pg_batch_plan_read_int_list(reader, "columns");
 	result->partial = pg_batch_plan_read_int(reader, "partial") != 0;

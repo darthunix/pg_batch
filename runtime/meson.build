@@ -7,6 +7,7 @@ runtime_lib = static_library(
   'output.c',
   'unary.c',
   'plan.c',
+  'planner.c',
   dependencies: postgres_dep,
   include_directories: public_inc,
   gnu_symbol_visibility: 'hidden',
@@ -24,5 +25,6 @@ runtime_dep = declare_dependency(
 install_headers(
   '../include/pg_batch/runtime.h',
   '../include/pg_batch/plan.h',
+  '../include/pg_batch/planner.h',
   install_dir: pg_server_include / 'extension' / 'pg_batch',
 )

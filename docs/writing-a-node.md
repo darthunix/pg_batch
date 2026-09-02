@@ -98,35 +98,85 @@ Borrowed column views remain valid only until the source next prepares
 columns or releases the batch, unless that native interface documents a
 longer lifetime.
 
-## Plan data
+## Building paths and plans
 
-`CustomPath.custom_private` and `CustomScan.custom_private` must be
-`copyObject()`-compatible PostgreSQL nodes. Do not share positional list
-layouts between the planner and executor. Use the named, checked plan codec:
-
-```c
-PgBatchPlanWriter *writer =
-	pg_batch_plan_writer_create("MyNode", 1);
-
-pg_batch_plan_write_string(writer, "child", child_name);
-pg_batch_plan_write_int_list(writer, "columns", columns);
-scan->custom_private = pg_batch_plan_writer_finish(writer);
-```
-
-Read every field by name and finish the reader:
+The extension still owns its planner hooks, path selection, and costing. The
+runtime library only removes the mechanical `CustomPath` and `CustomScan`
+setup. Start with the ordinary path whose planner properties should be kept:
 
 ```c
-PgBatchPlanReader *reader = pg_batch_plan_reader_create(
-	scan->custom_private, "MyNode", 1);
+PgBatchPathConfig config =
+	PG_BATCH_STRUCT_INITIALIZER(PgBatchPathConfig);
 
-child_name = pg_batch_plan_read_string(reader, "child");
-columns = pg_batch_plan_read_int_list(reader, "columns");
-pg_batch_plan_reader_finish(reader);
+config.template_path = &limit->path;
+config.methods = &limit_path_methods;
+config.children = list_make1(limit->subpath);
+config.expressions = list_make2(limit->limitOffset, limit->limitCount);
+return pg_batch_path_create(&config);
 ```
 
-The reader rejects a wrong kind or version, duplicate fields, wrong field
-types, missing fields, fields read twice, and unread fields. Increment the
-record version when its required fields or meaning changes.
+`pg_batch_path_create()` copies rows, costs, path keys, parameterization, and
+parallel properties from `template_path`. It also keeps expressions and
+provider data in a `copyObject()`-safe form. Read them in `PlanCustomPath`
+and describe the final scan explicitly:
+
+```c
+PgBatchPathInfo path = PG_BATCH_STRUCT_INITIALIZER(PgBatchPathInfo);
+PgBatchPlanConfig config =
+	PG_BATCH_STRUCT_INITIALIZER(PgBatchPlanConfig);
+
+pg_batch_path_get_info(best_path, &path);
+config.api = my_api;
+config.methods = &limit_plan_methods;
+config.layout_policy = PG_BATCH_LAYOUT_PRESERVE_CHILD;
+config.layout_child = 0;
+config.expressions = path.expressions;
+return pg_batch_plan_create(rel, best_path, tlist, custom_plans, &config);
+```
+
+The output layout has three policies:
+
+- `PG_BATCH_LAYOUT_PRESERVE_CHILD` forwards one batch-aware child's layout;
+- `PG_BATCH_LAYOUT_DENSE` publishes one column per final target entry;
+- `PG_BATCH_LAYOUT_EXPLICIT` uses a supplied `PgBatchLayout`.
+
+Use `PRESERVE_CHILD` only for a pass-through node whose target list stays
+unchanged. A node with `CUSTOMPATH_SUPPORT_PROJECTION` normally uses `DENSE`,
+which follows a projection that PostgreSQL installs after `PlanCustomPath`.
+
+The helper discovers every batch-aware child through the bridge and stores
+its stable node name. A NULL child name means that the child returns ordinary
+rows. Use `pg_batch_plan_child()` when provider-specific planning needs a
+child's plan, node operations, or layout.
+
+Qualifiers and executable expressions are never inferred. Set `qual` and
+`expressions` to exactly what the executor will evaluate. This prevents a
+wrapper around a complete child path from evaluating its clauses twice.
+
+During executor initialization, read the common information once:
+
+```c
+PgBatchPlanInfo plan = PG_BATCH_STRUCT_INITIALIZER(PgBatchPlanInfo);
+
+pg_batch_plan_get_info(scan, &plan);
+input = pg_batch_input_create(query_context, child,
+	plan.child_names[0]);
+output = pg_batch_output_create(query_context, result_slot,
+	&plan.layout);
+```
+
+Set `PgBatchNodeOps.get_layout` to `pg_batch_plan_get_layout` when every plan
+claimed by that operation table is built by `pg_batch_plan_create()`.
+
+Provider-specific `node_data` may still use the named plan codec. The common
+plan stores that value without interpreting it. The reader rejects a wrong
+kind or version, duplicate fields, wrong field types, missing fields, fields
+read twice, and unread fields. Increment the provider record version when its
+required fields or meaning changes.
+
+Direct `CustomPath` and `CustomScan` construction remains available for
+composite nodes. The built-in scan/filter pair uses it because one custom path
+creates two stacked plan nodes.
 
 ## Registering the node
 
@@ -155,14 +205,12 @@ the child node name in its own plan data and passes it to
 
 `examples/limit_node/` shows the recommended implementation.
 
-The planner does four things:
+The planner does three things:
 
 1. It calls `find_node(child_path)` to require a batch-aware child.
-2. It stores the child node name and Limit expressions in typed path data.
-3. In `PlanCustomPath`, it calls the child's `get_layout()` and stores the
-   output-column mapping in typed plan data.
-4. It keeps executable expressions in `custom_exprs`, where PostgreSQL can
-   process them normally.
+2. It uses `pg_batch_path_create()` to retain the Limit expressions.
+3. Its `PlanCustomPath` uses `PG_BATCH_LAYOUT_PRESERVE_CHILD`; the common
+   plan helper stores the child name, layout, and executable expressions.
 
 The executor reads that data and creates one `PgBatchUnary`:
 

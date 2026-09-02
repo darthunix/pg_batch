@@ -4,11 +4,13 @@
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "nodes/makefuncs.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 
 #include "runtime.h"
 #include "plan.h"
+#include "planner.h"
 
 PG_MODULE_MAGIC;
 
@@ -22,6 +24,185 @@ PG_FUNCTION_INFO_V1(pg_batch_output_select_after_finish_test);
 PG_FUNCTION_INFO_V1(pg_batch_binding_request_test);
 PG_FUNCTION_INFO_V1(pg_batch_request_after_seal_test);
 PG_FUNCTION_INFO_V1(pg_batch_plan_data_test);
+PG_FUNCTION_INFO_V1(pg_batch_planner_api_test);
+PG_FUNCTION_INFO_V1(pg_batch_planner_invalid_test);
+
+static const CustomPathMethods planner_test_path_methods = {
+	.CustomName = "PgBatchPlannerTest",
+};
+
+static const CustomPathMethods planner_test_child_path_methods = {
+	.CustomName = "PgBatchPlannerTestChild",
+};
+
+static const CustomScanMethods planner_test_scan_methods = {
+	.CustomName = "PgBatchPlannerTest",
+};
+
+static void
+planner_test_child_layout(const Plan *plan, PgBatchLayout *result)
+{
+	static const int columns[] = {2, 0};
+
+	(void) plan;
+	result->ncolumns = 3;
+	result->ntargets = 2;
+	result->target_columns = columns;
+}
+
+static const PgBatchNodeOps planner_test_child_ops = {
+	PG_BATCH_ABI_INITIALIZER(PG_BATCH_NODE_OPS_ABI_VERSION, PgBatchNodeOps),
+	.node_name = "pg_batch_test.child",
+	.get_layout = planner_test_child_layout,
+};
+
+static const PgBatchNodeOps *
+planner_test_find_node(const Path *path)
+{
+	if (pg_batch_path_matches(path, &planner_test_child_path_methods))
+		return &planner_test_child_ops;
+	return NULL;
+}
+
+static TargetEntry *
+planner_test_target(int resno)
+{
+	Const	   *value = makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
+		Int32GetDatum(resno), false, true);
+
+	return makeTargetEntry((Expr *) value, resno, NULL, false);
+}
+
+Datum
+pg_batch_planner_api_test(PG_FUNCTION_ARGS)
+{
+	Path		template = {0};
+	CustomPath *child_path;
+	CustomScan *child_plan = makeNode(CustomScan);
+	CustomPath *path;
+	PgBatchPathConfig path_config =
+		PG_BATCH_STRUCT_INITIALIZER(PgBatchPathConfig);
+	PgBatchPathInfo path_info =
+		PG_BATCH_STRUCT_INITIALIZER(PgBatchPathInfo);
+	PgBatchPlanConfig plan_config =
+		PG_BATCH_STRUCT_INITIALIZER(PgBatchPlanConfig);
+	PgBatchPlanInfo plan_info =
+		PG_BATCH_STRUCT_INITIALIZER(PgBatchPlanInfo);
+	PgBatchAPI api = {
+		PG_BATCH_ABI_INITIALIZER(PG_BATCH_API_ABI_VERSION, PgBatchAPI),
+		.find_node = planner_test_find_node,
+	};
+	List	   *targetlist = list_make2(planner_test_target(1),
+		planner_test_target(2));
+	List	   *expressions = list_make1(makeInteger(7));
+	Plan	   *plan;
+	int			explicit_columns[] = {1, 0};
+	PgBatchLayout explicit_layout =
+		PG_BATCH_STRUCT_INITIALIZER(PgBatchLayout);
+	bool		ok;
+
+	child_path = makeNode(CustomPath);
+	child_path->methods = &planner_test_child_path_methods;
+	child_plan->scan.plan.targetlist = copyObject(targetlist);
+	path_config.template_path = &template;
+	path_config.methods = &planner_test_path_methods;
+	path_config.children = list_make1(&child_path->path);
+	path_config.expressions = expressions;
+	path_config.node_data = (Node *) makeString(pstrdup("path data"));
+	path = pg_batch_path_create(&path_config);
+	pg_batch_path_get_info(path, &path_info);
+	ok = pg_batch_path_matches(&path->path, &planner_test_path_methods) &&
+		equal(path_info.expressions, expressions) &&
+		IsA(path_info.node_data, String) &&
+		strcmp(strVal(path_info.node_data), "path data") == 0;
+
+	plan_config.api = &api;
+	plan_config.methods = &planner_test_scan_methods;
+	plan_config.layout_policy = PG_BATCH_LAYOUT_PRESERVE_CHILD;
+	plan_config.layout_child = 0;
+	plan_config.expressions = path_info.expressions;
+	plan_config.node_data = (Node *) makeString(pstrdup("plan data"));
+	plan = pg_batch_plan_create(NULL, path, targetlist,
+		list_make1(&child_plan->scan.plan), &plan_config);
+	pg_batch_plan_get_info(castNode(CustomScan, plan), &plan_info);
+	ok = ok && plan_info.nchildren == 1 &&
+		plan_info.child_names[0] != NULL &&
+		strcmp(plan_info.child_names[0], "pg_batch_test.child") == 0 &&
+		plan_info.layout.ncolumns == 3 && plan_info.layout.ntargets == 2 &&
+		pg_batch_layout_column(&plan_info.layout, 0) == 2 &&
+		pg_batch_layout_column(&plan_info.layout, 1) == 0 &&
+		IsA(plan_info.node_data, String) &&
+		strcmp(strVal(plan_info.node_data), "plan data") == 0;
+	pfree(plan_info.child_names);
+	pfree((void *) plan_info.layout.target_columns);
+
+	/* A dense layout follows a target list changed after PlanCustomPath. */
+	path_config.children = NIL;
+	path = pg_batch_path_create(&path_config);
+	plan_config.layout_policy = PG_BATCH_LAYOUT_DENSE;
+	plan_config.expressions = NIL;
+	plan_config.node_data = NULL;
+	plan = pg_batch_plan_create(NULL, path, targetlist, NIL, &plan_config);
+	plan->targetlist = lappend(plan->targetlist, planner_test_target(3));
+	plan_info = (PgBatchPlanInfo)
+		PG_BATCH_STRUCT_INITIALIZER(PgBatchPlanInfo);
+	pg_batch_plan_get_info(castNode(CustomScan, plan), &plan_info);
+	ok = ok && plan_info.nchildren == 0 &&
+		plan_info.layout.ncolumns == 3 && plan_info.layout.ntargets == 3 &&
+		plan_info.layout.target_columns == NULL;
+	pfree(plan_info.child_names);
+
+	explicit_layout.ncolumns = 2;
+	explicit_layout.ntargets = 2;
+	explicit_layout.target_columns = explicit_columns;
+	plan_config.layout_policy = PG_BATCH_LAYOUT_EXPLICIT;
+	plan_config.explicit_layout = &explicit_layout;
+	plan = pg_batch_plan_create(NULL, path, targetlist, NIL, &plan_config);
+	plan_info = (PgBatchPlanInfo)
+		PG_BATCH_STRUCT_INITIALIZER(PgBatchPlanInfo);
+	pg_batch_plan_get_info(castNode(CustomScan, plan), &plan_info);
+	ok = ok && plan_info.layout.ncolumns == 2 &&
+		pg_batch_layout_column(&plan_info.layout, 0) == 1 &&
+		pg_batch_layout_column(&plan_info.layout, 1) == 0;
+
+	PG_RETURN_BOOL(ok);
+}
+
+Datum
+pg_batch_planner_invalid_test(PG_FUNCTION_ARGS)
+{
+	int			mode = PG_GETARG_INT32(0);
+	Path		template = {0};
+	CustomPath *child_path = makeNode(CustomPath);
+	CustomScan *child_plan = makeNode(CustomScan);
+	CustomPath *path;
+	PgBatchPathConfig path_config =
+		PG_BATCH_STRUCT_INITIALIZER(PgBatchPathConfig);
+	PgBatchPlanConfig plan_config =
+		PG_BATCH_STRUCT_INITIALIZER(PgBatchPlanConfig);
+	PgBatchAPI api = {
+		PG_BATCH_ABI_INITIALIZER(PG_BATCH_API_ABI_VERSION, PgBatchAPI),
+		.find_node = planner_test_find_node,
+	};
+	List	   *targetlist = list_make1(planner_test_target(1));
+
+	if (mode != 0 && mode != 1)
+		elog(ERROR, "invalid pg_batch planner test mode");
+	child_path->methods = &planner_test_path_methods;
+	child_plan->scan.plan.targetlist = copyObject(targetlist);
+	path_config.template_path = &template;
+	path_config.methods = &planner_test_path_methods;
+	path_config.children = mode == 0 ? NIL :
+		list_make1(&child_path->path);
+	path = pg_batch_path_create(&path_config);
+	plan_config.api = &api;
+	plan_config.methods = &planner_test_scan_methods;
+	plan_config.layout_policy = PG_BATCH_LAYOUT_PRESERVE_CHILD;
+	plan_config.layout_child = 0;
+	(void) pg_batch_plan_create(NULL, path, targetlist,
+		list_make1(&child_plan->scan.plan), &plan_config);
+	PG_RETURN_VOID();
+}
 
 Datum
 pg_batch_plan_data_test(PG_FUNCTION_ARGS)
